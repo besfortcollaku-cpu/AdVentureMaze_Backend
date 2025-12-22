@@ -8,6 +8,91 @@ import { verifyPiAccessToken } from "./pi";
 
 import { approvePiPayment, completePiPayment } from "./pi";
 
+// payments hooks
+
+const progressStore = new Map<string, any>(); // TEMP (later we use sqlite)
+
+
+
+app.get("/progress", async (req, res) => {
+
+  const username = String(req.query.username || "");
+
+  if (!username) return res.status(400).json({ ok: false, error: "username required" });
+
+
+
+  const data = progressStore.get(username) || { level: 1, coins: 0 };
+
+  return res.json({ ok: true, data });
+
+});
+
+
+
+app.post("/progress", async (req, res) => {
+
+  const { username, level, coins } = req.body;
+
+  if (!username) return res.status(400).json({ ok: false, error: "username required" });
+
+
+
+  progressStore.set(username, {
+
+    level: Number(level || 1),
+
+    coins: Number(coins || 0),
+
+    updatedAt: Date.now(),
+
+  });
+
+
+
+  return res.json({ ok: true });
+
+});
+app.post("/payments/approve", async (req, res) => {
+
+  try {
+
+    // TODO: verify user auth here (same as /verify)
+
+    const { paymentId } = req.body;
+
+    // TODO: call Pi server approval API here (we’ll wire next)
+
+    return res.json({ ok: true, paymentId, status: "approved_stub" });
+
+  } catch (e: any) {
+
+    return res.status(500).json({ ok: false, error: e.message });
+
+  }
+
+});
+
+
+
+app.post("/payments/complete", async (req, res) => {
+
+  try {
+
+    const { paymentId, txid } = req.body;
+
+    // TODO: call Pi complete API here (we’ll wire next)
+
+    return res.json({ ok: true, paymentId, txid, status: "completed_stub" });
+
+  } catch (e: any) {
+
+    return res.status(500).json({ ok: false, error: e.message });
+
+  }
+
+});
+
 
 
 const app = express();
