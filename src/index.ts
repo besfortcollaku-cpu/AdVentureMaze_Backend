@@ -4,7 +4,7 @@ import express from "express";
 
 import cors from "cors";
 
-import { verifyPiAccessToken } from "./piAuth";
+import { verifyPiAccessToken } from "./pi";
 
 import { approvePiPayment, completePiPayment } from "./pi";
 
