@@ -44,16 +44,14 @@ export function initDB() {
   `);
 
   // ---------------------------
-  // ✅ REWARD CLAIMS (server-side anti-spam + idempotency)
-  // Each reward claim must provide a unique "nonce" from client.
-  // We also enforce cooldown per uid + type.
+  // ✅ REWARD CLAIMS
   // ---------------------------
   db.exec(`
     CREATE TABLE IF NOT EXISTS reward_claims (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       uid TEXT NOT NULL,
-      type TEXT NOT NULL,               -- e.g. "ad_50"
-      nonce TEXT NOT NULL UNIQUE,       -- idempotency key
+      type TEXT NOT NULL,
+      nonce TEXT NOT NULL UNIQUE,
       amount INTEGER NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -65,14 +63,13 @@ export function initDB() {
   `);
 
   // ---------------------------
-  // ✅ PAYMENTS (track who initiated a paymentId)
-  // Prevent someone else completing/approving another user's paymentId
+  // ✅ PAYMENTS
   // ---------------------------
   db.exec(`
     CREATE TABLE IF NOT EXISTS payments (
       payment_id TEXT PRIMARY KEY,
       uid TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'created',  -- created/approved/completed
+      status TEXT NOT NULL DEFAULT 'created',
       txid TEXT,
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -84,7 +81,7 @@ export function initDB() {
   `);
 
   // ---------------------------
-  // ✅ MIGRATION (from old progress(username...) to new progress(uid...))
+  // ✅ MIGRATION
   // ---------------------------
   migrateLegacyProgress();
 
@@ -103,7 +100,6 @@ function getDB() {
 export function upsertUser({ uid, username }: { uid: string; username: string }) {
   const d = getDB();
 
-  // protect against username collision with another uid
   const existingByUsername = getUserByUsername(username);
   if (existingByUsername && existingByUsername.uid && existingByUsername.uid !== uid) {
     throw new Error("Username already linked to another account.");
@@ -152,7 +148,6 @@ export function getUserByUsername(username: string) {
     | undefined;
 }
 
-// Adds/subtracts coins, never below 0
 export function addCoins(uid: string, delta: number) {
   const d = getDB();
 
@@ -214,7 +209,7 @@ export function getProgressByUid(uid: string) {
 }
 
 /* =========================
-   ✅ REWARDS (server-side)
+   ✅ REWARDS
    ========================= */
 
 export function claimReward({
@@ -225,8 +220,8 @@ export function claimReward({
   cooldownSeconds = 20,
 }: {
   uid: string;
-  type: string; // ex: "ad_50"
-  nonce: string; // unique per claim
+  type: string;
+  nonce: string;
   amount: number;
   cooldownSeconds?: number;
 }) {
@@ -235,7 +230,6 @@ export function claimReward({
   if (!user) throw new Error("User not found");
 
   const tx = d.transaction(() => {
-    // 1) Idempotency: if nonce already exists -> return "already claimed"
     const existing = d
       .prepare(`SELECT id FROM reward_claims WHERE nonce = ? LIMIT 1`)
       .get(nonce) as any;
@@ -244,7 +238,6 @@ export function claimReward({
       return { ok: true, already: true, user: getUserByUid(uid) };
     }
 
-    // 2) Cooldown check (per uid+type)
     const last = d
       .prepare(
         `SELECT created_at FROM reward_claims
@@ -255,7 +248,7 @@ export function claimReward({
       .get(uid, type) as any;
 
     if (last?.created_at) {
-      const lastMs = Date.parse(last.created_at + "Z"); // treat as UTC-ish
+      const lastMs = Date.parse(last.created_at + "Z");
       const nowMs = Date.now();
       const diff = (nowMs - lastMs) / 1000;
       if (diff < cooldownSeconds) {
@@ -263,13 +256,11 @@ export function claimReward({
       }
     }
 
-    // 3) Insert claim
     d.prepare(
       `INSERT INTO reward_claims (uid, type, nonce, amount, created_at)
        VALUES (?, ?, ?, ?, datetime('now'))`
     ).run(uid, type, nonce, Math.trunc(amount));
 
-    // 4) Apply coins
     addCoins(uid, amount);
 
     return { ok: true, already: false, user: getUserByUid(uid) };
@@ -279,7 +270,7 @@ export function claimReward({
 }
 
 /* =========================
-   ✅ PAYMENTS TRACKING
+   ✅ PAYMENTS
    ========================= */
 
 export function upsertPaymentOwner({
@@ -370,16 +361,11 @@ function hasColumn(table: string, col: string) {
 function migrateLegacyProgress() {
   const d = getDB();
 
-  // only migrate if an old schema exists (username column)
   if (!hasTable("progress")) return;
-
-  // If progress already has uid column, nothing to do
   if (hasColumn("progress", "uid")) return;
 
-  // old progress table exists but is username-based.
   d.exec(`ALTER TABLE progress RENAME TO progress_legacy;`);
 
-  // create new progress table
   d.exec(`
     CREATE TABLE IF NOT EXISTS progress (
       uid TEXT PRIMARY KEY,
@@ -391,7 +377,6 @@ function migrateLegacyProgress() {
 
   d.exec(`CREATE INDEX IF NOT EXISTS idx_progress_uid ON progress(uid);`);
 
-  // copy legacy rows
   const legacyRows = d
     .prepare(`SELECT username, level, coins, updated_at FROM progress_legacy`)
     .all() as any[];
@@ -427,6 +412,4 @@ function migrateLegacyProgress() {
   });
 
   tx();
-
-  // keep progress_legacy for safety (delete later)
 }
