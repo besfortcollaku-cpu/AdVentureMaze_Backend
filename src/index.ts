@@ -1,4 +1,4 @@
-// src/index.ts
+// src/index.ts last change
 import "dotenv/config";
 
 import express from "express";
@@ -152,11 +152,9 @@ app.get("/api/me", async (req, res) => {
 
     // Load progress (default if none)
     const p = getProgressByUid(uid);
-
-    // ✅ Coins source of truth is users.coins (progress.coins can drift; don't return it)
     const progress = p
-      ? { uid, level: p.level, updated_at: p.updated_at }
-      : { uid, level: 1, updated_at: null };
+      ? { uid, level: p.level, coins: p.coins, updated_at: p.updated_at }
+      : { uid, level: 1, coins: 0, updated_at: null };
 
     return res.json({
       ok: true,
@@ -202,24 +200,13 @@ app.post("/api/rewards/daily-login", async (req, res) => {
 app.post("/api/rewards/level-complete", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-
     const level = Number(req.body?.level || 0);
-    if (!level) {
-      return res.status(400).json({ ok: false, error: "level required" });
-    }
+    if (!level) return res.status(400).json({ ok: false, error: "level required" });
 
     const out = claimLevelComplete(uid, level);
     return res.json({ ok: true, already: !!out?.already, user: out?.user });
   } catch (e: any) {
-    const msg = e?.message || String(e);
-    // auth-ish errors -> 401, otherwise 500
-    const lower = String(msg).toLowerCase();
-    const code =
-      lower.includes("bearer") || lower.includes("token") || lower.includes("unauthorized")
-        ? 401
-        : 500;
-
-    return res.status(code).json({ ok: false, error: msg });
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
@@ -228,9 +215,7 @@ app.post("/api/rewards/ad-50", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce || "").trim();
-    if (!nonce) {
-      return res.status(400).json({ ok: false, error: "nonce required" });
-    }
+    if (!nonce) return res.status(400).json({ ok: false, error: "nonce required" });
 
     const out = claimReward({
       uid,
@@ -275,9 +260,7 @@ app.post("/api/rewards/skip-ad", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce || "").trim();
-    if (!nonce) {
-      return res.status(400).json({ ok: false, error: "nonce required" });
-    }
+    if (!nonce) return res.status(400).json({ ok: false, error: "nonce required" });
 
     const out = claimReward({
       uid,
@@ -297,9 +280,7 @@ app.post("/api/rewards/hint-ad", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce || "").trim();
-    if (!nonce) {
-      return res.status(400).json({ ok: false, error: "nonce required" });
-    }
+    if (!nonce) return res.status(400).json({ ok: false, error: "nonce required" });
 
     const out = claimReward({
       uid,
@@ -329,23 +310,16 @@ app.get("/api/users/by-uid", (req, res) => {
   return res.json({ ok: true, user });
 });
 
-// ✅ coin add/subtract by uid (AUTH REQUIRED + ONLY SELF)
-// NOTE: keep for debug if you want, but this prevents anyone modifying other users.
-app.post("/api/users/coins", async (req, res) => {
+// (Admin / debug only) coin add/subtract by uid
+app.post("/api/users/coins", (req, res) => {
   try {
-    const { uid: authedUid } = await requirePiUser(req);
-
     const { uid, delta } = req.body || {};
     if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
-
-    if (String(uid) !== String(authedUid)) {
-      return res.status(403).json({ ok: false, error: "forbidden" });
-    }
 
     const updated = addCoins(String(uid), Number(delta || 0));
     return res.json({ ok: true, user: updated });
   } catch (e: any) {
-    return res.status(401).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
@@ -355,8 +329,6 @@ app.post("/api/users/coins", async (req, res) => {
 //
 // GET  /progress?uid=...
 // POST /progress { uid, level, coins }
-//
-// NOTE: coins here is legacy; prefer users.coins. Keep endpoint for compatibility.
 //
 
 app.get("/progress", (req, res) => {
