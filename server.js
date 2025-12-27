@@ -1,57 +1,80 @@
-Const express = require("express");
-const cors = require("cors");
+
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
+import Database from "better-sqlite3";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// VERY SIMPLE storage for now (later: database)
-const users = {}; // { username: { pointsThisWeek: number, pointsToday: number, lastDay: "YYYY-MM-DD" } }
+const db = new Database("pimaze.sqlite");
 
-function todayKey() {
-  const d = new Date();
-  return d.toISOString().slice(0, 10);
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid TEXT UNIQUE,
+  username TEXT UNIQUE,
+  coins INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS progress (
+  uid TEXT PRIMARY KEY,
+  level INTEGER DEFAULT 1,
+  coins INTEGER DEFAULT 0,
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+`);
+
+function getUserByUid(uid) {
+  return db.prepare("SELECT * FROM users WHERE uid=?").get(uid);
 }
 
-// TODO: Replace this with real Pi Platform verification using adId (recommended by Pi) 4
-async function verifyAdIdWithPi(adId) {
-  // For Step 6 testing: accept any non-empty adId
-  return typeof adId === "string" && adId.length > 5;
+function upsertUser(uid, username) {
+  db.prepare(`
+    INSERT INTO users (uid, username)
+    VALUES (?, ?)
+    ON CONFLICT(uid) DO UPDATE SET username=excluded.username
+  `).run(uid, username);
+
+  return getUserByUid(uid);
 }
 
-app.post("/ads/claim", async (req, res) => {
-  const { username, adId } = req.body;
-  if (!username || !adId) return res.status(400).json({ ok: false, error: "Missing username/adId" });
+app.post("/api/pi/verify", async (req, res) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const accessToken = auth.replace("Bearer ", "");
 
-  // Daily cap: 30 points/day (your rule)
-  const day = todayKey();
-  users[username] ||= { pointsThisWeek: 0, pointsToday: 0, lastDay: day };
+    if (!accessToken) {
+      return res.status(401).json({ ok: false, error: "Missing access token" });
+    }
 
-  if (users[username].lastDay !== day) {
-    users[username].lastDay = day;
-    users[username].pointsToday = 0;
+    const piRes = await fetch("https://api.minepi.com/v2/me", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!piRes.ok) {
+      return res.status(401).json({ ok: false, error: "Pi token invalid" });
+    }
+
+    const piUser = await piRes.json();
+    const user = upsertUser(piUser.uid, piUser.username);
+
+    res.json({ ok: true, user });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
-
-  if (users[username].pointsToday >= 30) {
-    return res.json({ ok: false, capped: true, pointsToday: users[username].pointsToday, pointsThisWeek: users[username].pointsThisWeek });
-  }
-
-  const valid = await verifyAdIdWithPi(adId);
-  if (!valid) return res.status(401).json({ ok: false, error: "Invalid adId" });
-
-  users[username].pointsToday += 1;
-  users[username].pointsThisWeek += 1;
-
-  return res.json({
-    ok: true,
-    pointsToday: users[username].pointsToday,
-    pointsThisWeek: users[username].pointsThisWeek,
-  });
 });
 
-app.get("/points/:username", (req, res) => {
-  const u = users[req.params.username];
-  res.json({ ok: true, pointsThisWeek: u?.pointsThisWeek || 0, pointsToday: u?.pointsToday || 0 });
+app.get("/api/me", (req, res) => {
+  const user = db.prepare("SELECT * FROM users ORDER BY id DESC LIMIT 1").get();
+  const progress = user
+    ? db.prepare("SELECT * FROM progress WHERE uid=?").get(user.uid)
+    : null;
+
+  res.json({ ok: true, user, progress });
 });
 
-app.listen(5050, () => console.log("Backend running on http://localhost:5050"));
+const PORT = process.env.PORT || 5050;
+app.listen(PORT, () => console.log("Backend running on", PORT));
