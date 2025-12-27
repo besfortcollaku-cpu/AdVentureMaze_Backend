@@ -11,6 +11,13 @@ import {
   addCoins,
   getProgressByUid,
   setProgressByUid,
+
+  // ✅ rewards / utility
+  claimReward,
+  claimDailyLogin,
+  claimLevelComplete,
+  useSkip,
+  useHint,
 } from "./db";
 
 // ---------------------------
@@ -124,6 +131,7 @@ app.post("/auth/pi/verify", handlePiVerify);
 // - Requires Authorization: Bearer <Pi accessToken>
 // - Verifies token with Pi
 // - Upserts user
+// - ✅ Auto-claims DAILY LOGIN (+5) once per day
 // - Returns user + progress
 // =======================================================
 
@@ -132,13 +140,23 @@ app.get("/api/me", async (req, res) => {
     const { uid, username } = await requirePiUser(req);
 
     // Create/update user
-    const user = upsertUser({ uid, username });
+    let user = upsertUser({ uid, username });
+
+    // ✅ Daily login (+5) once per UTC day (idempotent via nonce)
+    try {
+      const out = claimDailyLogin(uid);
+      if (out?.ok && out?.user) user = out.user;
+    } catch {
+      // ignore (already claimed or other minor error)
+    }
 
     // Load progress (default if none)
     const p = getProgressByUid(uid);
+
+    // ✅ Coins source of truth is users.coins (progress.coins can drift; don't return it)
     const progress = p
-      ? { uid, level: p.level, coins: p.coins, updated_at: p.updated_at }
-      : { uid, level: 1, coins: 0, updated_at: null };
+      ? { uid, level: p.level, updated_at: p.updated_at }
+      : { uid, level: 1, updated_at: null };
 
     return res.json({
       ok: true,
@@ -146,11 +164,154 @@ app.get("/api/me", async (req, res) => {
         uid: user?.uid,
         username: user?.username,
         coins: user?.coins ?? 0,
+        free_skips_used: user?.free_skips_used ?? 0,
+        free_hints_used: user?.free_hints_used ?? 0,
+        last_payout_month: user?.last_payout_month ?? null,
       },
       progress,
     });
   } catch (e: any) {
     return res.status(401).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// =======================================================
+// ✅ REWARDS API
+// =======================================================
+//
+// All reward endpoints require Authorization: Bearer <Pi accessToken>
+// We always resolve uid by verifying token with Pi (source of truth).
+//
+
+// (Optional) explicit daily login claim (you can call /api/me and it auto-claims)
+app.post("/api/rewards/daily-login", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const out = claimDailyLogin(uid);
+    return res.json({
+      ok: true,
+      already: !!out?.already,
+      user: out?.user,
+    });
+  } catch (e: any) {
+    return res.status(401).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Level complete +1 coin (idempotent per uid+level)
+app.post("/api/rewards/level-complete", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+
+    const level = Number(req.body?.level || 0);
+    if (!level) {
+      return res.status(400).json({ ok: false, error: "level required" });
+    }
+
+    const out = claimLevelComplete(uid, level);
+    return res.json({ ok: true, already: !!out?.already, user: out?.user });
+  } catch (e: any) {
+    const msg = e?.message || String(e);
+    // auth-ish errors -> 401, otherwise 500
+    const lower = String(msg).toLowerCase();
+    const code =
+      lower.includes("bearer") || lower.includes("token") || lower.includes("unauthorized")
+        ? 401
+        : 500;
+
+    return res.status(code).json({ ok: false, error: msg });
+  }
+});
+
+// Watch ad voluntarily +50 (idempotent via nonce)
+app.post("/api/rewards/ad-50", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const nonce = String(req.body?.nonce || "").trim();
+    if (!nonce) {
+      return res.status(400).json({ ok: false, error: "nonce required" });
+    }
+
+    const out = claimReward({
+      uid,
+      type: "ad_50",
+      nonce,
+      amount: 50,
+      cooldownSeconds: 0,
+    });
+
+    return res.json({ ok: true, already: !!out?.already, user: out?.user });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Skip: 3 free lifetime, then -50 coins (server enforced)
+// If you want "watch ad to skip", call /api/rewards/skip-ad with nonce.
+app.post("/api/skip", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const out = useSkip(uid);
+    return res.json(out);
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Hint: 3 free lifetime, then -50 coins (server enforced)
+// If you want "watch ad to hint", call /api/rewards/hint-ad with nonce.
+app.post("/api/hint", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const out = useHint(uid);
+    return res.json(out);
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Optional: watch-ad alternatives (no coin cost). We still store an idempotent claim to prevent spam.
+app.post("/api/rewards/skip-ad", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const nonce = String(req.body?.nonce || "").trim();
+    if (!nonce) {
+      return res.status(400).json({ ok: false, error: "nonce required" });
+    }
+
+    const out = claimReward({
+      uid,
+      type: "skip_ad",
+      nonce,
+      amount: 0,
+      cooldownSeconds: 0,
+    });
+
+    return res.json({ ok: true, already: !!out?.already });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+app.post("/api/rewards/hint-ad", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const nonce = String(req.body?.nonce || "").trim();
+    if (!nonce) {
+      return res.status(400).json({ ok: false, error: "nonce required" });
+    }
+
+    const out = claimReward({
+      uid,
+      type: "hint_ad",
+      nonce,
+      amount: 0,
+      cooldownSeconds: 0,
+    });
+
+    return res.json({ ok: true, already: !!out?.already });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
@@ -168,15 +329,23 @@ app.get("/api/users/by-uid", (req, res) => {
   return res.json({ ok: true, user });
 });
 
-app.post("/api/users/coins", (req, res) => {
+// ✅ coin add/subtract by uid (AUTH REQUIRED + ONLY SELF)
+// NOTE: keep for debug if you want, but this prevents anyone modifying other users.
+app.post("/api/users/coins", async (req, res) => {
   try {
+    const { uid: authedUid } = await requirePiUser(req);
+
     const { uid, delta } = req.body || {};
     if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
+
+    if (String(uid) !== String(authedUid)) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
 
     const updated = addCoins(String(uid), Number(delta || 0));
     return res.json({ ok: true, user: updated });
   } catch (e: any) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(401).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
@@ -187,6 +356,8 @@ app.post("/api/users/coins", (req, res) => {
 // GET  /progress?uid=...
 // POST /progress { uid, level, coins }
 //
+// NOTE: coins here is legacy; prefer users.coins. Keep endpoint for compatibility.
+//
 
 app.get("/progress", (req, res) => {
   const uid = String(req.query.uid || "").trim();
@@ -194,7 +365,9 @@ app.get("/progress", (req, res) => {
 
   const row = getProgressByUid(uid);
 
-  const data = row ? { uid, level: row.level, coins: row.coins } : { uid, level: 1, coins: 0 };
+  const data = row
+    ? { uid, level: row.level, coins: row.coins }
+    : { uid, level: 1, coins: 0 };
 
   return res.json({ ok: true, data });
 });
