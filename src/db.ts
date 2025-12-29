@@ -1,233 +1,283 @@
-// src/db.ts last change
-import Database from "better-sqlite3";
+// src/db.ts
+//
+// Postgres version of your SQLite DB layer.
+// Requires: npm i pg
+// Env: DATABASE_URL (Render Postgres "Internal Database URL")
+//
+// Keeps the same exported function names + behavior you already use in src/index.ts.
 
-let db: Database.Database | null = null;
+import { Pool, PoolClient } from "pg";
 
 // ✅ Lifetime freebies (not per month)
 const FREE_SKIPS = 3;
 const FREE_HINTS = 3;
 
-export function initDB() {
-  if (db) return db;
+let pool: Pool | null = null;
 
-  db = new Database("data.sqlite");
+function getPool() {
+  if (!pool) {
+    const url = process.env.DATABASE_URL;
+    if (!url) {
+      throw new Error("Missing DATABASE_URL env var (Render Postgres connection string).");
+    }
+    const needsSSL =
+      /sslmode=require/i.test(url) ||
+      process.env.PGSSLMODE === "require" ||
+      process.env.PGSSL === "true";
 
-  // ---------------------------
+    pool = new Pool({
+      connectionString: url,
+      ...(needsSSL ? { ssl: { rejectUnauthorized: false } } : {}),
+    });
+  }
+  return pool;
+}
+
+// Run schema creation once on boot (idempotent)
+export async function initDB() {
+  const p = getPool();
+  const client = await p.connect();
+  try {
+    await client.query("BEGIN");
+    await ensureSchema(client);
+    await client.query("COMMIT");
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    throw e;
+  } finally {
+    client.release();
+  }
+  return p;
+}
+
+/* =========================
+   SCHEMA
+   ========================= */
+
+async function ensureSchema(c: PoolClient) {
   // USERS
-  // ---------------------------
-  db.exec(`
+  await c.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id BIGSERIAL PRIMARY KEY,
       uid TEXT UNIQUE,
       username TEXT UNIQUE,
       coins INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      free_skips_used INTEGER NOT NULL DEFAULT 0,
+      free_hints_used INTEGER NOT NULL DEFAULT 0,
+      last_payout_month TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_users_uid ON users(uid);
-    CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-  `);
+  await c.query(`CREATE INDEX IF NOT EXISTS idx_users_uid ON users(uid);`);
+  await c.query(`CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);`);
 
-  // ✅ Add new columns to users table (safe migration)
-  ensureUserColumns();
-
-  // ---------------------------
   // PROGRESS (UID)
-  // ---------------------------
-  db.exec(`
+  await c.query(`
     CREATE TABLE IF NOT EXISTS progress (
       uid TEXT PRIMARY KEY,
       level INTEGER NOT NULL DEFAULT 1,
       coins INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+  await c.query(`CREATE INDEX IF NOT EXISTS idx_progress_uid ON progress(uid);`);
 
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_progress_uid ON progress(uid);
-  `);
-
-  // ---------------------------
-  // ✅ REWARD CLAIMS (idempotency via nonce UNIQUE)
-  // - daily_login, ad_50, skip_ad, hint_ad, ...
-  // ---------------------------
-  db.exec(`
+  // REWARD CLAIMS (idempotency via nonce UNIQUE)
+  await c.query(`
     CREATE TABLE IF NOT EXISTS reward_claims (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id BIGSERIAL PRIMARY KEY,
       uid TEXT NOT NULL,
       type TEXT NOT NULL,
       nonce TEXT NOT NULL UNIQUE,
       amount INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-
-  db.exec(`
+  await c.query(`
     CREATE INDEX IF NOT EXISTS idx_reward_claims_uid_type_time
     ON reward_claims(uid, type, created_at);
   `);
 
-  // ---------------------------
-  // ✅ LEVEL REWARDS (level complete +1 once per uid+level)
-  // ---------------------------
-  db.exec(`
+  // LEVEL REWARDS (level complete +1 once per uid+level)
+  await c.query(`
     CREATE TABLE IF NOT EXISTS level_rewards (
       uid TEXT NOT NULL,
       level INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY(uid, level)
     );
   `);
+  await c.query(`CREATE INDEX IF NOT EXISTS idx_level_rewards_uid ON level_rewards(uid);`);
 
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_level_rewards_uid ON level_rewards(uid);
-  `);
-
-  // ---------------------------
-  // ✅ PAYMENTS (track paymentId ownership)
-  // ---------------------------
-  db.exec(`
+  // PAYMENTS
+  await c.query(`
     CREATE TABLE IF NOT EXISTS payments (
       payment_id TEXT PRIMARY KEY,
       uid TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'created',  -- created/approved/completed
+      status TEXT NOT NULL DEFAULT 'created',
       txid TEXT,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+  await c.query(`CREATE INDEX IF NOT EXISTS idx_payments_uid ON payments(uid);`);
 
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_payments_uid ON payments(uid);
-  `);
-
-  // ---------------------------
-  // ✅ MONTHLY PAYOUTS LEDGER (for Pi conversion later)
-  // - prevents paying twice per month
-  // - after you really pay user => reset coins in users
-  // ---------------------------
-  db.exec(`
+  // MONTHLY PAYOUTS LEDGER
+  await c.query(`
     CREATE TABLE IF NOT EXISTS monthly_payouts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id BIGSERIAL PRIMARY KEY,
       uid TEXT NOT NULL,
       month TEXT NOT NULL,                 -- e.g. "2026-01"
       coins INTEGER NOT NULL,
-      pi_amount REAL NOT NULL DEFAULT 0,
+      pi_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'created', -- created/processing/sent/failed
       txid TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE(uid, month)
     );
   `);
-
-  db.exec(`
+  await c.query(`
     CREATE INDEX IF NOT EXISTS idx_monthly_payouts_uid_month
     ON monthly_payouts(uid, month);
   `);
-
-  // ---------------------------
-  // ✅ MIGRATION (old progress(username...) -> progress(uid...))
-  // ---------------------------
-  migrateLegacyProgress();
-
-  return db;
-}
-
-function getDB() {
-  if (!db) initDB();
-  return db!;
 }
 
 /* =========================
    USERS API
    ========================= */
 
-export function upsertUser({ uid, username }: { uid: string; username: string }) {
-  const d = getDB();
+export async function upsertUser({ uid, username }: { uid: string; username: string }) {
+  const p = getPool();
+  const client = await p.connect();
+  try {
+    await client.query("BEGIN");
 
-  const existingByUsername = getUserByUsername(username);
-  if (existingByUsername && existingByUsername.uid && existingByUsername.uid !== uid) {
-    throw new Error("Username already linked to another account.");
+    // protect against username collision with another uid
+    const existingByUsername = await getUserByUsername(username, client);
+    if (existingByUsername?.uid && existingByUsername.uid !== uid) {
+      throw new Error("Username already linked to another account.");
+    }
+
+    // Upsert by uid
+    await client.query(
+      `
+      INSERT INTO users (uid, username, coins, created_at, updated_at)
+      VALUES ($1, $2, 0, NOW(), NOW())
+      ON CONFLICT (uid) DO UPDATE SET
+        username = EXCLUDED.username,
+        updated_at = NOW()
+      `,
+      [uid, username]
+    );
+
+    const user = await getUserByUid(uid, client);
+
+    await client.query("COMMIT");
+    return user;
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    throw e;
+  } finally {
+    client.release();
   }
-
-  const stmt = d.prepare(`
-    INSERT INTO users (uid, username, coins, created_at, updated_at)
-    VALUES (@uid, @username, 0, datetime('now'), datetime('now'))
-    ON CONFLICT(uid) DO UPDATE SET
-      username = excluded.username,
-      updated_at = datetime('now')
-  `);
-
-  stmt.run({ uid, username });
-  return getUserByUid(uid);
 }
 
-export function getUserByUid(uid: string) {
-  const d = getDB();
-  const stmt = d.prepare(`SELECT * FROM users WHERE uid = ? LIMIT 1`);
-  return stmt.get(uid) as
-    | {
-        id: number;
-        uid: string;
-        username: string;
-        coins: number;
-        free_skips_used?: number;
-        free_hints_used?: number;
-        last_payout_month?: string | null;
-        created_at: string;
-        updated_at: string;
-      }
-    | undefined;
+export async function getUserByUid(uid: string, client?: PoolClient) {
+  const run = async (c: PoolClient) => {
+    const r = await c.query(`SELECT * FROM users WHERE uid = $1 LIMIT 1`, [uid]);
+    return (r.rows[0] || undefined) as
+      | {
+          id: number;
+          uid: string;
+          username: string;
+          coins: number;
+          free_skips_used: number;
+          free_hints_used: number;
+          last_payout_month: string | null;
+          created_at: string;
+          updated_at: string;
+        }
+      | undefined;
+  };
+
+  if (client) return run(client);
+  const p = getPool();
+  const c = await p.connect();
+  try {
+    return await run(c);
+  } finally {
+    c.release();
+  }
 }
 
-export function getUserByUsername(username: string) {
-  const d = getDB();
-  const stmt = d.prepare(`SELECT * FROM users WHERE username = ? LIMIT 1`);
-  return stmt.get(username) as
-    | {
-        id: number;
-        uid: string;
-        username: string;
-        coins: number;
-        free_skips_used?: number;
-        free_hints_used?: number;
-        last_payout_month?: string | null;
-        created_at: string;
-        updated_at: string;
-      }
-    | undefined;
+export async function getUserByUsername(username: string, client?: PoolClient) {
+  const run = async (c: PoolClient) => {
+    const r = await c.query(`SELECT * FROM users WHERE username = $1 LIMIT 1`, [username]);
+    return (r.rows[0] || undefined) as
+      | {
+          id: number;
+          uid: string;
+          username: string;
+          coins: number;
+          free_skips_used: number;
+          free_hints_used: number;
+          last_payout_month: string | null;
+          created_at: string;
+          updated_at: string;
+        }
+      | undefined;
+  };
+
+  if (client) return run(client);
+  const p = getPool();
+  const c = await p.connect();
+  try {
+    return await run(c);
+  } finally {
+    c.release();
+  }
 }
 
 // Adds/subtracts coins, never below 0
-export function addCoins(uid: string, delta: number) {
-  const d = getDB();
+export async function addCoins(uid: string, delta: number, client?: PoolClient) {
+  const d = Math.trunc(delta || 0);
 
-  const user = getUserByUid(uid);
-  if (!user) throw new Error("User not found");
+  const run = async (c: PoolClient) => {
+    const user = await getUserByUid(uid, c);
+    if (!user) throw new Error("User not found");
 
-  const stmt = d.prepare(`
-    UPDATE users
-    SET coins = CASE
-      WHEN coins + @delta < 0 THEN 0
-      ELSE coins + @delta
-    END,
-    updated_at = datetime('now')
-    WHERE uid = @uid
-  `);
+    const r = await c.query(
+      `
+      UPDATE users
+      SET coins = GREATEST(0, coins + $2),
+          updated_at = NOW()
+      WHERE uid = $1
+      RETURNING *
+      `,
+      [uid, d]
+    );
 
-  stmt.run({ uid, delta: Math.trunc(delta) });
-  return getUserByUid(uid);
+    return (r.rows[0] || undefined) as typeof user | undefined;
+  };
+
+  if (client) return run(client);
+  const p = getPool();
+  const c = await p.connect();
+  try {
+    return await run(c);
+  } finally {
+    c.release();
+  }
 }
 
 /* =========================
    PROGRESS API (UID BASED)
    ========================= */
 
-export function setProgressByUid({
+export async function setProgressByUid({
   uid,
   level,
   coins,
@@ -236,37 +286,47 @@ export function setProgressByUid({
   level: number;
   coins: number;
 }) {
-  const d = getDB();
+  const p = getPool();
+  const c = await p.connect();
+  try {
+    const lvl = Math.max(1, Math.trunc(level || 1));
+    const cns = Math.max(0, Math.trunc(coins || 0));
 
-  const stmt = d.prepare(`
-    INSERT INTO progress (uid, level, coins, updated_at)
-    VALUES (@uid, @level, @coins, datetime('now'))
-    ON CONFLICT(uid) DO UPDATE SET
-      level = excluded.level,
-      coins = excluded.coins,
-      updated_at = datetime('now')
-  `);
-
-  stmt.run({
-    uid,
-    level: Math.max(1, Math.trunc(level || 1)),
-    coins: Math.max(0, Math.trunc(coins || 0)),
-  });
+    await c.query(
+      `
+      INSERT INTO progress (uid, level, coins, updated_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (uid) DO UPDATE SET
+        level = EXCLUDED.level,
+        coins = EXCLUDED.coins,
+        updated_at = NOW()
+      `,
+      [uid, lvl, cns]
+    );
+  } finally {
+    c.release();
+  }
 }
 
-export function getProgressByUid(uid: string) {
-  const d = getDB();
-  const stmt = d.prepare(`SELECT * FROM progress WHERE uid = ? LIMIT 1`);
-  return stmt.get(uid) as
-    | { uid: string; level: number; coins: number; updated_at: string }
-    | undefined;
+export async function getProgressByUid(uid: string) {
+  const p = getPool();
+  const c = await p.connect();
+  try {
+    const r = await c.query(`SELECT * FROM progress WHERE uid = $1 LIMIT 1`, [uid]);
+    const row = r.rows[0];
+    return (row || undefined) as
+      | { uid: string; level: number; coins: number; updated_at: string }
+      | undefined;
+  } finally {
+    c.release();
+  }
 }
 
 /* =========================
    ✅ REWARDS (server-side)
    ========================= */
 
-export function claimReward({
+export async function claimReward({
   uid,
   type,
   nonce,
@@ -279,59 +339,73 @@ export function claimReward({
   amount: number;
   cooldownSeconds?: number;
 }) {
-  const d = getDB();
-  const user = getUserByUid(uid);
-  if (!user) throw new Error("User not found");
+  const p = getPool();
+  const c = await p.connect();
 
-  const tx = d.transaction(() => {
-    // 1) Idempotency
-    const existing = d
-      .prepare(`SELECT id FROM reward_claims WHERE nonce = ? LIMIT 1`)
-      .get(nonce) as any;
+  try {
+    await c.query("BEGIN");
 
-    if (existing?.id) {
-      return { ok: true, already: true, user: getUserByUid(uid) };
+    const user = await getUserByUid(uid, c);
+    if (!user) throw new Error("User not found");
+
+    // 1) Idempotency: if nonce already exists -> already claimed
+    const existing = await c.query(
+      `SELECT id FROM reward_claims WHERE nonce = $1 LIMIT 1`,
+      [nonce]
+    );
+    if (existing.rows[0]?.id) {
+      await c.query("COMMIT");
+      return { ok: true, already: true, user: await getUserByUid(uid, c) };
     }
 
-    // 2) Cooldown (per uid+type)
-    const last = d
-      .prepare(
-        `SELECT created_at FROM reward_claims
-         WHERE uid = ? AND type = ?
-         ORDER BY datetime(created_at) DESC
-         LIMIT 1`
-      )
-      .get(uid, type) as any;
+    // 2) Cooldown check (per uid+type)
+    if ((cooldownSeconds || 0) > 0) {
+      const last = await c.query(
+        `
+        SELECT created_at FROM reward_claims
+        WHERE uid = $1 AND type = $2
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [uid, type]
+      );
 
-    if (last?.created_at) {
-      const lastMs = Date.parse(last.created_at + "Z");
-      const nowMs = Date.now();
-      const diff = (nowMs - lastMs) / 1000;
-      if (diff < cooldownSeconds) {
-        throw new Error(`Cooldown: wait ${Math.ceil(cooldownSeconds - diff)}s`);
+      const lastAt: Date | undefined = last.rows[0]?.created_at;
+      if (lastAt) {
+        const diffSeconds = (Date.now() - new Date(lastAt).getTime()) / 1000;
+        if (diffSeconds < cooldownSeconds) {
+          throw new Error(`Cooldown: wait ${Math.ceil(cooldownSeconds - diffSeconds)}s`);
+        }
       }
     }
 
     // 3) Insert claim
-    d.prepare(
-      `INSERT INTO reward_claims (uid, type, nonce, amount, created_at)
-       VALUES (?, ?, ?, ?, datetime('now'))`
-    ).run(uid, type, nonce, Math.trunc(amount));
+    await c.query(
+      `
+      INSERT INTO reward_claims (uid, type, nonce, amount, created_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      `,
+      [uid, type, nonce, Math.trunc(amount || 0)]
+    );
 
     // 4) Apply coins
-    addCoins(uid, amount);
+    const updatedUser = await addCoins(uid, Math.trunc(amount || 0), c);
 
-    return { ok: true, already: false, user: getUserByUid(uid) };
-  });
-
-  return tx();
+    await c.query("COMMIT");
+    return { ok: true, already: false, user: updatedUser };
+  } catch (e) {
+    try { await c.query("ROLLBACK"); } catch {}
+    throw e;
+  } finally {
+    c.release();
+  }
 }
 
 /**
  * Daily login +5 coins once per day (UTC).
  * nonce is deterministic => only once/day.
  */
-export function claimDailyLogin(uid: string, dayKey?: string) {
+export async function claimDailyLogin(uid: string, dayKey?: string) {
   const key = dayKey || getDayKeyUTC(); // e.g. "2025-12-27"
   const nonce = `daily:${uid}:${key}`;
   return claimReward({
@@ -346,111 +420,153 @@ export function claimDailyLogin(uid: string, dayKey?: string) {
 /**
  * Level complete +1 coin, only once per uid+level.
  */
-export function claimLevelComplete(uid: string, level: number) {
-  const d = getDB();
-  const user = getUserByUid(uid);
-  if (!user) throw new Error("User not found");
-
+export async function claimLevelComplete(uid: string, level: number) {
   const lvl = Math.max(1, Math.trunc(level || 1));
 
-  const tx = d.transaction(() => {
-    const already = d
-      .prepare(`SELECT 1 FROM level_rewards WHERE uid = ? AND level = ? LIMIT 1`)
-      .get(uid, lvl) as any;
+  const p = getPool();
+  const c = await p.connect();
+  try {
+    await c.query("BEGIN");
 
-    if (already) {
-      return { ok: true, already: true, user: getUserByUid(uid) };
+    const user = await getUserByUid(uid, c);
+    if (!user) throw new Error("User not found");
+
+    const already = await c.query(
+      `SELECT 1 FROM level_rewards WHERE uid = $1 AND level = $2 LIMIT 1`,
+      [uid, lvl]
+    );
+    if (already.rows[0]) {
+      await c.query("COMMIT");
+      return { ok: true, already: true, user: await getUserByUid(uid, c) };
     }
 
-    d.prepare(
-      `INSERT INTO level_rewards (uid, level, created_at)
-       VALUES (?, ?, datetime('now'))`
-    ).run(uid, lvl);
+    await c.query(
+      `INSERT INTO level_rewards (uid, level, created_at) VALUES ($1, $2, NOW())`,
+      [uid, lvl]
+    );
 
-    addCoins(uid, 1);
+    const updatedUser = await addCoins(uid, 1, c);
 
-    return { ok: true, already: false, user: getUserByUid(uid) };
-  });
-
-  return tx();
+    await c.query("COMMIT");
+    return { ok: true, already: false, user: updatedUser };
+  } catch (e) {
+    try { await c.query("ROLLBACK"); } catch {}
+    throw e;
+  } finally {
+    c.release();
+  }
 }
 
 /* =========================
    ✅ SKIP / HINT (3 free lifetime then -50)
    ========================= */
 
-export function useSkip(uid: string) {
-  const d = getDB();
-  const user = getUserByUid(uid);
-  if (!user) throw new Error("User not found");
+export async function useSkip(uid: string) {
+  const p = getPool();
+  const c = await p.connect();
 
-  const used = Number(user.free_skips_used || 0);
+  try {
+    await c.query("BEGIN");
 
-  if (used < FREE_SKIPS) {
-    d.prepare(
-      `UPDATE users
-       SET free_skips_used = free_skips_used + 1,
-           updated_at = datetime('now')
-       WHERE uid = ?`
-    ).run(uid);
+    const user = await getUserByUid(uid, c);
+    if (!user) throw new Error("User not found");
 
+    const used = Number(user.free_skips_used || 0);
+
+    if (used < FREE_SKIPS) {
+      const r = await c.query(
+        `
+        UPDATE users
+        SET free_skips_used = free_skips_used + 1,
+            updated_at = NOW()
+        WHERE uid = $1
+        RETURNING *
+        `,
+        [uid]
+      );
+
+      await c.query("COMMIT");
+      return {
+        ok: true,
+        mode: "free",
+        freeLeft: FREE_SKIPS - (used + 1),
+        user: r.rows[0],
+      };
+    }
+
+    if ((user.coins || 0) < 50) {
+      throw new Error("Not enough coins for skip (need 50) or watch an ad.");
+    }
+
+    const updatedUser = await addCoins(uid, -50, c);
+
+    await c.query("COMMIT");
     return {
       ok: true,
-      mode: "free",
-      freeLeft: FREE_SKIPS - (used + 1),
-      user: getUserByUid(uid),
+      mode: "coins",
+      freeLeft: 0,
+      user: updatedUser,
     };
+  } catch (e) {
+    try { await c.query("ROLLBACK"); } catch {}
+    throw e;
+  } finally {
+    c.release();
   }
-
-  if ((user.coins || 0) < 50) {
-    throw new Error("Not enough coins for skip (need 50) or watch an ad.");
-  }
-
-  addCoins(uid, -50);
-
-  return {
-    ok: true,
-    mode: "coins",
-    freeLeft: 0,
-    user: getUserByUid(uid),
-  };
 }
 
-export function useHint(uid: string) {
-  const d = getDB();
-  const user = getUserByUid(uid);
-  if (!user) throw new Error("User not found");
+export async function useHint(uid: string) {
+  const p = getPool();
+  const c = await p.connect();
 
-  const used = Number(user.free_hints_used || 0);
+  try {
+    await c.query("BEGIN");
 
-  if (used < FREE_HINTS) {
-    d.prepare(
-      `UPDATE users
-       SET free_hints_used = free_hints_used + 1,
-           updated_at = datetime('now')
-       WHERE uid = ?`
-    ).run(uid);
+    const user = await getUserByUid(uid, c);
+    if (!user) throw new Error("User not found");
 
+    const used = Number(user.free_hints_used || 0);
+
+    if (used < FREE_HINTS) {
+      const r = await c.query(
+        `
+        UPDATE users
+        SET free_hints_used = free_hints_used + 1,
+            updated_at = NOW()
+        WHERE uid = $1
+        RETURNING *
+        `,
+        [uid]
+      );
+
+      await c.query("COMMIT");
+      return {
+        ok: true,
+        mode: "free",
+        freeLeft: FREE_HINTS - (used + 1),
+        user: r.rows[0],
+      };
+    }
+
+    if ((user.coins || 0) < 50) {
+      throw new Error("Not enough coins for hint (need 50) or watch an ad.");
+    }
+
+    const updatedUser = await addCoins(uid, -50, c);
+
+    await c.query("COMMIT");
     return {
       ok: true,
-      mode: "free",
-      freeLeft: FREE_HINTS - (used + 1),
-      user: getUserByUid(uid),
+      mode: "coins",
+      freeLeft: 0,
+      user: updatedUser,
     };
+  } catch (e) {
+    try { await c.query("ROLLBACK"); } catch {}
+    throw e;
+  } finally {
+    c.release();
   }
-
-  if ((user.coins || 0) < 50) {
-    throw new Error("Not enough coins for hint (need 50) or watch an ad.");
-  }
-
-  addCoins(uid, -50);
-
-  return {
-    ok: true,
-    mode: "coins",
-    freeLeft: 0,
-    user: getUserByUid(uid),
-  };
 }
 
 /* =========================
@@ -464,133 +580,157 @@ export function getCurrentMonthKeyUTC() {
   return `${y}-${m}`;
 }
 
-export function createMonthlyPayout(uid: string, month = getCurrentMonthKeyUTC(), piAmount = 0) {
-  const d = getDB();
-  const user = getUserByUid(uid);
-  if (!user) throw new Error("User not found");
+export async function createMonthlyPayout(
+  uid: string,
+  month = getCurrentMonthKeyUTC(),
+  piAmount = 0
+) {
+  const p = getPool();
+  const c = await p.connect();
 
-  const coins = Number(user.coins || 0);
+  try {
+    await c.query("BEGIN");
 
-  const stmt = d.prepare(`
-    INSERT INTO monthly_payouts (uid, month, coins, pi_amount, status, created_at, updated_at)
-    VALUES (@uid, @month, @coins, @pi_amount, 'created', datetime('now'), datetime('now'))
-    ON CONFLICT(uid, month) DO NOTHING
-  `);
+    const user = await getUserByUid(uid, c);
+    if (!user) throw new Error("User not found");
 
-  stmt.run({ uid, month, coins, pi_amount: piAmount });
+    const coins = Number(user.coins || 0);
 
-  return d
-    .prepare(`SELECT * FROM monthly_payouts WHERE uid = ? AND month = ? LIMIT 1`)
-    .get(uid, month) as any;
+    await c.query(
+      `
+      INSERT INTO monthly_payouts (uid, month, coins, pi_amount, status, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, 'created', NOW(), NOW())
+      ON CONFLICT (uid, month) DO NOTHING
+      `,
+      [uid, month, coins, Number(piAmount || 0)]
+    );
+
+    const row = await c.query(
+      `SELECT * FROM monthly_payouts WHERE uid = $1 AND month = $2 LIMIT 1`,
+      [uid, month]
+    );
+
+    await c.query("COMMIT");
+    return row.rows[0] || null;
+  } catch (e) {
+    try { await c.query("ROLLBACK"); } catch {}
+    throw e;
+  } finally {
+    c.release();
+  }
 }
 
 /**
  * After payout is confirmed SENT, reset coins to 0 (current month from 0).
  */
-export function resetUserCoinsAfterPayout(uid: string, month = getCurrentMonthKeyUTC()) {
-  const d = getDB();
-  d.prepare(
-    `UPDATE users
-     SET coins = 0,
-         last_payout_month = ?,
-         updated_at = datetime('now')
-     WHERE uid = ?`
-  ).run(month, uid);
+export async function resetUserCoinsAfterPayout(
+  uid: string,
+  month = getCurrentMonthKeyUTC()
+) {
+  const p = getPool();
+  const c = await p.connect();
 
-  return getUserByUid(uid);
+  try {
+    const r = await c.query(
+      `
+      UPDATE users
+      SET coins = 0,
+          last_payout_month = $2,
+          updated_at = NOW()
+      WHERE uid = $1
+      RETURNING *
+      `,
+      [uid, month]
+    );
+
+    return r.rows[0] || undefined;
+  } finally {
+    c.release();
+  }
 }
 
 /* =========================
-   ✅ MIGRATION HELPERS
+   PAYMENTS TRACKING
    ========================= */
 
-function ensureUserColumns() {
-  const d = getDB();
-  const cols = d.prepare(`PRAGMA table_info(users)`).all() as any[];
-  const has = (name: string) => cols.some((c) => c.name === name);
-
-  if (!has("free_skips_used")) {
-    d.exec(`ALTER TABLE users ADD COLUMN free_skips_used INTEGER NOT NULL DEFAULT 0;`);
-  }
-
-  if (!has("free_hints_used")) {
-    d.exec(`ALTER TABLE users ADD COLUMN free_hints_used INTEGER NOT NULL DEFAULT 0;`);
-  }
-
-  if (!has("last_payout_month")) {
-    d.exec(`ALTER TABLE users ADD COLUMN last_payout_month TEXT;`);
-  }
-}
-
-function hasTable(name: string) {
-  const d = getDB();
-  const row = d
-    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`)
-    .get(name);
-  return !!row;
-}
-
-function hasColumn(table: string, col: string) {
-  const d = getDB();
-  const cols = d.prepare(`PRAGMA table_info(${table})`).all() as any[];
-  return cols.some((c) => c.name === col);
-}
-
-function migrateLegacyProgress() {
-  const d = getDB();
-
-  if (!hasTable("progress")) return;
-  if (hasColumn("progress", "uid")) return;
-
-  d.exec(`ALTER TABLE progress RENAME TO progress_legacy;`);
-
-  d.exec(`
-    CREATE TABLE IF NOT EXISTS progress (
-      uid TEXT PRIMARY KEY,
-      level INTEGER NOT NULL DEFAULT 1,
-      coins INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+export async function upsertPaymentOwner({
+  paymentId,
+  uid,
+  status,
+  txid,
+}: {
+  paymentId: string;
+  uid: string;
+  status?: string;
+  txid?: string | null;
+}) {
+  const p = getPool();
+  const c = await p.connect();
+  try {
+    const r = await c.query(
+      `
+      INSERT INTO payments (payment_id, uid, status, txid, updated_at, created_at)
+      VALUES ($1, $2, COALESCE($3, 'created'), $4, NOW(), NOW())
+      ON CONFLICT (payment_id) DO UPDATE SET
+        uid = EXCLUDED.uid,
+        status = COALESCE(EXCLUDED.status, payments.status),
+        txid = COALESCE(EXCLUDED.txid, payments.txid),
+        updated_at = NOW()
+      RETURNING *
+      `,
+      [paymentId, uid, status || null, txid ?? null]
     );
-  `);
-
-  d.exec(`CREATE INDEX IF NOT EXISTS idx_progress_uid ON progress(uid);`);
-
-  const legacyRows = d
-    .prepare(`SELECT username, level, coins, updated_at FROM progress_legacy`)
-    .all() as any[];
-
-  const insert = d.prepare(`
-    INSERT INTO progress (uid, level, coins, updated_at)
-    VALUES (@uid, @level, @coins, COALESCE(@updated_at, datetime('now')))
-    ON CONFLICT(uid) DO UPDATE SET
-      level = excluded.level,
-      coins = excluded.coins,
-      updated_at = excluded.updated_at
-  `);
-
-  const findUidByUsername = d.prepare(
-    `SELECT uid FROM users WHERE username = ? LIMIT 1`
-  );
-
-  const tx = d.transaction(() => {
-    for (const r of legacyRows) {
-      const username = String(r.username || "");
-      let uid = username;
-
-      const mapped = findUidByUsername.get(username) as any;
-      if (mapped?.uid) uid = mapped.uid;
-
-      insert.run({
-        uid,
-        level: Math.max(1, Math.trunc(r.level || 1)),
-        coins: Math.max(0, Math.trunc(r.coins || 0)),
-        updated_at: r.updated_at,
-      });
-    }
-  });
-
-  tx();
+    return r.rows[0] || undefined;
+  } finally {
+    c.release();
+  }
 }
+
+export async function getPayment(paymentId: string) {
+  const p = getPool();
+  const c = await p.connect();
+  try {
+    const r = await c.query(
+      `SELECT * FROM payments WHERE payment_id = $1 LIMIT 1`,
+      [paymentId]
+    );
+    return r.rows[0] || undefined;
+  } finally {
+    c.release();
+  }
+}
+
+export async function assertPaymentOwnedBy(paymentId: string, uid: string) {
+  const p = await getPayment(paymentId);
+  if (!p) throw new Error("Unknown paymentId");
+  if (p.uid !== uid) throw new Error("Payment does not belong to this user");
+  return p;
+}
+
+export async function setPaymentStatus(paymentId: string, status: string, txid?: string | null) {
+  const p = getPool();
+  const c = await p.connect();
+  try {
+    const r = await c.query(
+      `
+      UPDATE payments
+      SET status = $2,
+          txid = COALESCE($3, txid),
+          updated_at = NOW()
+      WHERE payment_id = $1
+      RETURNING *
+      `,
+      [paymentId, status, txid ?? null]
+    );
+    return r.rows[0] || undefined;
+  } finally {
+    c.release();
+  }
+}
+
+/* =========================
+   UTIL
+   ========================= */
 
 function getDayKeyUTC() {
   const d = new Date();
