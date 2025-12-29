@@ -1,4 +1,4 @@
-// src/index.ts last change
+// src/index.ts (Postgres-ready)
 import "dotenv/config";
 
 import express from "express";
@@ -18,6 +18,15 @@ import {
   claimLevelComplete,
   useSkip,
   useHint,
+
+  // ✅ admin / sessions
+  startSession,
+  pingSession,
+  endSession,
+  adminListUsers,
+  adminGetUser,
+  adminGetStats,
+  adminListOnlineUsers,
 } from "./db";
 
 // ---------------------------
@@ -34,9 +43,6 @@ app.use(
 );
 
 app.use(express.json());
-
-// init sqlite ONCE
-initDB();
 
 // ---------------------------
 // Health
@@ -57,7 +63,6 @@ function getBearerToken(req: express.Request) {
 }
 
 async function verifyPiAccessToken(accessToken: string) {
-  // Node 18+ has global fetch. If you run older Node, upgrade or polyfill.
   const piRes = await fetch("https://api.minepi.com/v2/me", {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
@@ -87,6 +92,20 @@ async function requirePiUser(req: express.Request) {
   }
 
   return { uid: String(uid), username: String(username), accessToken: token };
+
+// =======================================================
+// ✅ ADMIN auth (simple shared secret)
+// - Send header: x-admin-secret: <ADMIN_SECRET>
+// - Set env ADMIN_SECRET on Render
+// =======================================================
+
+function requireAdmin(req: express.Request) {
+  const secret = String(req.headers["x-admin-secret"] || "");
+  const expected = String(process.env.ADMIN_SECRET || "");
+  if (!expected) throw new Error("ADMIN_SECRET not configured on server");
+  if (!secret || secret !== expected) throw new Error("Unauthorized (admin)");
+}
+
 }
 
 // =======================================================
@@ -114,7 +133,7 @@ async function handlePiVerify(req: express.Request, res: express.Response) {
         .json({ ok: false, error: "Pi user missing uid/username" });
     }
 
-    const user = upsertUser({ uid: String(uid), username: String(username) });
+    const user = await upsertUser({ uid: String(uid), username: String(username) });
 
     return res.json({ ok: true, user });
   } catch (e: any) {
@@ -128,11 +147,6 @@ app.post("/auth/pi/verify", handlePiVerify);
 
 // =======================================================
 // ✅ /api/me
-// - Requires Authorization: Bearer <Pi accessToken>
-// - Verifies token with Pi
-// - Upserts user
-// - ✅ Auto-claims DAILY LOGIN (+5) once per day
-// - Returns user + progress
 // =======================================================
 
 app.get("/api/me", async (req, res) => {
@@ -140,18 +154,18 @@ app.get("/api/me", async (req, res) => {
     const { uid, username } = await requirePiUser(req);
 
     // Create/update user
-    let user = upsertUser({ uid, username });
+    let user = await upsertUser({ uid, username });
 
     // ✅ Daily login (+5) once per UTC day (idempotent via nonce)
     try {
-      const out = claimDailyLogin(uid);
+      const out = await claimDailyLogin(uid);
       if (out?.ok && out?.user) user = out.user;
     } catch {
-      // ignore (already claimed or other minor error)
+      // ignore
     }
 
     // Load progress (default if none)
-    const p = getProgressByUid(uid);
+    const p = await getProgressByUid(uid);
     const progress = p
       ? { uid, level: p.level, coins: p.coins, updated_at: p.updated_at }
       : { uid, level: 1, coins: 0, updated_at: null };
@@ -176,16 +190,11 @@ app.get("/api/me", async (req, res) => {
 // =======================================================
 // ✅ REWARDS API
 // =======================================================
-//
-// All reward endpoints require Authorization: Bearer <Pi accessToken>
-// We always resolve uid by verifying token with Pi (source of truth).
-//
 
-// (Optional) explicit daily login claim (you can call /api/me and it auto-claims)
 app.post("/api/rewards/daily-login", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-    const out = claimDailyLogin(uid);
+    const out = await claimDailyLogin(uid);
     return res.json({
       ok: true,
       already: !!out?.already,
@@ -196,28 +205,26 @@ app.post("/api/rewards/daily-login", async (req, res) => {
   }
 });
 
-// Level complete +1 coin (idempotent per uid+level)
 app.post("/api/rewards/level-complete", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const level = Number(req.body?.level || 0);
     if (!level) return res.status(400).json({ ok: false, error: "level required" });
 
-    const out = claimLevelComplete(uid, level);
+    const out = await claimLevelComplete(uid, level);
     return res.json({ ok: true, already: !!out?.already, user: out?.user });
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// Watch ad voluntarily +50 (idempotent via nonce)
 app.post("/api/rewards/ad-50", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce || "").trim();
     if (!nonce) return res.status(400).json({ ok: false, error: "nonce required" });
 
-    const out = claimReward({
+    const out = await claimReward({
       uid,
       type: "ad_50",
       nonce,
@@ -231,38 +238,33 @@ app.post("/api/rewards/ad-50", async (req, res) => {
   }
 });
 
-// Skip: 3 free lifetime, then -50 coins (server enforced)
-// If you want "watch ad to skip", call /api/rewards/skip-ad with nonce.
 app.post("/api/skip", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-    const out = useSkip(uid);
+    const out = await useSkip(uid);
     return res.json(out);
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// Hint: 3 free lifetime, then -50 coins (server enforced)
-// If you want "watch ad to hint", call /api/rewards/hint-ad with nonce.
 app.post("/api/hint", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-    const out = useHint(uid);
+    const out = await useHint(uid);
     return res.json(out);
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// Optional: watch-ad alternatives (no coin cost). We still store an idempotent claim to prevent spam.
 app.post("/api/rewards/skip-ad", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce || "").trim();
     if (!nonce) return res.status(400).json({ ok: false, error: "nonce required" });
 
-    const out = claimReward({
+    const out = await claimReward({
       uid,
       type: "skip_ad",
       nonce,
@@ -282,7 +284,7 @@ app.post("/api/rewards/hint-ad", async (req, res) => {
     const nonce = String(req.body?.nonce || "").trim();
     if (!nonce) return res.status(400).json({ ok: false, error: "nonce required" });
 
-    const out = claimReward({
+    const out = await claimReward({
       uid,
       type: "hint_ad",
       nonce,
@@ -296,27 +298,131 @@ app.post("/api/rewards/hint-ad", async (req, res) => {
   }
 });
 
+
+
+// =======================================================
+// ✅ SESSIONS (client can call; used by admin online view)
+// =======================================================
+
+app.post("/api/session/start", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const sessionId = String(req.body?.sessionId || "").trim();
+    if (!sessionId) return res.status(400).json({ ok: false, error: "sessionId required" });
+
+    const userAgent = String(req.headers["user-agent"] || "");
+    const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "");
+
+    const row = await startSession({ uid, sessionId, userAgent, ip });
+    return res.json({ ok: true, session: row });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+app.post("/api/session/ping", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const sessionId = String(req.body?.sessionId || "").trim();
+    if (!sessionId) return res.status(400).json({ ok: false, error: "sessionId required" });
+
+    const row = await pingSession(uid, sessionId);
+    return res.json({ ok: true, session: row });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+app.post("/api/session/end", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const sessionId = String(req.body?.sessionId || "").trim();
+    if (!sessionId) return res.status(400).json({ ok: false, error: "sessionId required" });
+
+    const row = await endSession(uid, sessionId);
+    return res.json({ ok: true, session: row });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// =======================================================
+// ✅ ADMIN API (protected by x-admin-secret)
+// =======================================================
+
+app.get("/admin/stats", async (req, res) => {
+  try {
+    requireAdmin(req);
+    const minutes = Number(req.query.minutes || 5);
+    const out = await adminGetStats({ onlineMinutes: minutes });
+    return res.json({ ok: true, data: out });
+  } catch (e: any) {
+    return res.status(401).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+app.get("/admin/users", async (req, res) => {
+  try {
+    requireAdmin(req);
+    const search = String(req.query.search || "");
+    const limit = Number(req.query.limit || 50);
+    const offset = Number(req.query.offset || 0);
+    const order = String(req.query.order || "updated_at_desc") as any;
+    const out = await adminListUsers({ search, limit, offset, order });
+    return res.json({ ok: true, ...out });
+  } catch (e: any) {
+    return res.status(401).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+app.get("/admin/users/:uid", async (req, res) => {
+  try {
+    requireAdmin(req);
+    const uid = String(req.params.uid || "").trim();
+    if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
+
+    const out = await adminGetUser(uid);
+    if (!out) return res.status(404).json({ ok: false, error: "not found" });
+    return res.json({ ok: true, data: out });
+  } catch (e: any) {
+    return res.status(401).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+app.get("/admin/online", async (req, res) => {
+  try {
+    requireAdmin(req);
+    const minutes = Number(req.query.minutes || 5);
+    const limit = Number(req.query.limit || 50);
+    const offset = Number(req.query.offset || 0);
+    const out = await adminListOnlineUsers({ minutes, limit, offset });
+    return res.json({ ok: true, ...out });
+  } catch (e: any) {
+    return res.status(401).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+
 // =======================================================
 // ✅ USERS
 // =======================================================
 
-app.get("/api/users/by-uid", (req, res) => {
+app.get("/api/users/by-uid", async (req, res) => {
   const uid = String(req.query.uid || "").trim();
   if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
 
-  const user = getUserByUid(uid);
+  const user = await getUserByUid(uid);
   if (!user) return res.status(404).json({ ok: false, error: "not found" });
 
   return res.json({ ok: true, user });
 });
 
-// (Admin / debug only) coin add/subtract by uid
-app.post("/api/users/coins", (req, res) => {
+app.post("/api/users/coins", async (req, res) => {
   try {
     const { uid, delta } = req.body || {};
     if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
 
-    const updated = addCoins(String(uid), Number(delta || 0));
+    const updated = await addCoins(String(uid), Number(delta || 0));
     return res.json({ ok: true, user: updated });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -326,16 +432,12 @@ app.post("/api/users/coins", (req, res) => {
 // =======================================================
 // ✅ PROGRESS (UID ONLY)
 // =======================================================
-//
-// GET  /progress?uid=...
-// POST /progress { uid, level, coins }
-//
 
-app.get("/progress", (req, res) => {
+app.get("/progress", async (req, res) => {
   const uid = String(req.query.uid || "").trim();
   if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
 
-  const row = getProgressByUid(uid);
+  const row = await getProgressByUid(uid);
 
   const data = row
     ? { uid, level: row.level, coins: row.coins }
@@ -344,11 +446,11 @@ app.get("/progress", (req, res) => {
   return res.json({ ok: true, data });
 });
 
-app.post("/progress", (req, res) => {
+app.post("/progress", async (req, res) => {
   const { uid, level, coins } = req.body || {};
   if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
 
-  setProgressByUid({
+  await setProgressByUid({
     uid: String(uid),
     level: Number(level || 1),
     coins: Number(coins || 0),
@@ -358,5 +460,16 @@ app.post("/progress", (req, res) => {
 });
 
 // ---------------------------
-const PORT = Number(process.env.PORT) || 3001;
-app.listen(PORT, "0.0.0.0", () => console.log("Backend running on", PORT));
+// Start (ensure DB is ready first)
+// ---------------------------
+async function main() {
+  await initDB();
+
+  const PORT = Number(process.env.PORT) || 3001;
+  app.listen(PORT, "0.0.0.0", () => console.log("Backend running on", PORT));
+}
+
+main().catch((err) => {
+  console.error("Fatal startup error:", err);
+  process.exit(1);
+});
