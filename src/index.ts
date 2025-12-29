@@ -38,7 +38,7 @@ app.use(
   cors({
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"],
   })
 );
 
@@ -92,6 +92,7 @@ async function requirePiUser(req: express.Request) {
   }
 
   return { uid: String(uid), username: String(username), accessToken: token };
+}
 
 // =======================================================
 // ✅ ADMIN auth (simple shared secret)
@@ -104,8 +105,6 @@ function requireAdmin(req: express.Request) {
   const expected = String(process.env.ADMIN_SECRET || "");
   if (!expected) throw new Error("ADMIN_SECRET not configured on server");
   if (!secret || secret !== expected) throw new Error("Unauthorized (admin)");
-}
-
 }
 
 // =======================================================
@@ -133,7 +132,10 @@ async function handlePiVerify(req: express.Request, res: express.Response) {
         .json({ ok: false, error: "Pi user missing uid/username" });
     }
 
-    const user = await upsertUser({ uid: String(uid), username: String(username) });
+    const user = await upsertUser({
+      uid: String(uid),
+      username: String(username),
+    });
 
     return res.json({ ok: true, user });
   } catch (e: any) {
@@ -209,7 +211,8 @@ app.post("/api/rewards/level-complete", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const level = Number(req.body?.level || 0);
-    if (!level) return res.status(400).json({ ok: false, error: "level required" });
+    if (!level)
+      return res.status(400).json({ ok: false, error: "level required" });
 
     const out = await claimLevelComplete(uid, level);
     return res.json({ ok: true, already: !!out?.already, user: out?.user });
@@ -222,7 +225,8 @@ app.post("/api/rewards/ad-50", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce || "").trim();
-    if (!nonce) return res.status(400).json({ ok: false, error: "nonce required" });
+    if (!nonce)
+      return res.status(400).json({ ok: false, error: "nonce required" });
 
     const out = await claimReward({
       uid,
@@ -262,7 +266,8 @@ app.post("/api/rewards/skip-ad", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce || "").trim();
-    if (!nonce) return res.status(400).json({ ok: false, error: "nonce required" });
+    if (!nonce)
+      return res.status(400).json({ ok: false, error: "nonce required" });
 
     const out = await claimReward({
       uid,
@@ -282,7 +287,8 @@ app.post("/api/rewards/hint-ad", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce || "").trim();
-    if (!nonce) return res.status(400).json({ ok: false, error: "nonce required" });
+    if (!nonce)
+      return res.status(400).json({ ok: false, error: "nonce required" });
 
     const out = await claimReward({
       uid,
@@ -298,8 +304,6 @@ app.post("/api/rewards/hint-ad", async (req, res) => {
   }
 });
 
-
-
 // =======================================================
 // ✅ SESSIONS (client can call; used by admin online view)
 // =======================================================
@@ -308,10 +312,13 @@ app.post("/api/session/start", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const sessionId = String(req.body?.sessionId || "").trim();
-    if (!sessionId) return res.status(400).json({ ok: false, error: "sessionId required" });
+    if (!sessionId)
+      return res.status(400).json({ ok: false, error: "sessionId required" });
 
     const userAgent = String(req.headers["user-agent"] || "");
-    const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "");
+    const ip = String(
+      req.headers["x-forwarded-for"] || req.socket.remoteAddress || ""
+    );
 
     const row = await startSession({ uid, sessionId, userAgent, ip });
     return res.json({ ok: true, session: row });
@@ -324,7 +331,8 @@ app.post("/api/session/ping", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const sessionId = String(req.body?.sessionId || "").trim();
-    if (!sessionId) return res.status(400).json({ ok: false, error: "sessionId required" });
+    if (!sessionId)
+      return res.status(400).json({ ok: false, error: "sessionId required" });
 
     const row = await pingSession(uid, sessionId);
     return res.json({ ok: true, session: row });
@@ -337,7 +345,8 @@ app.post("/api/session/end", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const sessionId = String(req.body?.sessionId || "").trim();
-    if (!sessionId) return res.status(400).json({ ok: false, error: "sessionId required" });
+    if (!sessionId)
+      return res.status(400).json({ ok: false, error: "sessionId required" });
 
     const row = await endSession(uid, sessionId);
     return res.json({ ok: true, session: row });
@@ -401,7 +410,6 @@ app.get("/admin/online", async (req, res) => {
     return res.status(401).json({ ok: false, error: e?.message || String(e) });
   }
 });
-
 
 // =======================================================
 // ✅ USERS
@@ -473,3 +481,4 @@ main().catch((err) => {
   console.error("Fatal startup error:", err);
   process.exit(1);
 });
+```0
