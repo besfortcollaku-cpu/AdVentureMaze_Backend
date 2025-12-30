@@ -33,12 +33,15 @@ import {
 // App + middleware
 // ---------------------------
 const app = express();
-
 app.use(
   cors({
-    origin: "*",
+    origin: "*", // later you can restrict to your admin domain
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "x-admin-secret"
+    ],
   })
 );
 
