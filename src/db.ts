@@ -1992,5 +1992,3 @@ const day = String(d.getUTCDate()).padStart(2, "0");
 return ${y}-${m}-${day};
 
 }
-
-Can you chech
