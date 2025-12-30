@@ -96,6 +96,12 @@ async function requirePiUser(req: express.Request) {
   };
 }
 
+function asInt(v: any, fallback = 0) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.trunc(n);
+}
+
 // =======================================================
 // ADMIN AUTH
 // =======================================================
@@ -181,11 +187,6 @@ app.get("/api/me", async (req, res) => {
 
 // =======================================================
 // ✅ REWARDS API (FIXES 404)
-// These endpoints must exist because frontend calls them:
-// - /api/rewards/ad-50
-// - /api/rewards/level-complete
-// - /api/skip
-// - /api/hint
 // =======================================================
 
 app.post("/api/rewards/ad-50", async (req, res) => {
@@ -199,7 +200,7 @@ app.post("/api/rewards/ad-50", async (req, res) => {
       type: "ad_50",
       nonce,
       amount: 50,
-      cooldownSeconds: 0, // keep 0 if you want unlimited; set 20 if you want cooldown
+      cooldownSeconds: 0,
     });
 
     return res.json({ ok: true, already: !!out?.already, user: out?.user });
@@ -211,7 +212,7 @@ app.post("/api/rewards/ad-50", async (req, res) => {
 app.post("/api/rewards/level-complete", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-    const level = Number(req.body?.level || 0);
+    const level = asInt(req.body?.level, 0);
     if (!level) return res.status(400).json({ ok: false, error: "level required" });
 
     const out = await claimLevelComplete(uid, level);
@@ -225,7 +226,7 @@ app.post("/api/skip", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const out = await useSkip(uid);
-    return res.json(out); // already returns { ok, mode, freeLeft, user }
+    return res.json(out);
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e?.message || String(e) });
   }
@@ -235,13 +236,12 @@ app.post("/api/hint", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const out = await useHint(uid);
-    return res.json(out); // already returns { ok, mode, freeLeft, user }
+    return res.json(out);
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// Optional: explicit daily login endpoint (if you use it anywhere)
 app.post("/api/rewards/daily-login", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
@@ -258,7 +258,6 @@ app.post("/api/rewards/daily-login", async (req, res) => {
 
 app.get("/progress", async (req, res) => {
   try {
-    // keep it public if you want, but usually should be authed:
     const uid = String(req.query.uid || "").trim();
     if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
 
@@ -272,7 +271,6 @@ app.get("/progress", async (req, res) => {
 
 app.post("/progress", async (req, res) => {
   try {
-    // ✅ make progress save require Pi auth (prevents random writes)
     await requirePiUser(req);
 
     const { uid, level, coins } = req.body || {};
@@ -280,8 +278,8 @@ app.post("/progress", async (req, res) => {
 
     await setProgressByUid({
       uid: String(uid),
-      level: Number(level || 1),
-      coins: Number(coins || 0),
+      level: asInt(level, 1),
+      coins: Math.max(0, asInt(coins, 0)),
     });
 
     return res.json({ ok: true });
@@ -291,7 +289,7 @@ app.post("/progress", async (req, res) => {
 });
 
 // =======================================================
-// (Optional) Users helper endpoints (if you still use them)
+// (Optional) Users helper endpoints
 // =======================================================
 
 app.get("/api/users/by-uid", async (req, res) => {
@@ -310,13 +308,12 @@ app.get("/api/users/by-uid", async (req, res) => {
 
 app.post("/api/users/coins", async (req, res) => {
   try {
-    // if you expose this, requireAdmin is safer:
     requireAdmin(req);
 
     const { uid, delta } = req.body || {};
     if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
 
-    const updated = await addCoins(String(uid), Number(delta || 0));
+    const updated = await addCoins(String(uid), asInt(delta, 0));
     return res.json({ ok: true, user: updated });
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e?.message || String(e) });
@@ -324,7 +321,7 @@ app.post("/api/users/coins", async (req, res) => {
 });
 
 // =======================================================
-// ✅ SESSIONS (if your client calls them)
+// ✅ SESSIONS
 // =======================================================
 
 app.post("/api/session/start", async (req, res) => {
@@ -376,7 +373,7 @@ app.post("/api/session/end", async (req, res) => {
 app.get("/admin/stats", async (req, res) => {
   try {
     requireAdmin(req);
-    const minutes = Number(req.query.minutes || 5);
+    const minutes = asInt(req.query.minutes, 5);
     const data = await adminGetStats({ onlineMinutes: minutes });
     return res.json({ ok: true, data });
   } catch (e: any) {
@@ -389,8 +386,8 @@ app.get("/admin/users", async (req, res) => {
     requireAdmin(req);
     const out = await adminListUsers({
       search: String(req.query.search || ""),
-      limit: Number(req.query.limit || 50),
-      offset: Number(req.query.offset || 0),
+      limit: asInt(req.query.limit, 50),
+      offset: asInt(req.query.offset, 0),
       order: String(req.query.order || "updated_at_desc") as any,
     });
     return res.json({ ok: true, ...out });
@@ -414,13 +411,112 @@ app.get("/admin/users/:uid", async (req, res) => {
   }
 });
 
+/**
+ * ✅ NEW: Admin coins add/sub (used by Admin UI)
+ * POST /admin/users/:uid/coins/add  { delta }
+ */
+app.post("/admin/users/:uid/coins/add", async (req, res) => {
+  try {
+    requireAdmin(req);
+    const uid = String(req.params.uid || "").trim();
+    if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
+
+    const delta = asInt(req.body?.delta, 0);
+    if (delta === 0) return res.status(400).json({ ok: false, error: "delta required" });
+
+    const updated = await addCoins(uid, delta);
+    return res.json({ ok: true, user: updated });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/**
+ * ✅ NEW: Admin set coins exact (used by Admin UI)
+ * POST /admin/users/:uid/coins/set  { coins }
+ */
+app.post("/admin/users/:uid/coins/set", async (req, res) => {
+  try {
+    requireAdmin(req);
+    const uid = String(req.params.uid || "").trim();
+    if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
+
+    const coins = asInt(req.body?.coins, -1);
+    if (coins < 0) return res.status(400).json({ ok: false, error: "coins must be >= 0" });
+
+    const user = await getUserByUid(uid);
+    if (!user) return res.status(404).json({ ok: false, error: "user not found" });
+
+    const delta = coins - asInt(user.coins, 0);
+    const updated = await addCoins(uid, delta);
+    return res.json({ ok: true, user: updated });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/**
+ * ✅ NEW: Admin reset coins to 0 (used by Admin UI)
+ * POST /admin/users/:uid/coins/reset  {}
+ */
+app.post("/admin/users/:uid/coins/reset", async (req, res) => {
+  try {
+    requireAdmin(req);
+    const uid = String(req.params.uid || "").trim();
+    if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
+
+    const user = await getUserByUid(uid);
+    if (!user) return res.status(404).json({ ok: false, error: "user not found" });
+
+    const delta = 0 - asInt(user.coins, 0);
+    const updated = await addCoins(uid, delta);
+    return res.json({ ok: true, user: updated });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/**
+ * ✅ NEW: Reset free skips/hints counters (used by Admin UI)
+ * POST /admin/users/:uid/reset-free  {}
+ *
+ * This requires a helper in db.ts.
+ * If you don't have it, add it (I show you below).
+ */
+app.post("/admin/users/:uid/reset-free", async (req, res) => {
+  try {
+    requireAdmin(req);
+    const uid = String(req.params.uid || "").trim();
+    if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
+
+    // --- IMPORTANT ---
+    // Your db.ts currently does NOT export a function for this.
+    // We'll do it safely here using addCoins? No: we need an UPDATE query.
+    // So: call a small inline SQL via a new db helper.
+    // If you prefer, paste db.ts and I’ll add the helper there too.
+
+    const p = await getUserByUid(uid);
+    if (!p) return res.status(404).json({ ok: false, error: "user not found" });
+
+    // Quick fallback: re-upsert username does not reset counters.
+    // So we must return an error if helper not implemented.
+    return res.status(500).json({
+      ok: false,
+      error:
+        "reset-free endpoint needs DB helper. Add a db.ts function to reset free_skips_used/free_hints_used to 0.",
+    });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
 app.get("/admin/online", async (req, res) => {
   try {
     requireAdmin(req);
     const out = await adminListOnlineUsers({
-      minutes: Number(req.query.minutes || 5),
-      limit: Number(req.query.limit || 50),
-      offset: Number(req.query.offset || 0),
+      minutes: asInt(req.query.minutes, 5),
+      limit: asInt(req.query.limit, 50),
+      offset: asInt(req.query.offset, 0),
     });
     return res.json({ ok: true, ...out });
   } catch (e: any) {
