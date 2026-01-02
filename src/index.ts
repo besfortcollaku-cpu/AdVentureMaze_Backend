@@ -205,7 +205,8 @@ app.post("/api/session/ping", async (req,res)=>{
   try{
     const { uid } = await requirePiUser(req);
     const sessionId = String(req.body?.sessionId||"");
-    const row = await pingSession(uid, sessionId);
+    // 🔧 FIX: pingSession takes only uid
+    const row = await pingSession(uid);
     res.json({ ok:true, session:row });
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
@@ -216,7 +217,8 @@ app.post("/api/session/end", async (req,res)=>{
   try{
     const { uid } = await requirePiUser(req);
     const sessionId = String(req.body?.sessionId||"");
-    const row = await endSession(uid, sessionId);
+    // 🔧 FIX: endSession takes only uid
+    const row = await endSession(uid);
     res.json({ ok:true, session:row });
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});

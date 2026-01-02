@@ -326,6 +326,7 @@ export async function adminResetFreeCounters(uid: string) {
 export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }) {
   const users = await pool.query(`SELECT COUNT(*) FROM users`);
   const coins = await pool.query(`SELECT SUM(coins) FROM users`);
+
   const online = await pool.query(
     `
     SELECT COUNT(*) FROM sessions
@@ -334,10 +335,25 @@ export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }
     [onlineMinutes]
   );
 
+  // (optional but useful for your UI KPIs)
+  const ad50 = await pool.query(
+    `SELECT COUNT(*) FROM reward_claims WHERE type='ad_50'`
+  );
+  const daily = await pool.query(
+    `SELECT COUNT(*) FROM reward_claims WHERE type='daily_login'`
+  );
+  const levels = await pool.query(
+    `SELECT COUNT(*) FROM level_rewards`
+  );
+
   return {
     users_total: Number(users.rows[0].count),
     coins_total: Number(coins.rows[0].sum || 0),
     online_now: Number(online.rows[0].count),
+
+    ad50_count: Number(ad50.rows[0].count),
+    daily_login_count: Number(daily.rows[0].count),
+    level_complete_count: Number(levels.rows[0].count),
   };
 }
 
@@ -364,4 +380,59 @@ export async function adminListOnlineUsers({
   );
 
   return { rows, count: rows.length };
+}
+
+/* =====================================================
+   ✅ STEP 1 — CHARTS (A = last 7 days)
+   2 endpoints need 2 db functions:
+   - coins earned per day (from reward_claims.amount)
+   - active users per day (from sessions.last_seen_at)
+===================================================== */
+
+export async function adminChartCoins({ days }: { days: number }) {
+  const d = Math.max(1, Math.min(90, Number(days || 7)));
+
+  const { rows } = await pool.query(
+    `
+    SELECT
+      to_char(gs.day, 'YYYY-MM-DD') AS day,
+      COALESCE(SUM(rc.amount), 0)::int AS coins
+    FROM generate_series(
+      CURRENT_DATE - ($1::int - 1),
+      CURRENT_DATE,
+      interval '1 day'
+    ) AS gs(day)
+    LEFT JOIN reward_claims rc
+      ON rc.created_at::date = gs.day::date
+    GROUP BY gs.day
+    ORDER BY gs.day ASC
+  `,
+    [d]
+  );
+
+  return rows.map(r => ({ day: r.day, coins: Number(r.coins) }));
+}
+
+export async function adminChartActiveUsers({ days }: { days: number }) {
+  const d = Math.max(1, Math.min(90, Number(days || 7)));
+
+  const { rows } = await pool.query(
+    `
+    SELECT
+      to_char(gs.day, 'YYYY-MM-DD') AS day,
+      COALESCE(COUNT(DISTINCT s.uid), 0)::int AS active_users
+    FROM generate_series(
+      CURRENT_DATE - ($1::int - 1),
+      CURRENT_DATE,
+      interval '1 day'
+    ) AS gs(day)
+    LEFT JOIN sessions s
+      ON s.last_seen_at::date = gs.day::date
+    GROUP BY gs.day
+    ORDER BY gs.day ASC
+  `,
+    [d]
+  );
+
+  return rows.map(r => ({ day: r.day, active_users: Number(r.active_users) }));
 }
