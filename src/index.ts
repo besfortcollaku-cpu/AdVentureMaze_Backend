@@ -1,4 +1,3 @@
-// src/index.ts
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -6,8 +5,6 @@ import cors from "cors";
 import {
   initDB,
   upsertUser,
-  getUserByUid,
-  addCoins,
   getProgressByUid,
   setProgressByUid,
 
@@ -21,12 +18,15 @@ import {
   startSession,
   pingSession,
   endSession,
-  touchUserOnline, // ✅ NEW
+  touchUserOnline,
   adminListUsers,
   adminGetUser,
   adminGetStats,
   adminListOnlineUsers,
   adminResetFreeCounters,
+  // ✅ charts
+  adminChartCoins,
+  adminChartActiveUsers,
 } from "./db";
 
 const app = express();
@@ -67,7 +67,7 @@ async function requirePiUser(req: express.Request) {
 
   await upsertUser({ uid, username });
 
-  // ✅ IMPORTANT: mark user as online on ANY request
+  // mark user online on ANY request
   await touchUserOnline(uid);
 
   return { uid, username };
@@ -204,8 +204,6 @@ app.post("/api/session/start", async (req,res)=>{
 app.post("/api/session/ping", async (req,res)=>{
   try{
     const { uid } = await requirePiUser(req);
-    const sessionId = String(req.body?.sessionId||"");
-    // 🔧 FIX: pingSession takes only uid
     const row = await pingSession(uid);
     res.json({ ok:true, session:row });
   }catch(e:any){
@@ -216,8 +214,6 @@ app.post("/api/session/ping", async (req,res)=>{
 app.post("/api/session/end", async (req,res)=>{
   try{
     const { uid } = await requirePiUser(req);
-    const sessionId = String(req.body?.sessionId||"");
-    // 🔧 FIX: endSession takes only uid
     const row = await endSession(uid);
     res.json({ ok:true, session:row });
   }catch(e:any){
@@ -225,7 +221,7 @@ app.post("/api/session/end", async (req,res)=>{
   }
 });
 
-/* ---------------- ADMIN ---------------- */
+/* ---------------- ADMIN: stats/online/users ---------------- */
 app.get("/admin/stats", async (req,res)=>{
   try{
     requireAdmin(req);
@@ -249,12 +245,51 @@ app.get("/admin/online", async (req,res)=>{
   }
 });
 
-app.post("/admin/users/:uid/reset-free", async (req,res)=>{
+/* ✅ NEW: admin users list + detail (Fix 2) */
+app.get("/admin/users", async (req,res)=>{
   try{
     requireAdmin(req);
-    res.json({ ok:true, user: await adminResetFreeCounters(req.params.uid) });
+    const search = String(req.query.search || "");
+    const limit  = Math.max(1, Math.min(200, Number(req.query.limit || 25)));
+    const offset = Math.max(0, Number(req.query.offset || 0));
+    const order  = String(req.query.order || "updated_at_desc");
+    const out = await adminListUsers({ search, limit, offset, order });
+    res.json(out);
   }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
+    res.status(401).json({ ok:false, error:e.message });
+  }
+});
+
+app.get("/admin/users/:uid", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const data = await adminGetUser(String(req.params.uid));
+    res.json({ ok:true, data });
+  }catch(e:any){
+    res.status(401).json({ ok:false, error:e.message });
+  }
+});
+
+/* ✅ NEW: charts endpoints (Step 1 – “A: last 7 days”) */
+app.get("/admin/charts/coins", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const days = Number(req.query.days || 7);
+    const rows = await adminChartCoins({ days });
+    res.json({ ok:true, rows });
+  }catch(e:any){
+    res.status(401).json({ ok:false, error:e.message });
+  }
+});
+
+app.get("/admin/charts/active", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const days = Number(req.query.days || 7);
+    const rows = await adminChartActiveUsers({ days });
+    res.json({ ok:true, rows });
+  }catch(e:any){
+    res.status(401).json({ ok:false, error:e.message });
   }
 });
 

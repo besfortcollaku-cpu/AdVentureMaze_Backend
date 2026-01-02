@@ -1,4 +1,3 @@
-// src/db.ts
 import { Pool } from "pg";
 
 const pool = new Pool({
@@ -9,22 +8,55 @@ const pool = new Pool({
 });
 
 /* =====================================================
-   INIT
+   INIT  (✅ Fix 1: auto-create core tables incl. sessions)
 ===================================================== */
 export async function initDB() {
   await pool.query("SELECT 1");
+  // create minimal tables if they don't exist
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      uid TEXT PRIMARY KEY,
+      username TEXT,
+      coins INT DEFAULT 0,
+      free_skips_used INT DEFAULT 0,
+      free_hints_used INT DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS progress (
+      uid TEXT PRIMARY KEY,
+      level INT DEFAULT 1,
+      coins INT DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS reward_claims (
+      uid TEXT NOT NULL,
+      type TEXT NOT NULL,
+      nonce TEXT,
+      amount INT DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS level_rewards (
+      uid TEXT NOT NULL,
+      level INT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+      uid TEXT PRIMARY KEY,
+      session_id TEXT,
+      user_agent TEXT,
+      ip TEXT,
+      started_at TIMESTAMP,
+      last_seen_at TIMESTAMP NOT NULL
+    );
+  `);
 }
 
 /* =====================================================
    USERS
 ===================================================== */
 export async function upsertUser({
-  uid,
-  username,
-}: {
-  uid: string;
-  username: string;
-}) {
+  uid, username,
+}: { uid: string; username: string; }) {
   const { rows } = await pool.query(
     `
     INSERT INTO users (uid, username, updated_at)
@@ -73,14 +105,8 @@ export async function getProgressByUid(uid: string) {
 }
 
 export async function setProgressByUid({
-  uid,
-  level,
-  coins,
-}: {
-  uid: string;
-  level: number;
-  coins: number;
-}) {
+  uid, level, coins,
+}: { uid: string; level: number; coins: number; }) {
   await pool.query(
     `
     INSERT INTO progress (uid, level, coins, updated_at)
@@ -99,18 +125,8 @@ export async function setProgressByUid({
    REWARDS
 ===================================================== */
 export async function claimReward({
-  uid,
-  type,
-  nonce,
-  amount,
-  cooldownSeconds,
-}: {
-  uid: string;
-  type: string;
-  nonce: string;
-  amount: number;
-  cooldownSeconds: number;
-}) {
+  uid, type, nonce, amount, cooldownSeconds,
+}: { uid: string; type: string; nonce: string; amount: number; cooldownSeconds: number; }) {
   const { rowCount } = await pool.query(
     `SELECT 1 FROM reward_claims WHERE uid=$1 AND nonce=$2`,
     [uid, nonce]
@@ -217,16 +233,8 @@ export async function touchUserOnline(uid: string) {
 }
 
 export async function startSession({
-  uid,
-  sessionId,
-  userAgent,
-  ip,
-}: {
-  uid: string;
-  sessionId: string;
-  userAgent: string;
-  ip: string;
-}) {
+  uid, sessionId, userAgent, ip,
+}: { uid: string; sessionId: string; userAgent: string; ip: string; }) {
   const { rows } = await pool.query(
     `
     INSERT INTO sessions (uid,session_id,user_agent,ip,started_at,last_seen_at)
@@ -264,16 +272,12 @@ export async function endSession(uid: string) {
 /* =====================================================
    ADMIN
 ===================================================== */
-export async function adminListUsers({
-  search,
-  limit,
-  offset,
-  order,
-}: any) {
+export async function adminListUsers({ search, limit, offset, order }: any) {
   const where = search
     ? `WHERE username ILIKE '%'||$1||'%' OR uid ILIKE '%'||$1||'%'`
     : "";
 
+  // (order param reserved for future; keep DESC by updated_at)
   const { rows } = await pool.query(
     `
     SELECT * FROM users
@@ -326,7 +330,6 @@ export async function adminResetFreeCounters(uid: string) {
 export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }) {
   const users = await pool.query(`SELECT COUNT(*) FROM users`);
   const coins = await pool.query(`SELECT SUM(coins) FROM users`);
-
   const online = await pool.query(
     `
     SELECT COUNT(*) FROM sessions
@@ -335,22 +338,14 @@ export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }
     [onlineMinutes]
   );
 
-  // (optional but useful for your UI KPIs)
-  const ad50 = await pool.query(
-    `SELECT COUNT(*) FROM reward_claims WHERE type='ad_50'`
-  );
-  const daily = await pool.query(
-    `SELECT COUNT(*) FROM reward_claims WHERE type='daily_login'`
-  );
-  const levels = await pool.query(
-    `SELECT COUNT(*) FROM level_rewards`
-  );
+  const ad50 = await pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='ad_50'`);
+  const daily = await pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='daily_login'`);
+  const levels = await pool.query(`SELECT COUNT(*) FROM level_rewards`);
 
   return {
     users_total: Number(users.rows[0].count),
     coins_total: Number(coins.rows[0].sum || 0),
     online_now: Number(online.rows[0].count),
-
     ad50_count: Number(ad50.rows[0].count),
     daily_login_count: Number(daily.rows[0].count),
     level_complete_count: Number(levels.rows[0].count),
@@ -358,14 +353,8 @@ export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }
 }
 
 export async function adminListOnlineUsers({
-  minutes,
-  limit,
-  offset,
-}: {
-  minutes: number;
-  limit: number;
-  offset: number;
-}) {
+  minutes, limit, offset,
+}: { minutes: number; limit: number; offset: number; }) {
   const { rows } = await pool.query(
     `
     SELECT u.uid,u.username,u.coins,
@@ -382,16 +371,11 @@ export async function adminListOnlineUsers({
   return { rows, count: rows.length };
 }
 
-/* =====================================================
-   ✅ STEP 1 — CHARTS (A = last 7 days)
-   2 endpoints need 2 db functions:
-   - coins earned per day (from reward_claims.amount)
-   - active users per day (from sessions.last_seen_at)
-===================================================== */
-
+/* ============================
+   Charts (Step 1 – 7 days default)
+============================ */
 export async function adminChartCoins({ days }: { days: number }) {
   const d = Math.max(1, Math.min(90, Number(days || 7)));
-
   const { rows } = await pool.query(
     `
     SELECT
@@ -409,13 +393,11 @@ export async function adminChartCoins({ days }: { days: number }) {
   `,
     [d]
   );
-
   return rows.map(r => ({ day: r.day, coins: Number(r.coins) }));
 }
 
 export async function adminChartActiveUsers({ days }: { days: number }) {
   const d = Math.max(1, Math.min(90, Number(days || 7)));
-
   const { rows } = await pool.query(
     `
     SELECT
@@ -433,6 +415,5 @@ export async function adminChartActiveUsers({ days }: { days: number }) {
   `,
     [d]
   );
-
   return rows.map(r => ({ day: r.day, active_users: Number(r.active_users) }));
 }
