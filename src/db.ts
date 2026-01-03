@@ -271,20 +271,51 @@ export async function endSession(uid: string) {
 /* =====================================================
    ADMIN
 ===================================================== */
-export async function adminListUsers({ search, limit, offset, order }: any) {
-  const where = search
-    ? `WHERE username ILIKE '%'||$1||'%' OR uid ILIKE '%'||$1||'%'`
-    : "";
 
-  // (order param reserved for future; keep DESC by updated_at)
+export async function adminListUsers({
+  search,
+  limit,
+  offset,
+}: {
+  search?: string;
+  limit: number;
+  offset: number;
+}) {
+  if (search) {
+    const { rows } = await pool.query(
+      `
+      SELECT *
+      FROM users
+      WHERE username ILIKE '%' || $1 || '%'
+         OR uid ILIKE '%' || $1 || '%'
+      ORDER BY updated_at DESC
+      LIMIT $2 OFFSET $3
+    `,
+      [search, limit, offset]
+    );
+
+    const { rows: c } = await pool.query(
+      `
+      SELECT COUNT(*)
+      FROM users
+      WHERE username ILIKE '%' || $1 || '%'
+         OR uid ILIKE '%' || $1 || '%'
+    `,
+      [search]
+    );
+
+    return { rows, count: Number(c[0].count) };
+  }
+
+  // ✅ no search
   const { rows } = await pool.query(
     `
-    SELECT * FROM users
-    ${where}
+    SELECT *
+    FROM users
     ORDER BY updated_at DESC
-    LIMIT $2 OFFSET $3
+    LIMIT $1 OFFSET $2
   `,
-    search ? [search, limit, offset] : [limit, offset]
+    [limit, offset]
   );
 
   const { rows: c } = await pool.query(`SELECT COUNT(*) FROM users`);
