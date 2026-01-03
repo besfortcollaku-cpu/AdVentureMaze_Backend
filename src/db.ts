@@ -79,12 +79,11 @@ export async function getUserByUid(uid: string) {
   );
   return rows[0] || null;
 }
-
 export async function addCoins(uid: string, delta: number) {
   const { rows } = await pool.query(
     `
     UPDATE users
-    SET coins = coins + $2, updated_at=NOW()
+    SET coins = COALESCE(coins,0) + $2, updated_at=NOW()
     WHERE uid=$1
     RETURNING *
   `,
@@ -184,7 +183,7 @@ export async function claimLevelComplete(uid: string, level: number) {
     [uid, level]
   );
 
-  const user = await addCoins(uid, 10);
+  const user = await addCoins(uid, 1);
   return { user };
 }
 
