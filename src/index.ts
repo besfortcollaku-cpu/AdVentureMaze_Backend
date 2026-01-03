@@ -253,7 +253,7 @@ app.get("/admin/users", async (req,res)=>{
     const limit  = Math.max(1, Math.min(200, Number(req.query.limit || 25)));
     const offset = Math.max(0, Number(req.query.offset || 0));
     const order  = String(req.query.order || "updated_at_desc");
-    const out = await adminListUsers({ search, limit, offset, order });
+    const out = await adminListUsers({ search, limit, offset });
     res.json(out);
   }catch(e:any){
     res.status(401).json({ ok:false, error:e.message });
