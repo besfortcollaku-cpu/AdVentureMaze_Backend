@@ -1,4 +1,3 @@
-// src/index.ts
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -6,57 +5,47 @@ import cors from "cors";
 import {
   initDB,
   upsertUser,
-  getUserByUid,
-  addCoins,
   getProgressByUid,
   setProgressByUid,
-
   claimReward,
   claimDailyLogin,
   claimLevelComplete,
   useSkip,
   useHint,
-
-  // sessions / admin
   startSession,
   pingSession,
   endSession,
   touchUserOnline,
-
   adminListUsers,
   adminGetUser,
   adminGetStats,
   adminListOnlineUsers,
   adminResetFreeCounters,
-
-  // charts
   adminChartCoins,
   adminChartActiveUsers,
 } from "./db";
 
 const app = express();
 
-/* ---------------- CORS ---------------- */
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"],
-}));
-app.options("*", cors());
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"],
+  })
+);
 app.use(express.json());
 
-/* ---------------- HEALTH ---------------- */
 app.get("/health", (_req, res) => res.send("ok"));
 app.get("/", (_req, res) => res.send("backend up"));
 
-/* ---------------- HELPERS ---------------- */
 function getBearerToken(req: express.Request) {
   return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
 }
 
-async function verifyPiAccessToken(accessToken: string) {
+async function verifyPiAccessToken(token: string) {
   const r = await fetch("https://api.minepi.com/v2/me", {
-    headers: { Authorization: `Bearer ${accessToken}` },
+    headers: { Authorization: `Bearer ${token}` },
   });
   if (!r.ok) throw new Error("Invalid Pi token");
   return r.json();
@@ -65,228 +54,136 @@ async function verifyPiAccessToken(accessToken: string) {
 async function requirePiUser(req: express.Request) {
   const token = getBearerToken(req);
   if (!token) throw new Error("Missing token");
-
-  const piUser: any = await verifyPiAccessToken(token);
-  const uid = String(piUser.uid);
-  const username = String(piUser.username);
-
-  await upsertUser({ uid, username });
-  await touchUserOnline(uid);
-
-  return { uid, username };
+  const pi: any = await verifyPiAccessToken(token);
+  await upsertUser({ uid: pi.uid, username: pi.username });
+  await touchUserOnline(pi.uid);
+  return { uid: pi.uid };
 }
 
-/* ---------------- ADMIN AUTH ---------------- */
 function requireAdmin(req: express.Request) {
-  const secret = String(req.headers["x-admin-secret"] || "");
-  if (!process.env.ADMIN_SECRET) throw new Error("ADMIN_SECRET missing");
-  if (secret !== process.env.ADMIN_SECRET) throw new Error("Unauthorized");
+  if (req.headers["x-admin-secret"] !== process.env.ADMIN_SECRET)
+    throw new Error("Unauthorized");
 }
 
-/* ---------------- PI VERIFY ---------------- */
-app.post("/api/pi/verify", async (req, res) => {
-  try {
-    const token = req.body?.accessToken || getBearerToken(req);
-    if (!token) return res.status(400).json({ ok: false });
+/* ================= API ================= */
 
-    const piUser: any = await verifyPiAccessToken(token);
-    const user = await upsertUser({
-      uid: String(piUser.uid),
-      username: String(piUser.username),
-    });
-
-    await touchUserOnline(user.uid);
-
-    res.json({ ok: true, user });
-  } catch (e: any) {
-    res.status(401).json({ ok: false, error: e.message });
-  }
-});
-
-/* ---------------- /api/me ---------------- */
 app.get("/api/me", async (req, res) => {
   try {
-    const { uid, username } = await requirePiUser(req);
-    let user = await upsertUser({ uid, username });
-
-    try {
-      const out = await claimDailyLogin(uid); // +5 coins once/day
-      if (out?.user) user = out.user;
-    } catch {}
-
+    const { uid } = await requirePiUser(req);
+    await claimDailyLogin(uid);
     const progress = await getProgressByUid(uid);
-
-    res.json({
-      ok: true,
-      user,
-      progress: progress ?? { uid, level: 1, coins: 0 },
-    });
+    res.json({ ok: true, progress });
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
 
-/* ---------------- REWARDS ---------------- */
 app.post("/api/rewards/ad-50", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-    const nonce = String(req.body?.nonce || "");
-    if (!nonce) return res.status(400).json({ ok: false });
-
     const out = await claimReward({
       uid,
       type: "ad_50",
-      nonce,
+      nonce: req.body.nonce,
       amount: 50,
-      cooldownSeconds: 0,
     });
-
-    res.json({ ok: true, already: !!out?.already, user: out?.user });
+    res.json({ ok: true, ...out });
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
 
 app.post("/api/rewards/level-complete", async (req, res) => {
-  try {
-    const { uid } = await requirePiUser(req);
-    const level = Number(req.body?.level || 0);
-
-    const out = await claimLevelComplete(uid, level); // +10 coins
-    res.json({ ok: true, already: !!out?.already, user: out?.user });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+  const { uid } = await requirePiUser(req);
+  res.json(await claimLevelComplete(uid, Number(req.body.level)));
 });
 
 app.post("/api/skip", async (req, res) => {
-  try {
-    const { uid } = await requirePiUser(req);
-    res.json(await useSkip(uid));
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+  const { uid } = await requirePiUser(req);
+  res.json(await useSkip(uid));
 });
 
 app.post("/api/hint", async (req, res) => {
-  try {
-    const { uid } = await requirePiUser(req);
-    res.json(await useHint(uid));
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+  const { uid } = await requirePiUser(req);
+  res.json(await useHint(uid));
 });
 
-/* ---------------- PROGRESS ---------------- */
-app.get("/progress", async (req, res) => {
-  const uid = String(req.query.uid || "");
-  const p = await getProgressByUid(uid);
-  res.json({ ok: true, data: p ?? { uid, level: 1, coins: 0 } });
-});
-
-app.post("/progress", async (req, res) => {
-  await requirePiUser(req);
-  const { uid, level, coins } = req.body;
-  await setProgressByUid({ uid, level, coins });
-  res.json({ ok: true });
-});
-
-/* ---------------- SESSIONS ---------------- */
 app.post("/api/session/start", async (req, res) => {
-  try {
-    const { uid } = await requirePiUser(req);
-    const sessionId = String(req.body?.sessionId || "");
-    const ua = String(req.headers["user-agent"] || "");
-    const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "");
-
-    const row = await startSession({ uid, sessionId, userAgent: ua, ip });
-    res.json({ ok: true, session: row });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+  const { uid } = await requirePiUser(req);
+  res.json(
+    await startSession({
+      uid,
+      sessionId: req.body.sessionId,
+      userAgent: req.headers["user-agent"] || "",
+      ip: String(req.socket.remoteAddress),
+    })
+  );
 });
 
 app.post("/api/session/ping", async (req, res) => {
-  try {
-    const { uid } = await requirePiUser(req);
-    const row = await pingSession(uid);
-    res.json({ ok: true, session: row });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+  const { uid } = await requirePiUser(req);
+  res.json(await pingSession(uid));
 });
 
 app.post("/api/session/end", async (req, res) => {
-  try {
-    const { uid } = await requirePiUser(req);
-    const row = await endSession(uid);
-    res.json({ ok: true, session: row });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+  const { uid } = await requirePiUser(req);
+  res.json(await endSession(uid));
 });
 
-/* ---------------- ADMIN ---------------- */
-app.get("/admin/stats", async (req, res) => {
-  try {
-    requireAdmin(req);
-    const minutes = Number(req.query.minutes || 5);
-    res.json({ ok: true, data: await adminGetStats({ onlineMinutes: minutes }) });
-  } catch (e: any) {
-    res.status(401).json({ ok: false, error: e.message });
-  }
-});
+/* ================= ADMIN ================= */
 
-app.get("/admin/online", async (req, res) => {
+app.get("/admin/users", async (req, res) => {
   try {
     requireAdmin(req);
-    res.json(await adminListOnlineUsers({
-      minutes: Number(req.query.minutes || 5),
+    const out = await adminListUsers({
+      search: String(req.query.search || ""),
       limit: 50,
-      offset: 0,
-    }));
+      offset: Number(req.query.offset || 0),
+    });
+    res.json({ ok: true, ...out });
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
+});
+
+app.get("/admin/users/:uid", async (req, res) => {
+  requireAdmin(req);
+  res.json({ ok: true, data: await adminGetUser(req.params.uid) });
 });
 
 app.post("/admin/users/:uid/reset-free", async (req, res) => {
-  try {
-    requireAdmin(req);
-    res.json({ ok: true, user: await adminResetFreeCounters(req.params.uid) });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+  requireAdmin(req);
+  res.json({ ok: true, user: await adminResetFreeCounters(req.params.uid) });
 });
 
-/* ---------------- CHARTS ---------------- */
+app.get("/admin/stats", async (req, res) => {
+  requireAdmin(req);
+  res.json({
+    ok: true,
+    data: await adminGetStats({ onlineMinutes: 5 }),
+  });
+});
+
+app.get("/admin/online", async (req, res) => {
+  requireAdmin(req);
+  res.json(await adminListOnlineUsers({ minutes: 5, limit: 50, offset: 0 }));
+});
+
 app.get("/admin/charts/coins", async (req, res) => {
-  try {
-    requireAdmin(req);
-    const days = Number(req.query.days || 7);
-    res.json({ ok: true, data: await adminChartCoins({ days }) });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+  requireAdmin(req);
+  res.json(await adminChartCoins({ days: 7 }));
 });
 
 app.get("/admin/charts/active-users", async (req, res) => {
-  try {
-    requireAdmin(req);
-    const days = Number(req.query.days || 7);
-    res.json({ ok: true, data: await adminChartActiveUsers({ days }) });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+  requireAdmin(req);
+  res.json(await adminChartActiveUsers({ days: 7 }));
 });
 
-/* ---------------- START ---------------- */
-async function main() {
-  await initDB();
-  const PORT = Number(process.env.PORT) || 3001;
-  app.listen(PORT, "0.0.0.0", () =>
-    console.log("Backend running on", PORT)
-  );
-}
+/* ================= START ================= */
 
-main();
+(async () => {
+  await initDB();
+  app.listen(process.env.PORT || 3001, () =>
+    console.log("Backend running")
+  );
+})();

@@ -1,11 +1,11 @@
-// src/db.ts
 import { Pool } from "pg";
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === "true"
-    ? { rejectUnauthorized: false }
-    : undefined,
+  ssl:
+    process.env.DATABASE_SSL === "true"
+      ? { rejectUnauthorized: false }
+      : undefined,
 });
 
 /* =====================================================
@@ -18,7 +18,13 @@ export async function initDB() {
 /* =====================================================
    USERS
 ===================================================== */
-export async function upsertUser({ uid, username }: { uid: string; username: string }) {
+export async function upsertUser({
+  uid,
+  username,
+}: {
+  uid: string;
+  username: string;
+}) {
   const { rows } = await pool.query(
     `
     INSERT INTO users (uid, username, updated_at)
@@ -39,7 +45,12 @@ export async function getUserByUid(uid: string) {
 
 export async function addCoins(uid: string, delta: number) {
   const { rows } = await pool.query(
-    `UPDATE users SET coins = coins + $2, updated_at=NOW() WHERE uid=$1 RETURNING *`,
+    `
+    UPDATE users
+    SET coins = coins + $2, updated_at=NOW()
+    WHERE uid=$1
+    RETURNING *
+  `,
     [uid, delta]
   );
   return rows[0];
@@ -49,17 +60,28 @@ export async function addCoins(uid: string, delta: number) {
    PROGRESS
 ===================================================== */
 export async function getProgressByUid(uid: string) {
-  const { rows } = await pool.query(`SELECT * FROM progress WHERE uid=$1`, [uid]);
+  const { rows } = await pool.query(
+    `SELECT * FROM progress WHERE uid=$1`,
+    [uid]
+  );
   return rows[0] || null;
 }
 
-export async function setProgressByUid({ uid, level, coins }: any) {
+export async function setProgressByUid({
+  uid,
+  level,
+  coins,
+}: {
+  uid: string;
+  level: number;
+  coins: number;
+}) {
   await pool.query(
     `
     INSERT INTO progress (uid, level, coins, updated_at)
     VALUES ($1,$2,$3,NOW())
     ON CONFLICT (uid)
-    DO UPDATE SET level=EXCLUDED.level, coins=EXCLUDED.coins, updated_at=NOW()
+    DO UPDATE SET level=$2, coins=$3, updated_at=NOW()
   `,
     [uid, level, coins]
   );
@@ -68,7 +90,17 @@ export async function setProgressByUid({ uid, level, coins }: any) {
 /* =====================================================
    REWARDS
 ===================================================== */
-export async function claimReward({ uid, type, nonce, amount }: any) {
+export async function claimReward({
+  uid,
+  type,
+  nonce,
+  amount,
+}: {
+  uid: string;
+  type: string;
+  nonce: string;
+  amount: number;
+}) {
   const { rowCount } = await pool.query(
     `SELECT 1 FROM reward_claims WHERE uid=$1 AND nonce=$2`,
     [uid, nonce]
@@ -76,8 +108,10 @@ export async function claimReward({ uid, type, nonce, amount }: any) {
   if (rowCount) return { already: true };
 
   await pool.query(
-    `INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
-     VALUES ($1,$2,$3,$4,NOW())`,
+    `
+    INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
+    VALUES ($1,$2,$3,$4,NOW())
+  `,
     [uid, type, nonce, amount]
   );
 
@@ -87,19 +121,26 @@ export async function claimReward({ uid, type, nonce, amount }: any) {
 
 export async function claimDailyLogin(uid: string) {
   const { rowCount } = await pool.query(
-    `SELECT 1 FROM reward_claims
-     WHERE uid=$1 AND type='daily_login' AND created_at::date=CURRENT_DATE`,
+    `
+    SELECT 1 FROM reward_claims
+    WHERE uid=$1 AND type='daily_login'
+      AND created_at::date = CURRENT_DATE
+  `,
     [uid]
   );
+
   if (rowCount) return { already: true };
 
   await pool.query(
-    `INSERT INTO reward_claims (uid,type,amount,created_at)
-     VALUES ($1,'daily_login',5,NOW())`,
+    `
+    INSERT INTO reward_claims (uid,type,amount,created_at)
+    VALUES ($1,'daily_login',5,NOW())
+  `,
     [uid]
   );
 
-  return { user: await addCoins(uid, 5) };
+  const user = await addCoins(uid, 5);
+  return { user };
 }
 
 export async function claimLevelComplete(uid: string, level: number) {
@@ -110,11 +151,15 @@ export async function claimLevelComplete(uid: string, level: number) {
   if (rowCount) return { already: true };
 
   await pool.query(
-    `INSERT INTO level_rewards (uid,level,created_at) VALUES ($1,$2,NOW())`,
+    `
+    INSERT INTO level_rewards (uid,level,created_at)
+    VALUES ($1,$2,NOW())
+  `,
     [uid, level]
   );
 
-  return { user: await addCoins(uid, 1) };
+  const user = await addCoins(uid, 10);
+  return { user };
 }
 
 /* =====================================================
@@ -122,7 +167,12 @@ export async function claimLevelComplete(uid: string, level: number) {
 ===================================================== */
 export async function useSkip(uid: string) {
   const { rows } = await pool.query(
-    `UPDATE users SET free_skips_used=free_skips_used+1 WHERE uid=$1 RETURNING *`,
+    `
+    UPDATE users
+    SET free_skips_used = free_skips_used + 1
+    WHERE uid=$1
+    RETURNING *
+  `,
     [uid]
   );
   return { ok: true, user: rows[0] };
@@ -130,14 +180,19 @@ export async function useSkip(uid: string) {
 
 export async function useHint(uid: string) {
   const { rows } = await pool.query(
-    `UPDATE users SET free_hints_used=free_hints_used+1 WHERE uid=$1 RETURNING *`,
+    `
+    UPDATE users
+    SET free_hints_used = free_hints_used + 1
+    WHERE uid=$1
+    RETURNING *
+  `,
     [uid]
   );
   return { ok: true, user: rows[0] };
 }
 
 /* =====================================================
-   SESSIONS / ONLINE
+   ONLINE / SESSIONS
 ===================================================== */
 export async function touchUserOnline(uid: string) {
   await pool.query(
@@ -151,7 +206,17 @@ export async function touchUserOnline(uid: string) {
   );
 }
 
-export async function startSession({ uid, sessionId, userAgent, ip }: any) {
+export async function startSession({
+  uid,
+  sessionId,
+  userAgent,
+  ip,
+}: {
+  uid: string;
+  sessionId: string;
+  userAgent: string;
+  ip: string;
+}) {
   const { rows } = await pool.query(
     `
     INSERT INTO sessions (uid,session_id,user_agent,ip,started_at,last_seen_at)
@@ -182,9 +247,17 @@ export async function endSession(uid: string) {
 }
 
 /* =====================================================
-   ADMIN
+   ADMIN — USERS
 ===================================================== */
-export async function adminListUsers({ search, limit, offset }: any) {
+export async function adminListUsers({
+  search,
+  limit,
+  offset,
+}: {
+  search?: string;
+  limit: number;
+  offset: number;
+}) {
   if (search) {
     const { rows } = await pool.query(
       `
@@ -197,7 +270,10 @@ export async function adminListUsers({ search, limit, offset }: any) {
     );
 
     const { rows: c } = await pool.query(
-      `SELECT COUNT(*) FROM users WHERE username ILIKE '%'||$1||'%' OR uid ILIKE '%'||$1||'%'`,
+      `
+      SELECT COUNT(*) FROM users
+      WHERE username ILIKE '%'||$1||'%' OR uid ILIKE '%'||$1||'%'
+    `,
       [search]
     );
 
@@ -205,7 +281,11 @@ export async function adminListUsers({ search, limit, offset }: any) {
   }
 
   const { rows } = await pool.query(
-    `SELECT * FROM users ORDER BY updated_at DESC LIMIT $1 OFFSET $2`,
+    `
+    SELECT * FROM users
+    ORDER BY updated_at DESC
+    LIMIT $1 OFFSET $2
+  `,
     [limit, offset]
   );
 
@@ -232,22 +312,41 @@ export async function adminGetUser(uid: string) {
 
 export async function adminResetFreeCounters(uid: string) {
   const { rows } = await pool.query(
-    `UPDATE users SET free_skips_used=0, free_hints_used=0 WHERE uid=$1 RETURNING *`,
+    `
+    UPDATE users
+    SET free_skips_used=0, free_hints_used=0
+    WHERE uid=$1
+    RETURNING *
+  `,
     [uid]
   );
   return rows[0];
 }
 
-export async function adminGetStats({ onlineMinutes }: any) {
+/* =====================================================
+   ADMIN — STATS + CHARTS (STEP 1)
+===================================================== */
+export async function adminGetStats({
+  onlineMinutes,
+}: {
+  onlineMinutes: number;
+}) {
   const users = await pool.query(`SELECT COUNT(*) FROM users`);
   const coins = await pool.query(`SELECT SUM(coins) FROM users`);
   const online = await pool.query(
-    `SELECT COUNT(*) FROM sessions WHERE last_seen_at > NOW() - ($1 || ' minutes')::interval`,
+    `
+    SELECT COUNT(*) FROM sessions
+    WHERE last_seen_at > NOW() - ($1 || ' minutes')::interval
+  `,
     [onlineMinutes]
   );
 
-  const ad50 = await pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='ad_50'`);
-  const daily = await pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='daily_login'`);
+  const ad50 = await pool.query(
+    `SELECT COUNT(*) FROM reward_claims WHERE type='ad_50'`
+  );
+  const daily = await pool.query(
+    `SELECT COUNT(*) FROM reward_claims WHERE type='daily_login'`
+  );
   const levels = await pool.query(`SELECT COUNT(*) FROM level_rewards`);
 
   return {
@@ -260,7 +359,15 @@ export async function adminGetStats({ onlineMinutes }: any) {
   };
 }
 
-export async function adminListOnlineUsers({ minutes, limit, offset }: any) {
+export async function adminListOnlineUsers({
+  minutes,
+  limit,
+  offset,
+}: {
+  minutes: number;
+  limit: number;
+  offset: number;
+}) {
   const { rows } = await pool.query(
     `
     SELECT u.uid,u.username,u.coins,
@@ -274,51 +381,30 @@ export async function adminListOnlineUsers({ minutes, limit, offset }: any) {
     [minutes, limit, offset]
   );
   return { rows, count: rows.length };
-};
+}
 
-/* =====================================================
-   CHARTS
-===================================================== */
-export async function adminChartCoins({ days }: any) {
-  const d = Math.max(1, Math.min(90, days || 7));
-
+export async function adminChartCoins({ days }: { days: number }) {
   const { rows } = await pool.query(
     `
-    SELECT to_char(gs.day,'YYYY-MM-DD') day,
-           COALESCE(SUM(rc.amount),0)::int coins
-    FROM generate_series(
-      CURRENT_DATE - ($1::int - 1),
-      CURRENT_DATE,
-      interval '1 day'
-    ) gs(day)
-    LEFT JOIN reward_claims rc ON rc.created_at::date = gs.day
-    GROUP BY gs.day
-    ORDER BY gs.day
-  `,
-    [d]
+    SELECT to_char(d,'YYYY-MM-DD') AS day,
+           COALESCE(SUM(rc.amount),0)::int AS coins
+    FROM generate_series(CURRENT_DATE-6, CURRENT_DATE, interval '1 day') d
+    LEFT JOIN reward_claims rc ON rc.created_at::date=d::date
+    GROUP BY d ORDER BY d
+  `
   );
-
   return rows;
 }
 
-export async function adminChartActiveUsers({ days }: any) {
-  const d = Math.max(1, Math.min(90, days || 7));
-
+export async function adminChartActiveUsers({ days }: { days: number }) {
   const { rows } = await pool.query(
     `
-    SELECT to_char(gs.day,'YYYY-MM-DD') day,
-           COUNT(DISTINCT s.uid)::int active_users
-    FROM generate_series(
-      CURRENT_DATE - ($1::int - 1),
-      CURRENT_DATE,
-      interval '1 day'
-    ) gs(day)
-    LEFT JOIN sessions s ON s.last_seen_at::date = gs.day
-    GROUP BY gs.day
-    ORDER BY gs.day
-  `,
-    [d]
+    SELECT to_char(d,'YYYY-MM-DD') AS day,
+           COUNT(DISTINCT s.uid)::int AS active_users
+    FROM generate_series(CURRENT_DATE-6, CURRENT_DATE, interval '1 day') d
+    LEFT JOIN sessions s ON s.last_seen_at::date=d::date
+    GROUP BY d ORDER BY d
+  `
   );
-
   return rows;
 }
