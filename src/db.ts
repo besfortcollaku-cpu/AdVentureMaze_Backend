@@ -114,7 +114,7 @@ export async function claimLevelComplete(uid: string, level: number) {
     [uid, level]
   );
 
-  return { user: await addCoins(uid, 10) };
+  return { user: await addCoins(uid, 1) };
 }
 
 /* =====================================================
@@ -274,7 +274,7 @@ export async function adminListOnlineUsers({ minutes, limit, offset }: any) {
     [minutes, limit, offset]
   );
   return { rows, count: rows.length };
-}
+};
 
 /* =====================================================
    CHARTS
