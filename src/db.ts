@@ -158,7 +158,7 @@ export async function claimLevelComplete(uid: string, level: number) {
     [uid, level]
   );
 
-  const user = await addCoins(uid, 10);
+  const user = await addCoins(uid, 1);
   return { user };
 }
 
@@ -166,31 +166,75 @@ export async function claimLevelComplete(uid: string, level: number) {
    SKIPS / HINTS
 ===================================================== */
 export async function useSkip(uid: string) {
-  const { rows } = await pool.query(
+  const { rows: userRows } = await pool.query(`SELECT * FROM users WHERE uid=$1`, [uid]);
+  const user = userRows[0];
+  if (!user) throw new Error("User not found");
+
+  // 3 free skips per account (your rule)
+  if ((user.free_skips_used ?? 0) < 3) {
+    const { rows } = await pool.query(
+      `
+      UPDATE users
+      SET free_skips_used = free_skips_used + 1, updated_at=NOW()
+      WHERE uid=$1
+      RETURNING *
+    `,
+      [uid]
+    );
+    return { ok: true, usedFree: true, charged: 0, user: rows[0] };
+  }
+
+  // after free: -50 coins
+  if ((user.coins ?? 0) < 50) throw new Error("Not enough coins for skip");
+
+  // record the cost (audit)
+  await pool.query(
     `
-    UPDATE users
-    SET free_skips_used = free_skips_used + 1
-    WHERE uid=$1
-    RETURNING *
+    INSERT INTO reward_claims (uid,type,amount,created_at)
+    VALUES ($1,'skip_cost',-50,NOW())
   `,
     [uid]
   );
-  return { ok: true, user: rows[0] };
+
+  const updatedUser = await addCoins(uid, -50);
+  return { ok: true, usedFree: false, charged: 50, user: updatedUser };
 }
+
 
 export async function useHint(uid: string) {
-  const { rows } = await pool.query(
+  const { rows: userRows } = await pool.query(`SELECT * FROM users WHERE uid=$1`, [uid]);
+  const user = userRows[0];
+  if (!user) throw new Error("User not found");
+
+  // 3 free hints per account (your rule)
+  if ((user.free_hints_used ?? 0) < 3) {
+    const { rows } = await pool.query(
+      `
+      UPDATE users
+      SET free_hints_used = free_hints_used + 1, updated_at=NOW()
+      WHERE uid=$1
+      RETURNING *
+    `,
+      [uid]
+    );
+    return { ok: true, usedFree: true, charged: 0, user: rows[0] };
+  }
+
+  // after free: -50 coins
+  if ((user.coins ?? 0) < 50) throw new Error("Not enough coins for hint");
+
+  // record the cost (audit)
+  await pool.query(
     `
-    UPDATE users
-    SET free_hints_used = free_hints_used + 1
-    WHERE uid=$1
-    RETURNING *
+    INSERT INTO reward_claims (uid,type,amount,created_at)
+    VALUES ($1,'hint_cost',-50,NOW())
   `,
     [uid]
   );
-  return { ok: true, user: rows[0] };
-}
 
+  const updatedUser = await addCoins(uid, -50);
+  return { ok: true, usedFree: false, charged: 50, user: updatedUser };
+}
 /* =====================================================
    ONLINE / SESSIONS
 ===================================================== */

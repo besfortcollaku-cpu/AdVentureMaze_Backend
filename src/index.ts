@@ -67,6 +67,30 @@ function requireAdmin(req: express.Request) {
 
 /* ================= API ================= */
 
+app.post("/api/pi/verify", async (req, res) => {
+  try {
+    // frontend sends accessToken in body AND Authorization header
+    const token =
+      req.body?.accessToken ||
+      String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+
+    if (!token) throw new Error("Missing accessToken");
+
+    const pi: any = await verifyPiAccessToken(token);
+
+    // Create/update user in DB
+    await upsertUser({ uid: pi.uid, username: pi.username });
+    await touchUserOnline(pi.uid);
+
+    res.json({
+      ok: true,
+      user: { uid: pi.uid, username: pi.username },
+    });
+  } catch (e: any) {
+    res.status(401).json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/api/me", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
