@@ -58,20 +58,24 @@ async function verifyPiAccessToken(accessToken: string) {
 }
 
 async function requirePiUser(req: express.Request) {
-  const token = getBearerToken(req);
-  if (!token) throw new Error("Missing token");
+    const token = getBearerToken(req);
+      if (!token) throw new Error("Missing token");
 
-  const piUser: any = await verifyPiAccessToken(token);
-  const uid = String(piUser.uid);
-  const username = String(piUser.username);
+        const piUser: any = await verifyPiAccessToken(token);
 
-  await upsertUser({ uid, username });
+          if (!piUser?.user?.uid || !piUser?.user?.username) {
+                throw new Error("Invalid Pi user payload");
+                  }
 
-  // mark user online on ANY request
-  await touchUserOnline(uid);
+                    const uid = String(piUser.user.uid);
+                      const username = String(piUser.user.username);
 
-  return { uid, username };
-}
+                        await upsertUser({ uid, username });
+                          await touchUserOnline(uid);
+
+                            return { uid, username };
+                          }
+        
 
 /* ---------------- ADMIN AUTH ---------------- */
 function requireAdmin(req: express.Request) {
