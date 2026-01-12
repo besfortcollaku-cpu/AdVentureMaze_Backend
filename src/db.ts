@@ -306,6 +306,7 @@ export async function adminListUsers({
 
     return { rows, count: Number(c[0].count) };
   }
+  }
   export async function adminDeleteUser(uid: string) {
   if (!uid) {
     throw new Error("Missing uid");
@@ -352,7 +353,7 @@ export async function adminListUsers({
   } finally {
     client.release();
   }
-}
+
 
   // ✅ no search
   const { rows } = await pool.query(
