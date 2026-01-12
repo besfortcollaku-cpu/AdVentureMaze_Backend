@@ -368,7 +368,7 @@ export async function adminListUsers({
 
   const { rows: c } = await pool.query(`SELECT COUNT(*) FROM users`);
   return { rows, count: Number(c[0].count) };
-}
+
 
 export async function adminGetUser(uid: string) {
   const user = await getUserByUid(uid);
