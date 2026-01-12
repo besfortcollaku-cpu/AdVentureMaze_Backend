@@ -279,13 +279,10 @@ app.delete("/admin/users/:uid", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing uid" });
     }
 
-    // 🔥 DELETE USER DATA
-    await db.users.delete(uid);
-    await db.progress.deleteByUser(uid);
-    await db.sessions.deleteByUser(uid);
+    await adminDeleteUser(uid);
 
     res.json({ ok: true });
-  } catch (e) {
+  } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
 });

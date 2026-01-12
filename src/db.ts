@@ -400,6 +400,10 @@ export async function adminListOnlineUsers({
 
   return { rows, count: rows.length };
 }
+
+/* ============================
+   Admin Delete Users
+============================ */
 export async function adminDeleteUser(uid: string) {
   await db.users.delete(uid);
   await db.progress.deleteByUser(uid);
