@@ -352,7 +352,7 @@ export async function adminListUsers({
     throw err;
   } finally {
     client.release();
-  }
+  }}
 
 
   // ✅ no search
