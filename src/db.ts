@@ -450,11 +450,11 @@ export async function adminChartActiveUsers({ days }: { days: number }) {
 }
 
 // ✅ ADMIN: delete user completely
+// ✅ ADMIN: delete user completely
 export async function adminDeleteUser(uid: string) {
   if (!uid) throw new Error("Missing uid");
 
-  // reuse existing helpers / tables
-  await sql`DELETE FROM users WHERE uid = ${uid}`;
-  await sql`DELETE FROM progress WHERE uid = ${uid}`;
-  await sql`DELETE FROM sessions WHERE uid = ${uid}`;
+  await db.query(`DELETE FROM users WHERE uid = ?`, [uid]);
+  await db.query(`DELETE FROM progress WHERE uid = ?`, [uid]);
+  await db.query(`DELETE FROM sessions WHERE uid = ?`, [uid]);
 }
