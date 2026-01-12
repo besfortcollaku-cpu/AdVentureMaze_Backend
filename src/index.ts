@@ -36,29 +36,17 @@ const app = express();
 
 /* ---------------- CORS ---------------- */
 app.use(cors({
-  origin: "*",
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization","x-admin-secret"],
+  origin: true,
+  credentials: true,
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Admin-Secret"
+  ]
 }));
-app.options("*", cors());
-app.use(express.json());
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, x-admin-secret"
-  );
-  res.header(
-    "Access-Control-Allow-Methods",
-    "GET, POST, PUT, DELETE, OPTIONS"
-  );
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
-
-  next();
-});
+app.use(express.json())
 
 /* ---------------- HEALTH ---------------- */
 app.get("/health", (_req, res) => res.send("ok"));
@@ -94,14 +82,12 @@ async function requirePiUser(req: express.Request) {
 }
 
 // ✅ ADMIN: delete user completely
-app.delete("/admin/users/:uid", async (req, res) => {
-  try {
-    requireAdmin(req);
-    await adminDeleteUser(req.params.uid);
-    res.json({ ok: true });
-  } catch (e: any) {
-    res.status(401).json({ ok: false, error: e.message });
-  }
+app.delete("/admin/users/:uid", requireAdmin, async (req, res) => {
+  const { uid } = req.params;
+
+  await adminDeleteUser(uid);
+
+  res.json({ ok: true });
 });
 /* ---------------- ADMIN AUTH ---------------- */
 function requireAdmin(req: express.Request) {
