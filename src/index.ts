@@ -269,6 +269,26 @@ app.get("/admin/users/:uid", async (req,res)=>{
     res.status(401).json({ ok:false, error:e.message });
   }
 });
+// ✅ ADMIN: delete user completely
+app.delete("/admin/users/:uid", async (req, res) => {
+  try {
+    requireAdmin(req);
+
+    const { uid } = req.params;
+    if (!uid) {
+      return res.status(400).json({ ok: false, error: "Missing uid" });
+    }
+
+    // 🔥 DELETE USER DATA
+    await db.users.delete(uid);
+    await db.progress.deleteByUser(uid);
+    await db.sessions.deleteByUser(uid);
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(401).json({ ok: false, error: e.message });
+  }
+});
 
 /* ✅ NEW: charts endpoints (Step 1 – “A: last 7 days”) */
 app.get("/admin/charts/coins", async (req,res)=>{
