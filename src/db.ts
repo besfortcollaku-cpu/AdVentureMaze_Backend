@@ -307,52 +307,7 @@ export async function adminListUsers({
     return { rows, count: Number(c[0].count) };
   }
   }
-  export async function adminDeleteUser(uid: string) {
-  if (!uid) {
-    throw new Error("Missing uid");
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    // 1️⃣ Delete sessions
-    await client.query(
-      "DELETE FROM sessions WHERE uid = $1",
-      [uid]
-    );
-
-    // 2️⃣ Delete progress
-    await client.query(
-      "DELETE FROM progress WHERE uid = $1",
-      [uid]
-    );
-
-    // 3️⃣ Delete rewards (if exists)
-    await client.query(
-      "DELETE FROM reward_claims WHERE uid = $1",
-      [uid]
-    );
-
-    await client.query(
-      "DELETE FROM level_rewards WHERE uid = $1",
-      [uid]
-    );
-
-    // 4️⃣ Delete user (LAST)
-    await client.query(
-      "DELETE FROM users WHERE uid = $1",
-      [uid]
-    );
-
-    await client.query("COMMIT");
-    return true;
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }}
+  
 
 
   // ✅ no search
@@ -368,7 +323,7 @@ export async function adminListUsers({
 
   const { rows: c } = await pool.query(`SELECT COUNT(*) FROM users`);
   return { rows, count: Number(c[0].count) };
-
+}
 
 export async function adminGetUser(uid: string) {
   const user = await getUserByUid(uid);
@@ -404,7 +359,27 @@ export async function adminResetFreeCounters(uid: string) {
   );
   return rows[0];
 }
+export async function adminDeleteUser(uid: string) {
+  // delete user
+  await pool.query(
+    `DELETE FROM users WHERE uid = $1`,
+    [uid]
+  );
 
+  // delete progress
+  await pool.query(
+    `DELETE FROM progress WHERE uid = $1`,
+    [uid]
+  );
+
+  // delete sessions
+  await pool.query(
+    `DELETE FROM sessions WHERE uid = $1`,
+    [uid]
+  );
+
+  return { ok: true };
+}
 export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }) {
   const users = await pool.query(`SELECT COUNT(*) FROM users`);
   const coins = await pool.query(`SELECT SUM(coins) FROM users`);
@@ -415,6 +390,7 @@ export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }
   `,
     [onlineMinutes]
   );
+
 
 
   const ad50 = await pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='ad_50'`);
