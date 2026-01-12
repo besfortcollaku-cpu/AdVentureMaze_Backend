@@ -306,7 +306,6 @@ export async function adminListUsers({
 
     return { rows, count: Number(c[0].count) };
   }
-  }
   
 
 
