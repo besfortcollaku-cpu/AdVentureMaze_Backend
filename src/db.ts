@@ -449,12 +449,13 @@ export async function adminChartActiveUsers({ days }: { days: number }) {
   return rows.map(r => ({ day: r.day, active_users: Number(r.active_users) }));
 }
 
-// ✅ ADMIN: delete user completely
-// ✅ ADMIN: delete user completely
+// ✅ db.ts
 export async function adminDeleteUser(uid: string) {
   if (!uid) throw new Error("Missing uid");
 
-  await db.query(`DELETE FROM users WHERE uid = ?`, [uid]);
-  await db.query(`DELETE FROM progress WHERE uid = ?`, [uid]);
-  await db.query(`DELETE FROM sessions WHERE uid = ?`, [uid]);
+  await users.delete(uid);
+  await progress.deleteByUser(uid);
+  await sessions.deleteByUser(uid);
+
+  return true;
 }

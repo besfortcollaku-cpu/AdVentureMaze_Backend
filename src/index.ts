@@ -77,6 +77,20 @@ async function requirePiUser(req: express.Request) {
   return { uid, username };
 }
 
+// ✅ ADMIN: delete user completely
+app.delete("/admin/users/:uid", async (req, res) => {
+  try {
+    requireAdmin(req);
+
+    const { uid } = req.params;
+    await adminDeleteUser(uid);
+
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(401).json({ ok: false, error: e.message });
+  }
+});
+
 /* ---------------- ADMIN AUTH ---------------- */
 function requireAdmin(req: express.Request) {
   const secret = String(req.headers["x-admin-secret"] || "");
