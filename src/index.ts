@@ -277,14 +277,7 @@ app.get("/admin/users/:uid", async (req,res)=>{
 app.delete("/admin/users/:uid", async (req, res) => {
   try {
     requireAdmin(req);
-
-    const { uid } = req.params;
-    if (!uid) {
-      return res.status(400).json({ ok: false, error: "Missing uid" });
-    }
-
-    await adminDeleteUser(uid);
-
+    await adminDeleteUser(req.params.uid);
     res.json({ ok: true });
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });

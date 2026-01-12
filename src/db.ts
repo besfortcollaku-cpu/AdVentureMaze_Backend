@@ -401,14 +401,6 @@ export async function adminListOnlineUsers({
   return { rows, count: rows.length };
 }
 
-/* ============================
-   Admin Delete Users
-============================ */
-export async function adminDeleteUser(uid: string) {
-  await users.delete(uid);
-  await onprogress.deleteByUser(uid);
-  await sessions.deleteByUser(uid);
-}
 
 /* ============================
    Charts (Step 1 – 7 days default)
@@ -457,3 +449,12 @@ export async function adminChartActiveUsers({ days }: { days: number }) {
   return rows.map(r => ({ day: r.day, active_users: Number(r.active_users) }));
 }
 
+// ✅ ADMIN: delete user completely
+export async function adminDeleteUser(uid: string) {
+  if (!uid) throw new Error("Missing uid");
+
+  // reuse existing helpers / tables
+  await sql`DELETE FROM users WHERE uid = ${uid}`;
+  await sql`DELETE FROM progress WHERE uid = ${uid}`;
+  await sql`DELETE FROM sessions WHERE uid = ${uid}`;
+}
