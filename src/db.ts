@@ -400,6 +400,11 @@ export async function adminListOnlineUsers({
 
   return { rows, count: rows.length };
 }
+export async function adminDeleteUser(uid: string) {
+  await db.users.delete(uid);
+  await db.progress.deleteByUser(uid);
+  await db.sessions.deleteByUser(uid);
+}
 
 /* ============================
    Charts (Step 1 – 7 days default)
