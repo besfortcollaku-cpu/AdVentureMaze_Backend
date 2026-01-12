@@ -368,6 +368,53 @@ export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }
     [onlineMinutes]
   );
 
+export async function adminDeleteUser(uid: string) {
+  if (!uid) {
+    throw new Error("Missing uid");
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 1️⃣ Delete sessions
+    await client.query(
+      "DELETE FROM sessions WHERE uid = $1",
+      [uid]
+    );
+
+    // 2️⃣ Delete progress
+    await client.query(
+      "DELETE FROM progress WHERE uid = $1",
+      [uid]
+    );
+
+    // 3️⃣ Delete rewards (if exists)
+    await client.query(
+      "DELETE FROM reward_claims WHERE uid = $1",
+      [uid]
+    );
+
+    await client.query(
+      "DELETE FROM level_rewards WHERE uid = $1",
+      [uid]
+    );
+
+    // 4️⃣ Delete user (LAST)
+    await client.query(
+      "DELETE FROM users WHERE uid = $1",
+      [uid]
+    );
+
+    await client.query("COMMIT");
+    return true;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
   const ad50 = await pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='ad_50'`);
   const daily = await pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='daily_login'`);
   const levels = await pool.query(`SELECT COUNT(*) FROM level_rewards`);
@@ -447,15 +494,4 @@ export async function adminChartActiveUsers({ days }: { days: number }) {
     [d]
   );
   return rows.map(r => ({ day: r.day, active_users: Number(r.active_users) }));
-}
-
-// ✅ db.ts
-export async function adminDeleteUser(uid: string) {
-  if (!uid) throw new Error("Missing uid");
-
-  await users.delete(uid);
-  await progress.deleteByUser(uid);
-  await sessions.deleteByUser(uid);
-
-  return true;
 }

@@ -21,7 +21,6 @@ import {
   pingSession,
   endSession,
   touchUserOnline,
-  adminListUser,
   adminGetUser,
   adminGetStats,
   adminListOnlineUsers,
@@ -90,7 +89,6 @@ app.delete("/admin/users/:uid", async (req, res) => {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
-
 /* ---------------- ADMIN AUTH ---------------- */
 function requireAdmin(req: express.Request) {
   const secret = String(req.headers["x-admin-secret"] || "");
