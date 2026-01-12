@@ -80,10 +80,7 @@ async function requirePiUser(req: express.Request) {
 app.delete("/admin/users/:uid", async (req, res) => {
   try {
     requireAdmin(req);
-
-    const { uid } = req.params;
-    await adminDeleteUser(uid);
-
+    await adminDeleteUser(req.params.uid);
     res.json({ ok: true });
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
