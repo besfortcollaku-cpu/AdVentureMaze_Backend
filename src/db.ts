@@ -405,9 +405,9 @@ export async function adminListOnlineUsers({
    Admin Delete Users
 ============================ */
 export async function adminDeleteUser(uid: string) {
-  await db.users.delete(uid);
-  await db.progress.deleteByUser(uid);
-  await db.sessions.deleteByUser(uid);
+  await users.delete(uid);
+  await onprogress.deleteByUser(uid);
+  await sessions.deleteByUser(uid);
 }
 
 /* ============================
@@ -457,13 +457,3 @@ export async function adminChartActiveUsers({ days }: { days: number }) {
   return rows.map(r => ({ day: r.day, active_users: Number(r.active_users) }));
 }
 
-// 🔥 ADMIN: delete user completely
-export async function adminDeleteUser(uid: string) {
-  if (!uid) throw new Error("Missing uid");
-
-  await users.delete(uid);
-  await progress.deleteByUser(uid);
-  await sessions.deleteByUser(uid);
-
-  return true;
-}

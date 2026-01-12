@@ -16,12 +16,12 @@ import {
   useHint,
 
   // sessions / admin
-  adminDeleteUsers,
+  adminDeleteUser,
   startSession,
   pingSession,
   endSession,
   touchUserOnline,
-  adminListUsers,
+  adminListUser,
   adminGetUser,
   adminGetStats,
   adminListOnlineUsers,
@@ -29,12 +29,9 @@ import {
   // ✅ charts
   adminChartCoins,
   adminChartActiveUsers,
-} from "./db";
-import {
   adminListUsers,
-  adminGetUser,
-  adminDeleteUser
-} from "./admin";
+} from "./db";
+
 
 const app = express();
 
