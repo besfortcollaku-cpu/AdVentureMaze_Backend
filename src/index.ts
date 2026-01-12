@@ -1,3 +1,4 @@
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -15,6 +16,7 @@ import {
   useHint,
 
   // sessions / admin
+  adminDeleteUsers,
   startSession,
   pingSession,
   endSession,
@@ -28,6 +30,11 @@ import {
   adminChartCoins,
   adminChartActiveUsers,
 } from "./db";
+import {
+  adminListUsers,
+  adminGetUser,
+  adminDeleteUser
+} from "./admin";
 
 const app = express();
 
