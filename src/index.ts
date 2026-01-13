@@ -87,8 +87,10 @@ app.delete("/admin/users/:uid", requireAdmin, async (req, res) => {
 
   await adminDeleteUser(uid);
 
-  res.json({ ok: true });
+  
 });
+
+res.json({ ok: true });
 /* ---------------- ADMIN AUTH ---------------- */
 function requireAdmin(req: express.Request) {
   const secret = String(req.headers["x-admin-secret"] || "");
