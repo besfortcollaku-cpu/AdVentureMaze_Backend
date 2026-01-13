@@ -318,6 +318,8 @@ app.post("/api/session/end", async (req,res)=>{
 
 // ✅ ADMIN: delete user completely
 app.delete("/admin/users/:uid", async (req, res) => {
+  app.delete("/admin/users/:uid", adminAuth, async (req, res) => {
+  console.log("[ADMIN DELETE] HIT", req.params.uid);
   try {
     requireAdmin(req);
     await adminDeleteUser(req.params.uid);
