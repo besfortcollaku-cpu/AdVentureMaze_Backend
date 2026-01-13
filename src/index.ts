@@ -281,40 +281,6 @@ app.get("/admin/charts/active", async (req,res)=>{
   }
 });
 
-/* ---------------- SESSIONS ---------------- */
-app.post("/api/session/start", async (req,res)=>{
-  try{
-    const { uid } = await requirePiUser(req);
-    const sessionId = String(req.body?.sessionId||"");
-    const ua = String(req.headers["user-agent"]||"");
-    const ip = String(req.headers["x-forwarded-for"]||req.socket.remoteAddress||"");
-    const row = await startSession({ uid, sessionId, userAgent:ua, ip });
-    res.json({ ok:true, session:row });
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
-  }
-});
-
-app.post("/api/session/ping", async (req,res)=>{
-  try{
-    const { uid } = await requirePiUser(req);
-    const row = await pingSession(uid);
-    res.json({ ok:true, session:row });
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
-  }
-});
-
-app.post("/api/session/end", async (req,res)=>{
-  try{
-    const { uid } = await requirePiUser(req);
-    const row = await endSession(uid);
-    res.json({ ok:true, session:row });
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
-  }
-});
-
 
 // ✅ ADMIN: delete user completely
 app.delete("/admin/users/:uid", async (req, res) => {
@@ -326,7 +292,6 @@ app.delete("/admin/users/:uid", async (req, res) => {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
-
 
 /* ---------------- START ---------------- */
 async function main(){
