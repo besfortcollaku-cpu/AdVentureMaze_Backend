@@ -52,6 +52,44 @@ app.use(express.json())
 app.get("/health", (_req, res) => res.send("ok"));
 app.get("/", (_req, res) => res.send("backend up"));
 
+/* ---------------- /api/me ---------------- */
+app.get("/api/me", async (req, res) => {
+  try {
+    const { uid, username } = await requirePiUser(req);
+    let user = await upsertUser({ uid, username });
+
+    try {
+      const out = await claimDailyLogin(uid);
+      if (out?.user) user = out.user;
+    } catch {}
+
+    const progress = await getProgressByUid(uid);
+
+    res.json({
+      ok:true,
+      user,
+      progress: progress ?? { uid, level:1, coins:0 },
+    });
+  } catch (e:any) {
+    res.status(401).json({ ok:false, error:e.message });
+  }
+});
+
+
+/* ---------------- PROGRESS ---------------- */
+app.get("/progress", async (req,res)=>{
+  const uid = String(req.query.uid||"");
+  const p = await getProgressByUid(uid);
+  res.json({ ok:true, data:p ?? {uid,level:1,coins:0} });
+});
+
+app.post("/progress", async (req,res)=>{
+  await requirePiUser(req);
+  const { uid, level, coins } = req.body;
+  await setProgressByUid({ uid, level, coins });
+  res.json({ ok:true });
+});
+
 /* ---------------- HELPERS ---------------- */
 function getBearerToken(req: express.Request) {
   return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
@@ -86,11 +124,10 @@ app.delete("/admin/users/:uid", requireAdmin, async (req, res) => {
   const { uid } = req.params;
 
   await adminDeleteUser(uid);
-
+res.json({ ok: true });
   
 });
 
-res.json({ ok: true });
 /* ---------------- ADMIN AUTH ---------------- */
 function requireAdmin(req: express.Request) {
   const secret = String(req.headers["x-admin-secret"] || "");
@@ -118,28 +155,6 @@ app.post("/api/pi/verify", async (req, res) => {
   }
 });
 
-/* ---------------- /api/me ---------------- */
-app.get("/api/me", async (req, res) => {
-  try {
-    const { uid, username } = await requirePiUser(req);
-    let user = await upsertUser({ uid, username });
-
-    try {
-      const out = await claimDailyLogin(uid);
-      if (out?.user) user = out.user;
-    } catch {}
-
-    const progress = await getProgressByUid(uid);
-
-    res.json({
-      ok:true,
-      user,
-      progress: progress ?? { uid, level:1, coins:0 },
-    });
-  } catch (e:any) {
-    res.status(401).json({ ok:false, error:e.message });
-  }
-});
 
 /* ---------------- REWARDS ---------------- */
 app.post("/api/rewards/ad-50", async (req,res)=>{
@@ -191,53 +206,8 @@ app.post("/api/hint", async (req,res)=>{
   }
 });
 
-/* ---------------- PROGRESS ---------------- */
-app.get("/progress", async (req,res)=>{
-  const uid = String(req.query.uid||"");
-  const p = await getProgressByUid(uid);
-  res.json({ ok:true, data:p ?? {uid,level:1,coins:0} });
-});
 
-app.post("/progress", async (req,res)=>{
-  await requirePiUser(req);
-  const { uid, level, coins } = req.body;
-  await setProgressByUid({ uid, level, coins });
-  res.json({ ok:true });
-});
 
-/* ---------------- SESSIONS ---------------- */
-app.post("/api/session/start", async (req,res)=>{
-  try{
-    const { uid } = await requirePiUser(req);
-    const sessionId = String(req.body?.sessionId||"");
-    const ua = String(req.headers["user-agent"]||"");
-    const ip = String(req.headers["x-forwarded-for"]||req.socket.remoteAddress||"");
-    const row = await startSession({ uid, sessionId, userAgent:ua, ip });
-    res.json({ ok:true, session:row });
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
-  }
-});
-
-app.post("/api/session/ping", async (req,res)=>{
-  try{
-    const { uid } = await requirePiUser(req);
-    const row = await pingSession(uid);
-    res.json({ ok:true, session:row });
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
-  }
-});
-
-app.post("/api/session/end", async (req,res)=>{
-  try{
-    const { uid } = await requirePiUser(req);
-    const row = await endSession(uid);
-    res.json({ ok:true, session:row });
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
-  }
-});
 
 /* ---------------- ADMIN: stats/online/users ---------------- */
 app.get("/admin/stats", async (req,res)=>{
@@ -287,16 +257,6 @@ app.get("/admin/users/:uid", async (req,res)=>{
     res.status(401).json({ ok:false, error:e.message });
   }
 });
-// ✅ ADMIN: delete user completely
-app.delete("/admin/users/:uid", async (req, res) => {
-  try {
-    requireAdmin(req);
-    await adminDeleteUser(req.params.uid);
-    res.json({ ok: true });
-  } catch (e: any) {
-    res.status(401).json({ ok: false, error: e.message });
-  }
-});
 
 /* ✅ NEW: charts endpoints (Step 1 – “A: last 7 days”) */
 app.get("/admin/charts/coins", async (req,res)=>{
@@ -320,6 +280,53 @@ app.get("/admin/charts/active", async (req,res)=>{
     res.status(401).json({ ok:false, error:e.message });
   }
 });
+
+/* ---------------- SESSIONS ---------------- */
+app.post("/api/session/start", async (req,res)=>{
+  try{
+    const { uid } = await requirePiUser(req);
+    const sessionId = String(req.body?.sessionId||"");
+    const ua = String(req.headers["user-agent"]||"");
+    const ip = String(req.headers["x-forwarded-for"]||req.socket.remoteAddress||"");
+    const row = await startSession({ uid, sessionId, userAgent:ua, ip });
+    res.json({ ok:true, session:row });
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
+  }
+});
+
+app.post("/api/session/ping", async (req,res)=>{
+  try{
+    const { uid } = await requirePiUser(req);
+    const row = await pingSession(uid);
+    res.json({ ok:true, session:row });
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
+  }
+});
+
+app.post("/api/session/end", async (req,res)=>{
+  try{
+    const { uid } = await requirePiUser(req);
+    const row = await endSession(uid);
+    res.json({ ok:true, session:row });
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
+  }
+});
+
+
+// ✅ ADMIN: delete user completely
+app.delete("/admin/users/:uid", async (req, res) => {
+  try {
+    requireAdmin(req);
+    await adminDeleteUser(req.params.uid);
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(401).json({ ok: false, error: e.message });
+  }
+});
+
 
 /* ---------------- START ---------------- */
 async function main(){
