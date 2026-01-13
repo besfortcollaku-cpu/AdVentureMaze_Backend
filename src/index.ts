@@ -327,7 +327,7 @@ app.delete("/admin/users/:uid", async (req, res) => {
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
-}});
+},});
 
 
 /* ---------------- START ---------------- */
