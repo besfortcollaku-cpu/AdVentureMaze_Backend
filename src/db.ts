@@ -597,3 +597,11 @@ export async function claimCoinAd(uid: string) {
     cooldownSeconds: 0,
   });
 }
+
+export async function getCompletedLevels(uid: string) {
+  const { rows } = await pool.query(
+    `SELECT level FROM level_rewards WHERE uid=$1`,
+    [uid]
+  );
+  return rows.map(r => r.level);
+}

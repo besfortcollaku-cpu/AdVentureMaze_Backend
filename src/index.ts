@@ -29,7 +29,9 @@ import {
   // ✅ charts
   adminChartCoins,
   adminChartActiveUsers,
-} from "./db";
+from "./db";
+}
+const progress = await getProgressByUid(uid);
 
 
 const app = express();
@@ -64,11 +66,14 @@ app.get("/api/me", async (req, res) => {
     } catch {}
 
     const progress = await getProgressByUid(uid);
+const completedLevels = await getCompletedLevels(uid);
 
     res.json({
-      ok:true,
-      user,
-      progress: progress ?? { uid, level:1, coins:0 },
+  ok: true,
+  user,
+  progress: progress ?? { uid, level: 1, coins: 0 },
+  completedLevels,
+});
     });
   } catch (e:any) {
     res.status(401).json({ ok:false, error:e.message });
