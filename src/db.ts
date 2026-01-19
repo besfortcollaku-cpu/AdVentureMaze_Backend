@@ -49,11 +49,54 @@ export async function initDB() {
       last_seen_at TIMESTAMP NOT NULL
     );
   `);
+  await pool.query(`
+  CREATE TABLE IF NOT EXISTS user_ads (
+    uid TEXT NOT NULL,
+    month TEXT NOT NULL, -- YYYY-MM
+    coin_ads_watched INTEGER DEFAULT 0,
+    skip_ads_watched INTEGER DEFAULT 0,
+    hint_ads_watched INTEGER DEFAULT 0,
+    PRIMARY KEY (uid, month)
+  );
+`);
+  await pool.query(`
+  CREATE TABLE IF NOT EXISTS user_ads (
+    uid TEXT NOT NULL,
+    month TEXT NOT NULL,
+    ads_for_coins INT DEFAULT 0,
+    ads_for_skips INT DEFAULT 0,
+    ads_for_hints INT DEFAULT 0,
+    PRIMARY KEY (uid, month)
+  );
+`);
+
 }
 
 /* =====================================================
    USERS
 ===================================================== */
+function currentMonthKey() {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`; // e.g. 2026-01
+}
+
+export async function ensureUserAdsRow(uid: string) {
+  const month = currentMonthKey();
+
+  await pool.query(
+    `
+    INSERT INTO user_ads (uid, month)
+    VALUES ($1, $2)
+    ON CONFLICT (uid, month) DO NOTHING
+    `,
+    [uid, month]
+  );
+
+  return { uid, month };
+}
+
 export async function upsertUser({
   uid, username,
 }: { uid: string; username: string; }) {
@@ -123,9 +166,28 @@ export async function setProgressByUid({
 /* =====================================================
    REWARDS
 ===================================================== */
+async function ensureUserAdsRow(uid: string) {
+  const month = new Date().toISOString().slice(0, 7); // YYYY-MM
+
+  await pool.query(
+    `
+    INSERT INTO user_ads (uid, month)
+    VALUES ($1, $2)
+    ON CONFLICT (uid, month) DO NOTHING
+    `,
+    [uid, month]
+  );
+
+  return { month };
+}
 export async function claimReward({
   uid, type, nonce, amount, cooldownSeconds,
-}: { uid: string; type: string; nonce: string; amount: number; cooldownSeconds: number; }) {
+}: { 
+  uid: string; 
+  type: string; 
+  nonce: string; 
+  amount: number; 
+  cooldownSeconds: number; }) {
   const { rowCount } = await pool.query(
     `SELECT 1 FROM reward_claims WHERE uid=$1 AND nonce=$2`,
     [uid, nonce]
@@ -452,23 +514,95 @@ export async function adminChartCoins({ days }: { days: number }) {
 }
 
 export async function adminChartActiveUsers({ days }: { days: number }) {
-  const d = Math.max(1, Math.min(90, Number(days || 7)));
-  const { rows } = await pool.query(
-    `
-    SELECT
+      const d = Math.max(1, Math.min(90, Number(days || 7)));
+      const { rows } = await pool.query(
+      `
+      SELECT
       to_char(gs.day, 'YYYY-MM-DD') AS day,
       COALESCE(COUNT(DISTINCT s.uid), 0)::int AS active_users
-    FROM generate_series(
+      FROM generate_series(
       CURRENT_DATE - ($1::int - 1),
       CURRENT_DATE,
       interval '1 day'
-    ) AS gs(day)
-    LEFT JOIN sessions s
+      ) AS gs(day)
+      LEFT JOIN sessions s
       ON s.last_seen_at::date = gs.day::date
-    GROUP BY gs.day
-    ORDER BY gs.day ASC
-  `,
-    [d]
+      GROUP BY gs.day
+      ORDER BY gs.day ASC
+      `,
+      [d]
+      );
+      return rows.map(r => ({ day: r.day, active_users: Number(r.active_users) }));
+      }
+
+      function currentMonth() {
+      const d = new Date();
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+      }
+      export async function trackAdView(
+      uid: string,
+      kind: "coins" | "skips" | "hints"
+      ) {
+      const month = currentMonth();
+
+      await pool.query(
+      `
+      INSERT INTO user_ads (uid, month)
+      VALUES ($1, $2)
+      ON CONFLICT (uid, month)
+      DO NOTHING
+      `,
+      [uid, month]
+      );
+
+      const column =kind === "coins"
+      ? "ads_for_coins"
+      : kind === "skips"
+      ? "ads_for_skips"
+      : "ads_for_hints";
+
+      await pool.query(
+      `
+      UPDATE user_ads
+      SET ${column} = ${column} + 1
+      WHERE uid = $1 AND month = $2
+      `,
+      [uid, month]
+      );
+      }
+                
+
+export async function getMonthlyAds(uid: string) {
+  const month = currentMonth();
+
+  const { rows } = await pool.query(
+    `
+    SELECT
+      ads_for_coins,
+      ads_for_skips,
+      ads_for_hints
+    FROM user_ads
+    WHERE uid = $1 AND month = $2
+    `,
+    [uid, month]
   );
-  return rows.map(r => ({ day: r.day, active_users: Number(r.active_users) }));
+
+  if (!rows.length) {
+    return {
+      ads_for_coins: 0,
+      ads_for_skips: 0,
+      ads_for_hints: 0,
+    };
+  }
+
+  return rows[0];
+}
+
+function coinRewardForAd(adsForCoinsThisMonth: number) {
+  const reward = 50 - adsForCoinsThisMonth;
+  return Math.max(reward, 2);
+}
+function coinRewardForAd(adsForCoinsThisMonth: number) {
+  const reward = 50 - adsForCoinsThisMonth;
+  return Math.max(reward, 2);
 }
