@@ -602,7 +602,24 @@ function coinRewardForAd(adsForCoinsThisMonth: number) {
   const reward = 50 - adsForCoinsThisMonth;
   return Math.max(reward, 2);
 }
-function coinRewardForAd(adsForCoinsThisMonth: number) {
-  const reward = 50 - adsForCoinsThisMonth;
-  return Math.max(reward, 2);
+export async function claimCoinAd(uid: string) {
+  // 1️⃣ Track ad view
+  await trackAdView(uid, "coins");
+
+  // 2️⃣ Read monthly ads
+  const ads = await getMonthlyAds(uid);
+
+  // ads_for_coins already incremented
+  const coins = coinRewardForAd(ads.ads_for_coins - 1);
+
+  // 3️⃣ Use EXISTING reward system
+  const nonce = `coin-ad-${currentMonth()}-${ads.ads_for_coins}`;
+
+  return await claimReward({
+    uid,
+    type: "ad",
+    nonce,
+    amount: coins,
+    cooldownSeconds: 0,
+  });
 }
