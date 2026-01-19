@@ -283,13 +283,15 @@ app.get("/admin/charts/active", async (req,res)=>{
 
 
 // ✅ ADMIN: delete user completely
-app.delete("/admin/users/:uid", async (req, res) => {
+app.delete("/admin/users/:uid", adminAuth, async (req, res) => {
+
+  console.log("[ADMIN DELETE] HIT", req.params.uid);
+
   try {
-    requireAdmin(req);
     await adminDeleteUser(req.params.uid);
     res.json({ ok: true });
   } catch (e: any) {
-    res.status(401).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 

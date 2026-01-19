@@ -1,474 +1,262 @@
-import { Pool } from "pg";
+// src/db.ts
+// Database schema + helpers for Adventure Maze
+// Coins, Ads, Skips, Hints, Monthly tracking
 
-const pool = new Pool({
+import { Pool } from "pg";
+import crypto from "crypto";
+
+// ---------------------------
+// DB CONNECTION
+// ---------------------------
+export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === "true"
-    ? { rejectUnauthorized: false }
-    : undefined,
+  ssl: { rejectUnauthorized: false },
 });
 
-/* =====================================================
-   INIT  (✅ Fix 1: auto-create core tables incl. sessions)
-===================================================== */
-export async function initDB() {
-  await pool.query("SELECT 1");
-  // create minimal tables if they don't exist
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      uid TEXT PRIMARY KEY,
-      username TEXT,
-      coins INT DEFAULT 0,
-      free_skips_used INT DEFAULT 0,
-      free_hints_used INT DEFAULT 0,
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS progress (
-      uid TEXT PRIMARY KEY,
-      level INT DEFAULT 1,
-      coins INT DEFAULT 0,
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS reward_claims (
-      uid TEXT NOT NULL,
-      type TEXT NOT NULL,
-      nonce TEXT,
-      amount INT DEFAULT 0,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS level_rewards (
-      uid TEXT NOT NULL,
-      level INT NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS sessions (
-      uid TEXT PRIMARY KEY,
-      session_id TEXT,
-      user_agent TEXT,
-      ip TEXT,
-      started_at TIMESTAMP,
-      last_seen_at TIMESTAMP NOT NULL
-    );
-  `);
+// ---------------------------
+// HELPERS
+// ---------------------------
+function uuid() {
+  return crypto.randomUUID();
 }
 
-/* =====================================================
-   USERS
-===================================================== */
-export async function upsertUser({
-  uid, username,
-}: { uid: string; username: string; }) {
-  const { rows } = await pool.query(
+function currentMonth() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+// ---------------------------
+// USERS
+// ---------------------------
+export async function ensureUser({ uid, username }: { uid: string; username: string }) {
+  await pool.query(
     `
-    INSERT INTO users (uid, username, updated_at)
-    VALUES ($1,$2,NOW())
-    ON CONFLICT (uid)
-    DO UPDATE SET
-      username = EXCLUDED.username,
-      updated_at = NOW()
-    RETURNING *
-  `,
+    INSERT INTO users (uid, username, coins, created_at)
+    VALUES ($1, $2, 0, NOW())
+    ON CONFLICT (uid) DO NOTHING
+    `,
     [uid, username]
   );
-  return rows[0];
 }
 
-export async function getUserByUid(uid: string) {
-  const { rows } = await pool.query(
-    `SELECT * FROM users WHERE uid=$1`,
-    [uid]
+// ---------------------------
+// MONTHLY STATE
+// ---------------------------
+export async function getMonthlyState(uid: string) {
+  const month = currentMonth();
+
+  const res = await pool.query(
+    `
+    INSERT INTO user_monthly_state (
+      uid,
+      month,
+      free_skips_left,
+      free_hints_left,
+      ads_watched_for_coins,
+      ads_watched_for_actions
+    )
+    VALUES ($1, $2, 3, 3, 0, 0)
+    ON CONFLICT (uid, month)
+    DO UPDATE SET uid = EXCLUDED.uid
+    RETURNING *
+    `,
+    [uid, month]
   );
-  return rows[0] || null;
+
+  return res.rows[0];
 }
-export async function addCoins(uid: string, delta: number) {
-  const { rows } = await pool.query(
+
+// ---------------------------
+// COIN LEDGER (IMMUTABLE)
+// ---------------------------
+export async function addCoinEvent({
+  uid,
+  type,
+  amount,
+  meta = {},
+}: {
+  uid: string;
+  type:
+    | "daily_login"
+    | "level_complete"
+    | "ad_reward"
+    | "skip_purchase"
+    | "hint_purchase"
+    | "monthly_conversion";
+  amount: number;
+  meta?: any;
+}) {
+  await pool.query(
+    `
+    INSERT INTO coin_events (id, uid, type, amount, meta, created_at)
+    VALUES ($1, $2, $3, $4, $5, NOW())
+    `,
+    [uuid(), uid, type, amount, meta]
+  );
+
+  await pool.query(
     `
     UPDATE users
-    SET coins = COALESCE(coins,0) + $2, updated_at=NOW()
-    WHERE uid=$1
-    RETURNING *
-  `,
-    [uid, delta]
-  );
-  return rows[0];
-}
-
-/* =====================================================
-   PROGRESS
-===================================================== */
-export async function getProgressByUid(uid: string) {
-  const { rows } = await pool.query(
-    `SELECT * FROM progress WHERE uid=$1`,
-    [uid]
-  );
-  return rows[0] || null;
-}
-
-export async function setProgressByUid({
-  uid, level, coins,
-}: { uid: string; level: number; coins: number; }) {
-  await pool.query(
-    `
-    INSERT INTO progress (uid, level, coins, updated_at)
-    VALUES ($1,$2,$3,NOW())
-    ON CONFLICT (uid)
-    DO UPDATE SET
-      level = EXCLUDED.level,
-      coins = EXCLUDED.coins,
-      updated_at = NOW()
-  `,
-    [uid, level, coins]
+    SET coins = coins + $1
+    WHERE uid = $2
+    `,
+    [amount, uid]
   );
 }
 
-/* =====================================================
-   REWARDS
-===================================================== */
-export async function claimReward({
-  uid, type, nonce, amount, cooldownSeconds,
-}: { uid: string; type: string; nonce: string; amount: number; cooldownSeconds: number; }) {
-  const { rowCount } = await pool.query(
-    `SELECT 1 FROM reward_claims WHERE uid=$1 AND nonce=$2`,
-    [uid, nonce]
-  );
-  if (rowCount) return { already: true };
+// ---------------------------
+// ADS
+// ---------------------------
+export async function registerAdWatch({
+  uid,
+  adType,
+}: {
+  uid: string;
+  adType: "coins" | "skip" | "hint";
+}) {
+  const month = currentMonth();
 
-  await pool.query(
-    `
-    INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
-    VALUES ($1,$2,$3,$4,NOW())
-  `,
-    [uid, type, nonce, amount]
-  );
+  const state = await getMonthlyState(uid);
 
-  const user = await addCoins(uid, amount);
-  return { user };
-}
+  let reward = 0;
 
-export async function claimDailyLogin(uid: string) {
-  const { rowCount } = await pool.query(
-    `
-    SELECT 1 FROM reward_claims
-    WHERE uid=$1 AND type='daily_login'
-      AND created_at::date = CURRENT_DATE
-  `,
-    [uid]
-  );
+  if (adType === "coins") {
+    const index = state.ads_watched_for_coins;
+    reward = Math.max(50 - index, 2);
 
-  if (rowCount) return { already: true };
+    await pool.query(
+      `
+      UPDATE user_monthly_state
+      SET ads_watched_for_coins = ads_watched_for_coins + 1
+      WHERE uid = $1 AND month = $2
+      `,
+      [uid, month]
+    );
+
+    await addCoinEvent({
+      uid,
+      type: "ad_reward",
+      amount: reward,
+      meta: { adIndex: index + 1 },
+    });
+  } else {
+    // skip / hint ads give NO coins
+    await pool.query(
+      `
+      UPDATE user_monthly_state
+      SET ads_watched_for_actions = ads_watched_for_actions + 1
+      WHERE uid = $1 AND month = $2
+      `,
+      [uid, month]
+    );
+  }
 
   await pool.query(
     `
-    INSERT INTO reward_claims (uid,type,amount,created_at)
-    VALUES ($1,'daily_login',5,NOW())
-  `,
-    [uid]
+    INSERT INTO ad_events (id, uid, ad_type, reward_amount, created_at)
+    VALUES ($1, $2, $3, $4, NOW())
+    `,
+    [uuid(), uid, adType, reward]
   );
 
-  const user = await addCoins(uid, 5);
-  return { user };
+  return reward;
 }
 
-export async function claimLevelComplete(uid: string, level: number) {
-  const { rowCount } = await pool.query(
-    `SELECT 1 FROM level_rewards WHERE uid=$1 AND level=$2`,
-    [uid, level]
-  );
-  if (rowCount) return { already: true };
-
-  await pool.query(
-    `
-    INSERT INTO level_rewards (uid,level,created_at)
-    VALUES ($1,$2,NOW())
-  `,
-    [uid, level]
-  );
-
-  const user = await addCoins(uid, 1);
-  return { user };
+// ---------------------------
+// DAILY LOGIN
+// ---------------------------
+export async function rewardDailyLogin(uid: string) {
+  await addCoinEvent({
+    uid,
+    type: "daily_login",
+    amount: 5,
+  });
 }
 
-/* =====================================================
-   SKIPS / HINTS
-===================================================== */
+// ---------------------------
+// LEVEL COMPLETE
+// ---------------------------
+export async function rewardLevelComplete(uid: string, level: number) {
+  await addCoinEvent({
+    uid,
+    type: "level_complete",
+    amount: 1,
+    meta: { level },
+  });
+}
+
+// ---------------------------
+// SKIP / HINT USAGE
+// ---------------------------
 export async function useSkip(uid: string) {
-  const { rows } = await pool.query(
-    `
-    UPDATE users
-    SET free_skips_used = free_skips_used + 1
-    WHERE uid=$1
-    RETURNING *
-  `,
-    [uid]
-  );
-  return { ok: true, user: rows[0] };
+  const state = await getMonthlyState(uid);
+
+  if (state.free_skips_left > 0) {
+    await pool.query(
+      `
+      UPDATE user_monthly_state
+      SET free_skips_left = free_skips_left - 1
+      WHERE uid = $1 AND month = $2
+      `,
+      [uid, currentMonth()]
+    );
+    return { mode: "free" };
+  }
+
+  // paid
+  await addCoinEvent({
+    uid,
+    type: "skip_purchase",
+    amount: -50,
+  });
+
+  return { mode: "paid" };
 }
 
 export async function useHint(uid: string) {
-  const { rows } = await pool.query(
-    `
-    UPDATE users
-    SET free_hints_used = free_hints_used + 1
-    WHERE uid=$1
-    RETURNING *
-  `,
-    [uid]
-  );
-  return { ok: true, user: rows[0] };
-}
+  const state = await getMonthlyState(uid);
 
-/* =====================================================
-   ONLINE / SESSIONS
-===================================================== */
-export async function touchUserOnline(uid: string) {
-  await pool.query(
-    `
-    INSERT INTO sessions (uid, session_id, last_seen_at)
-    VALUES ($1,'auto',NOW())
-    ON CONFLICT (uid)
-    DO UPDATE SET last_seen_at=NOW()
-  `,
-    [uid]
-  );
-}
-
-export async function startSession({
-  uid, sessionId, userAgent, ip,
-}: { uid: string; sessionId: string; userAgent: string; ip: string; }) {
-  const { rows } = await pool.query(
-    `
-    INSERT INTO sessions (uid,session_id,user_agent,ip,started_at,last_seen_at)
-    VALUES ($1,$2,$3,$4,NOW(),NOW())
-    ON CONFLICT (uid)
-    DO UPDATE SET last_seen_at=NOW(), session_id=$2
-    RETURNING *
-  `,
-    [uid, sessionId, userAgent, ip]
-  );
-  return rows[0];
-}
-
-export async function pingSession(uid: string) {
-  const { rows } = await pool.query(
-    `
-    UPDATE sessions
-    SET last_seen_at=NOW()
-    WHERE uid=$1
-    RETURNING *
-  `,
-    [uid]
-  );
-  return rows[0];
-}
-
-export async function endSession(uid: string) {
-  const { rows } = await pool.query(
-    `DELETE FROM sessions WHERE uid=$1 RETURNING *`,
-    [uid]
-  );
-  return rows[0];
-}
-
-/* =====================================================
-   ADMIN
-===================================================== */
-
-export async function adminListUsers({
-  search,
-  limit,
-  offset,
-}: {
-  search?: string;
-  limit: number;
-  offset: number;
-}) {
-  if (search) {
-    const { rows } = await pool.query(
+  if (state.free_hints_left > 0) {
+    await pool.query(
       `
-      SELECT *
-      FROM users
-      WHERE username ILIKE '%' || $1 || '%'
-         OR uid ILIKE '%' || $1 || '%'
-      ORDER BY updated_at DESC
-      LIMIT $2 OFFSET $3
-    `,
-      [search, limit, offset]
+      UPDATE user_monthly_state
+      SET free_hints_left = free_hints_left - 1
+      WHERE uid = $1 AND month = $2
+      `,
+      [uid, currentMonth()]
     );
-
-    const { rows: c } = await pool.query(
-      `
-      SELECT COUNT(*)
-      FROM users
-      WHERE username ILIKE '%' || $1 || '%'
-         OR uid ILIKE '%' || $1 || '%'
-    `,
-      [search]
-    );
-
-    return { rows, count: Number(c[0].count) };
+    return { mode: "free" };
   }
-  
 
+  await addCoinEvent({
+    uid,
+    type: "hint_purchase",
+    amount: -50,
+  });
 
-  // ✅ no search
-  const { rows } = await pool.query(
-    `
-    SELECT *
-    FROM users
-    ORDER BY updated_at DESC
-    LIMIT $1 OFFSET $2
-  `,
-    [limit, offset]
-  );
-
-  const { rows: c } = await pool.query(`SELECT COUNT(*) FROM users`);
-  return { rows, count: Number(c[0].count) };
+  return { mode: "paid" };
 }
 
-export async function adminGetUser(uid: string) {
-  const user = await getUserByUid(uid);
-  const progress = await getProgressByUid(uid);
-
-  const { rows: stats } = await pool.query(
-    `SELECT type,COUNT(*) FROM reward_claims WHERE uid=$1 GROUP BY type`,
+// ---------------------------
+// MONTHLY PI CONVERSION (LOGIC ONLY)
+// ---------------------------
+export async function convertMonthlyCoinsToPi(uid: string) {
+  const res = await pool.query(
+    `
+    SELECT coins FROM users WHERE uid = $1
+    `,
     [uid]
   );
 
-  const { rows: session } = await pool.query(
-    `SELECT * FROM sessions WHERE uid=$1`,
-    [uid]
-  );
+  const coins = Number(res.rows[0]?.coins || 0);
+  if (coins <= 0) return 0;
 
-  return {
-    user,
-    progress,
-    stats,
-    last_session: session[0] || null,
-  };
-}
+  // conversion logic handled elsewhere
+  await addCoinEvent({
+    uid,
+    type: "monthly_conversion",
+    amount: -coins,
+  });
 
-export async function adminResetFreeCounters(uid: string) {
-  const { rows } = await pool.query(
-    `
-    UPDATE users
-    SET free_skips_used=0, free_hints_used=0
-    WHERE uid=$1
-    RETURNING *
-  `,
-    [uid]
-  );
-  return rows[0];
-}
-export async function adminDeleteUser(uid: string) {
-  // delete user
-  await pool.query(
-    `DELETE FROM users WHERE uid = $1`,
-    [uid]
-  );
-
-  // delete progress
-  await pool.query(
-    `DELETE FROM progress WHERE uid = $1`,
-    [uid]
-  );
-
-  // delete sessions
-  await pool.query(
-    `DELETE FROM sessions WHERE uid = $1`,
-    [uid]
-  );
-
-  return { ok: true };
-}
-export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }) {
-  const users = await pool.query(`SELECT COUNT(*) FROM users`);
-  const coins = await pool.query(`SELECT SUM(coins) FROM users`);
-  const online = await pool.query(
-    `
-    SELECT COUNT(*) FROM sessions
-    WHERE last_seen_at > NOW() - ($1 || ' minutes')::interval
-  `,
-    [onlineMinutes]
-  );
-
-
-
-  const ad50 = await pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='ad_50'`);
-  const daily = await pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='daily_login'`);
-  const levels = await pool.query(`SELECT COUNT(*) FROM level_rewards`);
-
-  return {
-    users_total: Number(users.rows[0].count),
-    coins_total: Number(coins.rows[0].sum || 0),
-    online_now: Number(online.rows[0].count),
-    ad50_count: Number(ad50.rows[0].count),
-    daily_login_count: Number(daily.rows[0].count),
-    level_complete_count: Number(levels.rows[0].count),
-  };
-}
-
-export async function adminListOnlineUsers({
-  minutes, limit, offset,
-}: { minutes: number; limit: number; offset: number; }) {
-  const { rows } = await pool.query(
-    `
-    SELECT u.uid,u.username,u.coins,
-           s.last_seen_at,s.started_at,s.user_agent
-    FROM sessions s
-    JOIN users u ON u.uid=s.uid
-    WHERE s.last_seen_at > NOW() - ($1 || ' minutes')::interval
-    ORDER BY s.last_seen_at DESC
-    LIMIT $2 OFFSET $3
-  `,
-    [minutes, limit, offset]
-  );
-
-  return { rows, count: rows.length };
-}
-
-
-/* ============================
-   Charts (Step 1 – 7 days default)
-============================ */
-export async function adminChartCoins({ days }: { days: number }) {
-  const d = Math.max(1, Math.min(90, Number(days || 7)));
-  const { rows } = await pool.query(
-    `
-    SELECT
-      to_char(gs.day, 'YYYY-MM-DD') AS day,
-      COALESCE(SUM(rc.amount), 0)::int AS coins
-    FROM generate_series(
-      CURRENT_DATE - ($1::int - 1),
-      CURRENT_DATE,
-      interval '1 day'
-    ) AS gs(day)
-    LEFT JOIN reward_claims rc
-      ON rc.created_at::date = gs.day::date
-    GROUP BY gs.day
-    ORDER BY gs.day ASC
-  `,
-    [d]
-  );
-  return rows.map(r => ({ day: r.day, coins: Number(r.coins) }));
-}
-
-export async function adminChartActiveUsers({ days }: { days: number }) {
-  const d = Math.max(1, Math.min(90, Number(days || 7)));
-  const { rows } = await pool.query(
-    `
-    SELECT
-      to_char(gs.day, 'YYYY-MM-DD') AS day,
-      COALESCE(COUNT(DISTINCT s.uid), 0)::int AS active_users
-    FROM generate_series(
-      CURRENT_DATE - ($1::int - 1),
-      CURRENT_DATE,
-      interval '1 day'
-    ) AS gs(day)
-    LEFT JOIN sessions s
-      ON s.last_seen_at::date = gs.day::date
-    GROUP BY gs.day
-    ORDER BY gs.day ASC
-  `,
-    [d]
-  );
-  return rows.map(r => ({ day: r.day, active_users: Number(r.active_users) }));
+  return coins;
 }
