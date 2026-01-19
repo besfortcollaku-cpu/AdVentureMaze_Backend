@@ -49,16 +49,7 @@ export async function initDB() {
       last_seen_at TIMESTAMP NOT NULL
     );
   `);
-  await pool.query(`
-  CREATE TABLE IF NOT EXISTS user_ads (
-    uid TEXT NOT NULL,
-    month TEXT NOT NULL, -- YYYY-MM
-    coin_ads_watched INTEGER DEFAULT 0,
-    skip_ads_watched INTEGER DEFAULT 0,
-    hint_ads_watched INTEGER DEFAULT 0,
-    PRIMARY KEY (uid, month)
-  );
-`);
+  
   await pool.query(`
   CREATE TABLE IF NOT EXISTS user_ads (
     uid TEXT NOT NULL,
@@ -166,20 +157,7 @@ export async function setProgressByUid({
 /* =====================================================
    REWARDS
 ===================================================== */
-async function ensureUserAdsRow(uid: string) {
-  const month = new Date().toISOString().slice(0, 7); // YYYY-MM
 
-  await pool.query(
-    `
-    INSERT INTO user_ads (uid, month)
-    VALUES ($1, $2)
-    ON CONFLICT (uid, month) DO NOTHING
-    `,
-    [uid, month]
-  );
-
-  return { month };
-}
 export async function claimReward({
   uid, type, nonce, amount, cooldownSeconds,
 }: { 
