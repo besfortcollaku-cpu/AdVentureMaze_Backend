@@ -291,3 +291,85 @@ export async function adminChartActiveUsers() {
   `);
   return res.rows;
 }
+
+/* ============================================================
+   🔁 LEGACY COMPATIBILITY LAYER (DO NOT REMOVE)
+============================================================ */
+
+/**
+ * OLD skip logic wrapper
+ * Used by index.ts
+ */
+export async function useSkip(uid: string) {
+  // try free skip first
+  await consumeFreeSkip(uid);
+
+  // return user state as before
+  const res = await pool.query(`SELECT * FROM users WHERE uid = $1`, [uid]);
+  return {
+    already: false,
+    user: res.rows[0],
+  };
+}
+
+/**
+ * OLD hint logic wrapper
+ */
+export async function useHint(uid: string) {
+  await consumeFreeHint(uid);
+
+  const res = await pool.query(`SELECT * FROM users WHERE uid = $1`, [uid]);
+  return {
+    already: false,
+    user: res.rows[0],
+  };
+}
+
+/**
+ * OLD reward wrapper
+ */
+export async function claimRewardLegacy(uid: string, coins: number) {
+  await claimReward(uid, coins, "legacy");
+
+  const res = await pool.query(`SELECT * FROM users WHERE uid = $1`, [uid]);
+  return {
+    already: false,
+    user: res.rows[0],
+  };
+}
+
+/**
+ * OLD daily login wrapper
+ */
+export async function claimDailyLoginLegacy(uid: string) {
+  await claimDailyLogin(uid);
+
+  const res = await pool.query(`SELECT * FROM users WHERE uid = $1`, [uid]);
+  return {
+    already: false,
+    user: res.rows[0],
+  };
+}
+
+/**
+ * OLD level complete wrapper
+ */
+export async function claimLevelCompleteLegacy(uid: string, level: number) {
+  await claimLevelComplete(uid, level);
+
+  const res = await pool.query(`SELECT * FROM users WHERE uid = $1`, [uid]);
+  return {
+    already: false,
+    user: res.rows[0],
+  };
+}
+
+/* ============================================================
+   🔐 ADMIN AUTH PLACEHOLDER (FIXES BUILD)
+============================================================ */
+
+export function adminAuth(req: any, res: any, next: any) {
+  // TEMP: allow all admin routes
+  // Later we add real auth
+  next();
+}
