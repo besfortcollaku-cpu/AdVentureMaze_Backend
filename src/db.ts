@@ -512,16 +512,12 @@ export async function adminChartActiveUsers({ days }: { days: number }) {
       );
       return rows.map(r => ({ day: r.day, active_users: Number(r.active_users) }));
       }
-
-      function currentMonth() {
-      const d = new Date();
-      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
-      }
+      
       export async function trackAdView(
       uid: string,
       kind: "coins" | "skips" | "hints"
       ) {
-      const month = currentMonth();
+      const month = currentMonthKey();
 
       await pool.query(
       `
@@ -551,7 +547,7 @@ export async function adminChartActiveUsers({ days }: { days: number }) {
                 
 
 export async function getMonthlyAds(uid: string) {
-  const month = currentMonth();
+  const month = currentMonthKey();
 
   const { rows } = await pool.query(
     `
@@ -591,7 +587,7 @@ export async function claimCoinAd(uid: string) {
   const coins = coinRewardForAd(ads.ads_for_coins - 1);
 
   // 3️⃣ Use EXISTING reward system
-  const nonce = `coin-ad-${currentMonth()}-${ads.ads_for_coins}`;
+  const nonce = `coin-ad-${currentMonthKey()}-${ads.ads_for_coins}`;
 
   return await claimReward({
     uid,

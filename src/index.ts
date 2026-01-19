@@ -119,14 +119,7 @@ async function requirePiUser(req: express.Request) {
   return { uid, username };
 }
 
-// ✅ ADMIN: delete user completely
-app.delete("/admin/users/:uid", requireAdmin, async (req, res) => {
-  const { uid } = req.params;
 
-  await adminDeleteUser(uid);
-res.json({ ok: true });
-  
-});
 
 /* ---------------- ADMIN AUTH ---------------- */
 function requireAdmin(req: express.Request) {
@@ -283,15 +276,16 @@ app.get("/admin/charts/active", async (req,res)=>{
 
 
 // ✅ ADMIN: delete user completely
-app.delete("/admin/users/:uid", adminAuth, async (req, res) => {
-
-  console.log("[ADMIN DELETE] HIT", req.params.uid);
-
+app.delete("/admin/users/:uid", async (req, res) => {
   try {
+    requireAdmin(req);
+
+    console.log("[ADMIN DELETE] HIT", req.params.uid);
     await adminDeleteUser(req.params.uid);
     res.json({ ok: true });
+
   } catch (e: any) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(401).json({ ok: false, error: e.message });
   }
 });
 
