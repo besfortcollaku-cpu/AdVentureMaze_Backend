@@ -29,8 +29,8 @@ import {
   // ✅ charts
   adminChartCoins,
   adminChartActiveUsers,
-from "./db";
-}
+}from "./db";
+
 const progress = await getProgressByUid(uid);
 
 
@@ -58,6 +58,7 @@ app.get("/", (_req, res) => res.send("backend up"));
 app.get("/api/me", async (req, res) => {
   try {
     const { uid, username } = await requirePiUser(req);
+
     let user = await upsertUser({ uid, username });
 
     try {
@@ -66,17 +67,14 @@ app.get("/api/me", async (req, res) => {
     } catch {}
 
     const progress = await getProgressByUid(uid);
-const completedLevels = await getCompletedLevels(uid);
 
     res.json({
-  ok: true,
-  user,
-  progress: progress ?? { uid, level: 1, coins: 0 },
-  completedLevels,
-});
+      ok: true,
+      user,
+      progress: progress ?? { uid, level: 1, coins: 0 },
     });
-  } catch (e:any) {
-    res.status(401).json({ ok:false, error:e.message });
+  } catch (e: any) {
+    res.status(401).json({ ok: false, error: e.message });
   }
 });
 
