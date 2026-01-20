@@ -31,9 +31,6 @@ import {
   adminChartActiveUsers,
 }from "./db";
 
-const progress = await getProgressByUid(uid);
-
-
 const app = express();
 
 /* ---------------- CORS ---------------- */
