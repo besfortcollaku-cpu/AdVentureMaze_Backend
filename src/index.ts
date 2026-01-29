@@ -96,13 +96,13 @@ function getBearerToken(req: express.Request) {
 }
 
 async function verifyPiAccessToken(accessToken: string) {
-  const r = await fetch("https://api.minepi.com/v2/me", {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-  if (!r.ok) throw new Error("Invalid Pi token");
-  return r.json();
-}
+  const controller = new AbortController();
+setTimeout(() => controller.abort(), 3000);
 
+const r = await fetch("https://api.minepi.com/v2/me", {
+  headers: { Authorization: `Bearer ${accessToken}` },
+  signal: controller.signal,
+});
 async function requirePiUser(req: express.Request) {
   const token = getBearerToken(req);
   if (!token) throw new Error("Missing token");
