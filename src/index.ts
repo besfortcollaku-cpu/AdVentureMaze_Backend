@@ -26,7 +26,7 @@ import {
   adminGetStats,
   adminListOnlineUsers,
   adminResetFreeCounters,
-  // ✅ charts 2
+  // ✅ charts
   adminChartCoins,
   adminChartActiveUsers,
 }from "./db";
@@ -48,13 +48,8 @@ app.use(cors({
 app.use(express.json())
 
 /* ---------------- HEALTH ---------------- */
-app.get("/", (_req, res) => {
-  res.status(200).send("OK");
-});
-
-app.get("/health", (_req, res) => {
-  res.status(200).send("OK");
-});
+app.get("/health", (_req, res) => res.send("ok"));
+app.get("/", (_req, res) => res.send("backend up"));
 
 /* ---------------- /api/me ---------------- */
 app.get("/api/me", async (req, res) => {
@@ -118,19 +113,13 @@ function getBearerToken(req: express.Request) {
 
 async function verifyPiAccessToken(accessToken: string) {
   const controller = new AbortController();
-  setTimeout(() => controller.abort(), 3000);
+setTimeout(() => controller.abort(), 3000);
 
-  const r = await fetch("https://api.minepi.com/v2/me", {
-    headers: { Authorization: `Bearer ${accessToken}` },
-    signal: controller.signal,
-  });
+const r = await fetch("https://api.minepi.com/v2/me", {
+  headers: { Authorization: `Bearer ${accessToken}` },
+  signal: controller.signal,
+});
 
-  if (!r.ok) {
-    throw new Error("Invalid Pi access token");
-  }
-
-  return await r.json();
-}
 
 
 
@@ -301,13 +290,13 @@ app.delete("/admin/users/:uid", async (req, res) => {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
-
 /* ---------------- START ---------------- */
 
 const PORT = Number(process.env.PORT || 8080);
 
-app.listen(PORT, "0.0.0.0", async () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log("Backend listening on", PORT);
+});
 
   // DO NOT BLOCK DEPLOY
   initDB()
