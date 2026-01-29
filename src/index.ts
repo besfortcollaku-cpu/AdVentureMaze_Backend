@@ -290,6 +290,7 @@ app.delete("/admin/users/:uid", async (req, res) => {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
+}
 /* ---------------- START ---------------- */
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
