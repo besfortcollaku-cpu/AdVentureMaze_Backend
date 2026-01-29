@@ -290,9 +290,15 @@ app.delete("/admin/users/:uid", async (req, res) => {
 });
 
 /* ---------------- START ---------------- */
-async function main(){
-  await initDB();
-  const PORT = Number(process.env.PORT)||3001;
-  app.listen(PORT,"0.0.0.0",()=>console.log("Backend running on",PORT));
-}
-main();
+const PORT = Number(process.env.PORT) || 3000;
+
+app.listen(PORT, "0.0.0.0", async () => {
+  console.log("Backend listening on", PORT);
+
+  try {
+    await initDB();
+    console.log("Database initialized");
+  } catch (err) {
+    console.error("DB init failed:", err);
+  }
+});
