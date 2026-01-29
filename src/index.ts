@@ -302,4 +302,4 @@ app.listen(PORT, "0.0.0.0", () => {
 initDB()
   .then(() => console.log("Database initialized"))
   .catch(err => console.error("DB init failed:", err));
-  };
+  
