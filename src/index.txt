@@ -91,6 +91,18 @@ app.post("/progress", async (req,res)=>{
 });
 
 /* ---------------- HELPERS ---------------- */
+function getBearerToken(req: express.Request) {
+  return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+}
+
+async function verifyPiAccessToken(accessToken: string) {
+  const r = await fetch("https://api.minepi.com/v2/me", {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!r.ok) throw new Error("Invalid Pi token");
+  return r.json();
+}
+
 async function requirePiUser(req: express.Request) {
   const token = getBearerToken(req);
   if (!token) throw new Error("Missing token");
@@ -106,20 +118,6 @@ async function requirePiUser(req: express.Request) {
 
   return { uid, username };
 }
-
-function getBearerToken(req: express.Request) {
-  return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-}
-
-async function verifyPiAccessToken(accessToken: string) {
-  const controller = new AbortController();
-setTimeout(() => controller.abort(), 3000);
-
-const r = await fetch("https://api.minepi.com/v2/me", {
-  headers: { Authorization: `Bearer ${accessToken}` },
-  signal: controller.signal,
-});
-
 
 
 
@@ -292,15 +290,9 @@ app.delete("/admin/users/:uid", async (req, res) => {
 });
 
 /* ---------------- START ---------------- */
-
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("Backend listening on", PORT);
-});
-
-// init DB AFTER server start (non-blocking)
-initDB()
-  .then(() => console.log("Database initialized"))
-  .catch(err => console.error("DB init failed:", err));
-  
+async function main(){
+  await initDB();
+  const PORT = Number(process.env.PORT)||3001;
+  app.listen(PORT,"0.0.0.0",()=>console.log("Backend running on",PORT));
+}
+main();
