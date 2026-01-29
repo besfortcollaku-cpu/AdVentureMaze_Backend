@@ -290,15 +290,16 @@ app.delete("/admin/users/:uid", async (req, res) => {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
-/* ---------------- START ---------------- */
 
-const PORT = Number(process.env.PORT || 8080);
+/* ---------------- START ---------------- */
+const PORT = Number(process.env.PORT) || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Backend listening on", PORT);
 });
 
-  // DO NOT BLOCK DEPLOY
-  initDB()
-    .then(() => console.log("Database initialized"))
-    .catch(err => console.error("DB init failed:", err));
+// init DB AFTER server start (non-blocking)
+initDB()
+  .then(() => console.log("Database initialized"))
+  .catch(err => console.error("DB init failed:", err));
+  };

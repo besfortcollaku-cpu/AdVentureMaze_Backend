@@ -1,16 +1,12 @@
-import pg from "pg";
-const { Pool } = pg;
+import { Pool } from "pg";
 
-export const pool = new Pool({
+const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-
-  // 🚨 REQUIRED for Railway Postgres
-  ssl: {
-    rejectUnauthorized: false,
-  },
-
-  // 🚨 Force IPv6 compatibility
+  ssl: process.env.DATABASE_SSL === "true"
+    ? { rejectUnauthorized: false }
+    : undefined,
 });
+
 /* =====================================================
    INIT  (✅ Fix 1: auto-create core tables incl. sessions)
 ===================================================== */
