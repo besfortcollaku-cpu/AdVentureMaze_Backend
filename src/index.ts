@@ -48,8 +48,13 @@ app.use(cors({
 app.use(express.json())
 
 /* ---------------- HEALTH ---------------- */
-app.get("/health", (_req, res) => res.send("ok"));
-app.get("/", (_req, res) => res.send("backend up"));
+app.get("/", (_req, res) => {
+  res.status(200).json({ ok: true, service: "backend alive" });
+});
+
+app.get("/health", (_req, res) => {
+  res.status(200).send("OK");
+});
 
 /* ---------------- /api/me ---------------- */
 app.get("/api/me", async (req, res) => {
