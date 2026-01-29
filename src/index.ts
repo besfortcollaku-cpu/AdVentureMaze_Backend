@@ -305,8 +305,3 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Backend listening on", PORT);
 });
 
-// init DB AFTER server start (non-blocking)
-initDB()
-  .then(() => console.log("Database initialized"))
-  .catch(err => console.error("DB init failed:", err));
-  };
