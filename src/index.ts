@@ -292,7 +292,7 @@ app.delete("/admin/users/:uid", async (req, res) => {
 });
 
 /* ---------------- START ---------------- */
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 8080;
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Backend listening on", PORT);
@@ -302,4 +302,3 @@ app.listen(PORT, "0.0.0.0", () => {
 initDB()
   .then(() => console.log("Database initialized"))
   .catch(err => console.error("DB init failed:", err));
-  };
