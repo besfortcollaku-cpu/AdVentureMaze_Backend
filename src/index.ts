@@ -1,6 +1,7 @@
+import express from "express";
+
 
 import "dotenv/config";
-import express from "express";
 import cors from "cors";
 
 import {
@@ -113,13 +114,19 @@ function getBearerToken(req: express.Request) {
 
 async function verifyPiAccessToken(accessToken: string) {
   const controller = new AbortController();
-setTimeout(() => controller.abort(), 3000);
+  setTimeout(() => controller.abort(), 3000);
 
-const r = await fetch("https://api.minepi.com/v2/me", {
-  headers: { Authorization: `Bearer ${accessToken}` },
-  signal: controller.signal,
-});
+  const r = await fetch("https://api.minepi.com/v2/me", {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: controller.signal,
+  });
 
+  if (!r.ok) {
+    throw new Error("Invalid Pi token");
+  }
+
+  return await r.json();
+}
 
 
 
