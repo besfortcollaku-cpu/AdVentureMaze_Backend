@@ -306,11 +306,11 @@ app.delete("/admin/users/:uid", async (req, res) => {
 
 const PORT = Number(process.env.PORT || 8080);
 
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, "0.0.0.0", async () => {
   console.log("Backend listening on", PORT);
+
+  // DO NOT BLOCK DEPLOY
+  initDB()
+    .then(() => console.log("Database initialized"))
+    .catch(err => console.error("DB init failed:", err));
 });
-// init DB AFTER server start (non-blocking)
-initDB()
-  .then(() => console.log("Database initialized"))
-  .catch(err => console.error("DB init failed:", err));
-  
