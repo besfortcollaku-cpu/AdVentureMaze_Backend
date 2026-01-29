@@ -304,12 +304,11 @@ app.delete("/admin/users/:uid", async (req, res) => {
 
 /* ---------------- START ---------------- */
 
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const PORT = Number(process.env.PORT || 8080);
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Backend listening on", PORT);
 });
-
 // init DB AFTER server start (non-blocking)
 initDB()
   .then(() => console.log("Database initialized"))
