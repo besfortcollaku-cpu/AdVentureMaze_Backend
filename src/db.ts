@@ -10,7 +10,6 @@ export const pool = new Pool({
   },
 
   // 🚨 Force IPv6 compatibility
-  family: 6,
 });
 /* =====================================================
    INIT  (✅ Fix 1: auto-create core tables incl. sessions)
