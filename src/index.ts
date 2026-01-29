@@ -49,7 +49,7 @@ app.use(express.json())
 
 /* ---------------- HEALTH ---------------- */
 app.get("/", (_req, res) => {
-  res.status(200).json({ ok: true, service: "backend alive" });
+  res.status(200).send("OK");
 });
 
 app.get("/health", (_req, res) => {
