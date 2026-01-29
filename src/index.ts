@@ -290,9 +290,9 @@ app.delete("/admin/users/:uid", async (req, res) => {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
-
 /* ---------------- START ---------------- */
-const PORT = Number(process.env.PORT) || 3000;
+
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Backend listening on", PORT);
