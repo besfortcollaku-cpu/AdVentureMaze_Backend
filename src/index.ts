@@ -91,18 +91,6 @@ app.post("/progress", async (req,res)=>{
 });
 
 /* ---------------- HELPERS ---------------- */
-function getBearerToken(req: express.Request) {
-  return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-}
-
-async function verifyPiAccessToken(accessToken: string) {
-  const controller = new AbortController();
-setTimeout(() => controller.abort(), 3000);
-
-const r = await fetch("https://api.minepi.com/v2/me", {
-  headers: { Authorization: `Bearer ${accessToken}` },
-  signal: controller.signal,
-});
 async function requirePiUser(req: express.Request) {
   const token = getBearerToken(req);
   if (!token) throw new Error("Missing token");
@@ -118,6 +106,20 @@ async function requirePiUser(req: express.Request) {
 
   return { uid, username };
 }
+
+function getBearerToken(req: express.Request) {
+  return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+}
+
+async function verifyPiAccessToken(accessToken: string) {
+  const controller = new AbortController();
+setTimeout(() => controller.abort(), 3000);
+
+const r = await fetch("https://api.minepi.com/v2/me", {
+  headers: { Authorization: `Bearer ${accessToken}` },
+  signal: controller.signal,
+});
+
 
 
 
