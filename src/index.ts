@@ -1,4 +1,10 @@
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
 
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -305,11 +311,18 @@ app.delete("/admin/users/:uid", async (req, res) => {
 /* ---------------- START ---------------- */
 const PORT = Number(process.env.PORT) || 8080;
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("Backend listening on", PORT);
-});
+async function start() {
+  try {
+    await initDB();
+    console.log("Database initialized");
 
-// init DB AFTER server start (non-blocking)
-initDB()
-  .then(() => console.log("Database initialized"))
-  .catch(err => console.error("DB init failed:", err));
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log("Backend listening on", PORT);
+    });
+  } catch (err) {
+    console.error("Startup failed:", err);
+    process.exit(1);
+  }
+}
+
+start();
