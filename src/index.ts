@@ -1,10 +1,10 @@
-import express from "express";
-
 
 import "dotenv/config";
+import express from "express";
 import cors from "cors";
 
 import {
+  initDB,
   upsertUser,
   getProgressByUid,
   setProgressByUid,
@@ -30,25 +30,6 @@ import {
   adminChartCoins,
   adminChartActiveUsers,
 }from "./db";
-import { initDB } from "./db";
-
-async function start() {
-  try {
-    await initDB();
-    console.log("Database initialized");
-
-    const PORT = Number(process.env.PORT) || 8080;
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log("Backend listening on", PORT);
-    });
-
-  } catch (err) {
-    console.error("Failed to start server:", err);
-    process.exit(1);
-  }
-}
-
-start();
 
 const app = express();
 
@@ -132,19 +113,13 @@ function getBearerToken(req: express.Request) {
 
 async function verifyPiAccessToken(accessToken: string) {
   const controller = new AbortController();
-  setTimeout(() => controller.abort(), 3000);
+setTimeout(() => controller.abort(), 3000);
 
-  const r = await fetch("https://api.minepi.com/v2/me", {
-    headers: { Authorization: `Bearer ${accessToken}` },
-    signal: controller.signal,
-  });
+const r = await fetch("https://api.minepi.com/v2/me", {
+  headers: { Authorization: `Bearer ${accessToken}` },
+  signal: controller.signal,
+});
 
-  if (!r.ok) {
-    throw new Error("Invalid Pi token");
-  }
-
-  return await r.json();
-}
 
 
 
@@ -316,3 +291,14 @@ app.delete("/admin/users/:uid", async (req, res) => {
   }
 });
 
+/* ---------------- START ---------------- */
+const PORT = Number(process.env.PORT) || 8080;
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("Backend listening on", PORT);
+});
+
+// init DB AFTER server start (non-blocking)
+initDB()
+  .then(() => console.log("Database initialized"))
+  .catch(err => console.error("DB init failed:", err));
