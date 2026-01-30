@@ -91,18 +91,6 @@ app.post("/progress", async (req,res)=>{
 });
 
 /* ---------------- HELPERS ---------------- */
-function getBearerToken(req: express.Request) {
-  return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-}
-
-async function verifyPiAccessToken(accessToken: string) {
-  const r = await fetch("https://api.minepi.com/v2/me", {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-  if (!r.ok) throw new Error("Invalid Pi token");
-  return r.json();
-}
-
 async function requirePiUser(req: express.Request) {
   const token = getBearerToken(req);
   if (!token) throw new Error("Missing token");
@@ -117,6 +105,31 @@ async function requirePiUser(req: express.Request) {
   await touchUserOnline(uid);
 
   return { uid, username };
+}
+
+function getBearerToken(req: express.Request) {
+  return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+}
+
+async function verifyPiAccessToken(accessToken: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3000);
+
+  try {
+    const r = await fetch("https://api.minepi.com/v2/me", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: controller.signal,
+    });
+
+    if (!r.ok) {
+      throw new Error("Invalid Pi access token");
+    }
+
+    return await r.json();
+
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 
@@ -290,9 +303,13 @@ app.delete("/admin/users/:uid", async (req, res) => {
 });
 
 /* ---------------- START ---------------- */
-async function main(){
-  await initDB();
-  const PORT = Number(process.env.PORT)||3001;
-  app.listen(PORT,"0.0.0.0",()=>console.log("Backend running on",PORT));
-}
-main();
+const PORT = Number(process.env.PORT) || 8080;
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("Backend listening on", PORT);
+});
+
+// init DB AFTER server start (non-blocking)
+initDB()
+  .then(() => console.log("Database initialized"))
+  .catch(err => console.error("DB init failed:", err));
