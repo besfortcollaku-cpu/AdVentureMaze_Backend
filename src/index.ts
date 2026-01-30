@@ -5,7 +5,6 @@ import "dotenv/config";
 import cors from "cors";
 
 import {
-  initDB,
   upsertUser,
   getProgressByUid,
   setProgressByUid,
@@ -31,6 +30,25 @@ import {
   adminChartCoins,
   adminChartActiveUsers,
 }from "./db";
+import { initDB } from "./db";
+
+async function start() {
+  try {
+    await initDB();
+    console.log("Database initialized");
+
+    const PORT = Number(process.env.PORT) || 8080;
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log("Backend listening on", PORT);
+    });
+
+  } catch (err) {
+    console.error("Failed to start server:", err);
+    process.exit(1);
+  }
+}
+
+start();
 
 const app = express();
 
@@ -296,12 +314,5 @@ app.delete("/admin/users/:uid", async (req, res) => {
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
-});
-
-/* ---------------- START ---------------- */
-const PORT = Number(process.env.PORT) || 8080;
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("Backend listening on", PORT);
 });
 
