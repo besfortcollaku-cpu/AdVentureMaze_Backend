@@ -181,7 +181,7 @@ console.log("AD +50 HIT", {
 
     const out = await claimReward({
       uid,
-      type:"ad_50",
+      type:"ad_50_v2",
       nonce,
       amount:50,
       cooldownSeconds:30,
