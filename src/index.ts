@@ -170,6 +170,7 @@ app.post("/api/pi/verify", async (req, res) => {
 
 /* ---------------- REWARDS ---------------- */
 app.post("/api/rewards/ad-50", async (req,res)=>{
+console.log("HEADERS", req.headers.authorization);
 console.log("AD +50 HIT", {
   hasUser: !!req.user,
   uid: req.user?.uid,
