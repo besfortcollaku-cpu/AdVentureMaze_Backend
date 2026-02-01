@@ -169,31 +169,22 @@ app.post("/api/pi/verify", async (req, res) => {
 
 
 /* ---------------- REWARDS ---------------- */
-app.post("/api/rewards/ad-50", async (req,res)=>{
-console.log("HEADERS", req.headers.authorization);
-console.log("AD +50 HIT", {
-  hasUser: !!req.user,
-  uid: req.user?.uid,
-});  try{
+app.post("/api/rewards/ad-50", async (req, res) => {
+  try {
     const { uid } = await requirePiUser(req);
-    const nonce = String(req.body?.nonce||"");
-    if(!nonce) return res.status(400).json({ok:false});
 
-    const out = await claimReward({
-  uid,
-  type: "ad_50",
-  nonce,
-  amount: 50,
-  cooldownSeconds: 30,
+    const out = await claimCoinAd(uid);
+
+    res.json({
+      ok: true,
+      already: !!out?.already,
+      wait: out?.wait ?? 0,
+      user: out?.user,
+    });
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
 });
-
-res.json({
-  ok: true,
-  already: !!out.already,
-  wait: out.wait ?? 0,
-  user: out.user,
-});
-
 app.post("/api/rewards/level-complete", async (req,res)=>{
   try{
     const { uid } = await requirePiUser(req);

@@ -621,7 +621,7 @@ export async function claimCoinAd(uid: string) {
     type: "ad",
     nonce,
     amount: coins,
-    cooldownSeconds: 0,
+    cooldownSeconds: 30,
   });
 }
 
