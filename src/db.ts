@@ -174,7 +174,7 @@ export async function claimReward({
   const now = new Date();
 
   // 🔍 check last reward
-  const last = await db.reward.findFirst({
+  const last = await pool.reward.findFirst({
     where: { uid, type },
     orderBy: { createdAt: "desc" },
   });
@@ -192,12 +192,12 @@ export async function claimReward({
   }
 
   // ✅ grant reward
-  await db.user.update({
+  await pool.user.update({
     where: { uid },
     data: { coins: { increment: amount } },
   });
 
-  await db.reward.create({
+  await pool.reward.create({
     data: {
       uid,
       type,
