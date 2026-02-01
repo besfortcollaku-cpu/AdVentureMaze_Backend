@@ -159,29 +159,56 @@ export async function setProgressByUid({
 ===================================================== */
 
 export async function claimReward({
-  uid, type, nonce, amount, cooldownSeconds,
-}: { 
-  uid: string; 
-  type: string; 
-  nonce: string; 
-  amount: number; 
-  cooldownSeconds: number; }) {
-  const { rowCount } = await pool.query(
-    `SELECT 1 FROM reward_claims WHERE uid=$1 AND nonce=$2`,
-    [uid, nonce]
-  );
-  if (rowCount) return { already: true };
+  uid,
+  type,
+  nonce,
+  amount,
+  cooldownSeconds,
+}: {
+  uid: string;
+  type: string;
+  nonce: string;
+  amount: number;
+  cooldownSeconds: number;
+}) {
+  const now = new Date();
 
-  await pool.query(
-    `
-    INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
-    VALUES ($1,$2,$3,$4,NOW())
-  `,
-    [uid, type, nonce, amount]
-  );
+  // 🔍 check last reward
+  const last = await db.reward.findFirst({
+    where: { uid, type },
+    orderBy: { createdAt: "desc" },
+  });
 
-  const user = await addCoins(uid, amount);
-  return { user };
+  if (last) {
+    const diff =
+      (now.getTime() - last.createdAt.getTime()) / 1000;
+
+    if (diff < cooldownSeconds) {
+      return {
+        already: true,
+        wait: Math.ceil(cooldownSeconds - diff),
+      };
+    }
+  }
+
+  // ✅ grant reward
+  await db.user.update({
+    where: { uid },
+    data: { coins: { increment: amount } },
+  });
+
+  await db.reward.create({
+    data: {
+      uid,
+      type,
+      nonce,
+      amount,
+    },
+  });
+
+  const user = await db.user.findUnique({ where: { uid } });
+
+  return { already: false, user };
 }
 
 export async function claimDailyLogin(uid: string) {

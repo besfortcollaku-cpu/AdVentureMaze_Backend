@@ -180,17 +180,18 @@ console.log("AD +50 HIT", {
     if(!nonce) return res.status(400).json({ok:false});
 
     const out = await claimReward({
-      uid,
-      type:"ad_50_v2",
-      nonce,
-      amount:50,
-      cooldownSeconds:30,
-    });
+  uid,
+  type: "ad_50",
+  nonce,
+  amount: 50,
+  cooldownSeconds: 30,
+});
 
-    res.json({ ok:true, already:!!out?.already, user:out?.user });
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
-  }
+res.json({
+  ok: true,
+  already: !!out.already,
+  wait: out.wait ?? 0,
+  user: out.user,
 });
 
 app.post("/api/rewards/level-complete", async (req,res)=>{
