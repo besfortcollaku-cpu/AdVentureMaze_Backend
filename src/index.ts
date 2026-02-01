@@ -170,6 +170,7 @@ app.post("/api/pi/verify", async (req, res) => {
 
 /* ---------------- REWARDS ---------------- */
 app.post("/api/rewards/ad-50", async (req,res)=>{
+console.log("AD +50 HIT", req.user.uid);
   try{
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce||"");
