@@ -172,13 +172,7 @@ export async function claimReward({
   cooldownSeconds: number;
 }) {
   const now = new Date();
-
-  // 🔍 check last reward
-  const last = await pool.reward.findFirst({
-    where: { uid, type },
-    orderBy: { createdAt: "desc" },
-  });
-
+  
   if (last) {
     const diff =
       (now.getTime() - last.createdAt.getTime()) / 1000;
@@ -190,23 +184,6 @@ export async function claimReward({
       };
     }
   }
-
-  // ✅ grant reward
-  await pool.user.update({
-    where: { uid },
-    data: { coins: { increment: amount } },
-  });
-
-  await pool.reward.create({
-    data: {
-      uid,
-      type,
-      nonce,
-      amount,
-    },
-  });
-
-  const user = await db.user.findUnique({ where: { uid } });
 
   return { already: false, user };
 }
@@ -339,41 +316,66 @@ export async function endSession(uid: string) {
    ADMIN
 ===================================================== */
 
-export async function adminListUsers({
-  search,
-  limit,
-  offset,
+export async function claimReward({
+  uid,
+  type,
+  nonce,
+  amount,
+  cooldownSeconds,
 }: {
-  search?: string;
-  limit: number;
-  offset: number;
+  uid: string;
+  type: string;
+  nonce: string;
+  amount: number;
+  cooldownSeconds: number;
 }) {
-  if (search) {
-    const { rows } = await pool.query(
-      `
-      SELECT *
-      FROM users
-      WHERE username ILIKE '%' || $1 || '%'
-         OR uid ILIKE '%' || $1 || '%'
-      ORDER BY updated_at DESC
-      LIMIT $2 OFFSET $3
+  // 1️⃣ get last reward of this type
+  const { rows } = await pool.query(
+    `
+    SELECT created_at
+    FROM reward_claims
+    WHERE uid = $1 AND type = $2
+    ORDER BY created_at DESC
+    LIMIT 1
     `,
-      [search, limit, offset]
-    );
+    [uid, type]
+  );
 
-    const { rows: c } = await pool.query(
-      `
-      SELECT COUNT(*)
-      FROM users
-      WHERE username ILIKE '%' || $1 || '%'
-         OR uid ILIKE '%' || $1 || '%'
-    `,
-      [search]
-    );
+  if (rows.length) {
+    const last = new Date(rows[0].created_at).getTime();
+    const now = Date.now();
+    const diffSeconds = Math.floor((now - last) / 1000);
 
-    return { rows, count: Number(c[0].count) };
+    if (diffSeconds < cooldownSeconds) {
+      return {
+        already: true,
+        wait: cooldownSeconds - diffSeconds,
+      };
+    }
   }
-  
+
+  // 2️⃣ insert reward
+  await pool.query(
+    `
+    INSERT INTO reward_claims (uid, type, nonce, amount, created_at)
+    VALUES ($1, $2, $3, $4, NOW())
+    `,
+    [uid, type, nonce, amount]
+  );
+
+  // 3️⃣ add coins
+  const { rows: users } = await pool.query(
+    `
+    UPDATE users
+    SET coins = coins + $2, updated_at = NOW()
+    WHERE uid = $1
+    RETURNING *
+    `,
+    [uid, amount]
+  );
+
+  return { already: false, user: users[0] };
+}
 
 
   // ✅ no search
@@ -618,7 +620,7 @@ export async function claimCoinAd(uid: string) {
 
   return await claimReward({
     uid,
-    type: "ad",
+    type: "ad_coins",
     nonce,
     amount: coins,
     cooldownSeconds: 30,
