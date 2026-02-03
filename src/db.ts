@@ -20,6 +20,32 @@ import {
   adminChartCoins,
   adminChartActive,
 } from "./db";
+
+// ===============================
+// ADMIN – SAFE EXPORTS (REQUIRED)
+// ===============================
+
+export async function adminChartCoins() {
+  return [];
+}
+
+export async function adminChartActiveUsers() {
+  return [];
+}
+
+export async function claimCoinAd(
+  uid: string,
+  amount: number,
+  cooldownSeconds: number
+) {
+  return claimReward({
+    uid,
+    type: "ad_50",
+    nonce: "ad-50",
+    amount,
+    cooldownSeconds,
+  });
+}
 /* =====================================================
    INIT
 ===================================================== */
