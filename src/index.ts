@@ -86,7 +86,12 @@ app.get("/api/me", async (req, res) => {
 app.get("/progress", async (req,res)=>{
   const uid = String(req.query.uid||"");
   const p = await getProgressByUid(uid);
-  res.json({ ok:true, data:p ?? {uid,level:1,coins:0} });
+  res.json({
+  ok: true,
+  already: !!out?.already,
+  cooldownSeconds: out?.already ? 30 : 0,
+  user: out?.user,
+});
 });
 
 app.post("/progress", async (req,res)=>{
