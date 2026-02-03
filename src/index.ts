@@ -86,12 +86,7 @@ app.get("/api/me", async (req, res) => {
 app.get("/progress", async (req,res)=>{
   const uid = String(req.query.uid||"");
   const p = await getProgressByUid(uid);
-  res.json({
-  ok: true,
-  already: !!out?.already,
-  cooldownSeconds: out?.already ? 30 : 0,
-  user: out?.user,
-});
+  res.json({ ok:true, data:p ?? {uid,level:1,coins:0} });
 });
 
 app.post("/progress", async (req,res)=>{
@@ -174,22 +169,33 @@ app.post("/api/pi/verify", async (req, res) => {
 
 
 /* ---------------- REWARDS ---------------- */
-app.post("/api/rewards/ad-50", async (req, res) => {
-  try {
+app.post("/api/rewards/ad-50", async (req,res)=>{
+  try{
     const { uid } = await requirePiUser(req);
+    const nonce = String(req.body?.nonce||"");
+    if(!nonce) return res.status(400).json({ok:false});
 
-    const out = await claimCoinAd(uid);
+    const out = await claimCoinAd(
+  uid,
+  "ad_50",
+  nonce,
+  50,
+  30
+);
 
-    res.json({
-      ok: true,
-      already: !!out?.already,
-      wait: out?.wait ?? 0,
-      user: out?.user,
-    });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
+res.json({
+  ok: true,
+  already: !!out.already,
+  cooldownSeconds: out.cooldownSeconds,
+  user: out.user,
+});
+
+    res.json({ ok:true, already:!!out?.already, user:out?.user });
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
   }
 });
+
 app.post("/api/rewards/level-complete", async (req,res)=>{
   try{
     const { uid } = await requirePiUser(req);
