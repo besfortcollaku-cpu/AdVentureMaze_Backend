@@ -7,7 +7,19 @@ const pool = new Pool({
       ? { rejectUnauthorized: false }
       : undefined,
 });
-
+import {
+  initDB,
+  upsertUser,
+  getUserByUid,
+  getProgressByUid,
+  setProgressByUid,
+  claimCoinAd,
+  adminGetStats,
+  adminListOnline,
+  adminResetProgress,
+  adminChartCoins,
+  adminChartActive,
+} from "./db";
 /* =====================================================
    INIT
 ===================================================== */
