@@ -1,5 +1,7 @@
 import { Pool } from "pg";
+import { PrismaClient } from "@prisma/client";
 
+export const db = new PrismaClient();
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_SSL === "true"
@@ -125,7 +127,19 @@ export async function addCoins(uid: string, delta: number) {
   );
   return rows[0];
 }
-
+export async function claimReward(
+  uid: string,
+  amount: number
+) {
+  return db.user.update({
+    where: { uid },
+    data: {
+      coins: {
+        increment: amount,
+      },
+    },
+  });
+}
 /* =====================================================
    PROGRESS
 ===================================================== */
@@ -183,6 +197,15 @@ export async function claimDailyLogin(uid: string) {
 }
 
 export async function claimLevelComplete(uid: string, level: number) {
+
+await db.user.update({
+  where: { uid },
+  data: {
+    coins: {
+      increment: 1,
+    },
+  },
+});
   // prevent double-claim per level
   const already = await db.levelProgress.findFirst({
     where: { uid, level },
