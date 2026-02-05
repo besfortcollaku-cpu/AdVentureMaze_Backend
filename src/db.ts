@@ -158,32 +158,6 @@ export async function setProgressByUid({
    REWARDS
 ===================================================== */
 
-export async function claimLevelComplete(uid: string, level: number) {
-  // prevent double-claim per level
-  const already = await db.levelProgress.findFirst({
-    where: { uid, level },
-  });
-
-  if (already) {
-    return { already: true };
-  }
-
-  // mark level completed
-  await db.levelProgress.create({
-    data: { uid, level },
-  });
-
-  // ✅ ADD +1 COIN HERE
-  const user = await db.user.update({
-    where: { uid },
-    data: {
-      coins: { increment: 1 },
-    },
-  });
-
-  return { already: false, user };
-}
-
 export async function claimDailyLogin(uid: string) {
   const { rowCount } = await pool.query(
     `
@@ -209,24 +183,30 @@ export async function claimDailyLogin(uid: string) {
 }
 
 export async function claimLevelComplete(uid: string, level: number) {
-  const { rowCount } = await pool.query(
-    `SELECT 1 FROM level_rewards WHERE uid=$1 AND level=$2`,
-    [uid, level]
-  );
-  if (rowCount) return { already: true };
+  // prevent double-claim per level
+  const already = await db.levelProgress.findFirst({
+    where: { uid, level },
+  });
 
-  await pool.query(
-    `
-    INSERT INTO level_rewards (uid,level,created_at)
-    VALUES ($1,$2,NOW())
-  `,
-    [uid, level]
-  );
+  if (already) {
+    return { already: true };
+  }
 
-  const user = await addCoins(uid, 1);
-  return { user };
+  // mark level completed
+  await db.levelProgress.create({
+    data: { uid, level },
+  });
+
+  // ✅ ADD +1 COIN HERE
+  const user = await db.user.update({
+    where: { uid },
+    data: {
+      coins: { increment: 1 },
+    },
+  });
+
+  return { already: false, user };
 }
-
 /* =====================================================
    SKIPS / HINTS
 ===================================================== */
