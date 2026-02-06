@@ -20,6 +20,8 @@ export async function initDB() {
       coins INT DEFAULT 0,
       free_skips_used INT DEFAULT 0,
       free_hints_used INT DEFAULT 0,
+      -- used for monthly rollover bookkeeping (optional)
+      coins_month TEXT,
       updated_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS progress (
@@ -48,6 +50,19 @@ export async function initDB() {
       started_at TIMESTAMP,
       last_seen_at TIMESTAMP NOT NULL
     );
+
+    -- monthly payout ledger (idempotent month close)
+    CREATE TABLE IF NOT EXISTS monthly_payouts (
+      uid TEXT NOT NULL,
+      month TEXT NOT NULL,
+      coins_collected INT NOT NULL,
+      pi_amount NUMERIC,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT NOW(),
+      sent_at TIMESTAMP,
+      tx_id TEXT,
+      PRIMARY KEY (uid, month)
+    );
   `);
   
   await pool.query(`
@@ -60,7 +75,24 @@ export async function initDB() {
     PRIMARY KEY (uid, month)
   );
 `);
+}
 
+/* =====================================================
+   CONSTANTS
+===================================================== */
+export const FREE_SKIPS_PER_ACCOUNT = 3;
+export const FREE_HINTS_PER_ACCOUNT = 3;
+export const SKIP_COST_COINS = 50;
+export const HINT_COST_COINS = 50;
+
+export function getFreeSkipsLeft(u: any) {
+  const used = Number(u?.free_skips_used || 0);
+  return Math.max(0, FREE_SKIPS_PER_ACCOUNT - used);
+}
+
+export function getFreeHintsLeft(u: any) {
+  const used = Number(u?.free_hints_used || 0);
+  return Math.max(0, FREE_HINTS_PER_ACCOUNT - used);
 }
 
 /* =====================================================
@@ -71,6 +103,73 @@ function currentMonthKey() {
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   return `${y}-${m}`; // e.g. 2026-01
+}
+
+export function monthKeyForDate(d: Date) {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+}
+
+/**
+ * Month-close: takes each user's current coins, writes a ledger row (monthly_payouts),
+ * then resets the user's coins to 0.
+ *
+ * IMPORTANT: This does NOT send Pi coins. It's the safe, idempotent
+ * accounting step you need before you plug in the Pi transfer logic.
+ */
+export async function closeMonthAndResetCoins(opts?: { month?: string }) {
+  const month = String(opts?.month || currentMonthKey());
+
+  // Use a transaction to avoid partial resets
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      `SELECT uid, COALESCE(coins,0)::int AS coins
+       FROM users
+       WHERE COALESCE(coins,0) <> 0
+       FOR UPDATE`,
+    );
+
+    for (const r of rows) {
+      const uid = String(r.uid);
+      const coins = Number(r.coins || 0);
+
+      // insert payout row once per (uid,month)
+      await client.query(
+        `INSERT INTO monthly_payouts (uid, month, coins_collected, status, created_at)
+         VALUES ($1,$2,$3,'pending',NOW())
+         ON CONFLICT (uid, month) DO NOTHING`,
+        [uid, month, coins]
+      );
+
+      // reset coins (idempotent)
+      await client.query(
+        `UPDATE users
+         SET coins = 0,
+             coins_month = $2,
+             updated_at = NOW()
+         WHERE uid = $1`,
+        [uid, month]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return {
+      ok: true,
+      month,
+      users_reset: rows.length,
+      total_coins_reset: rows.reduce((s, r) => s + Number(r.coins || 0), 0),
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 export async function ensureUserAdsRow(uid: string) {
@@ -123,6 +222,26 @@ export async function addCoins(uid: string, delta: number) {
   `,
     [uid, delta]
   );
+  return rows[0];
+}
+
+export async function spendCoins(uid: string, amount: number) {
+  const a = Math.abs(Number(amount || 0));
+  if (!a) throw new Error("Amount required");
+
+  const { rows } = await pool.query(
+    `
+      UPDATE users
+      SET coins = COALESCE(coins,0) - $2, updated_at=NOW()
+      WHERE uid=$1 AND COALESCE(coins,0) >= $2
+      RETURNING *
+    `,
+    [uid, a]
+  );
+
+  if (!rows.length) {
+    throw new Error("Not enough coins");
+  }
   return rows[0];
 }
 
@@ -230,30 +349,96 @@ export async function claimLevelComplete(uid: string, level: number) {
 /* =====================================================
    SKIPS / HINTS
 ===================================================== */
-export async function useSkip(uid: string) {
-  const { rows } = await pool.query(
-    `
-    UPDATE users
-    SET free_skips_used = free_skips_used + 1
-    WHERE uid=$1
-    RETURNING *
-  `,
-    [uid]
+type SpendMode = "free" | "coins" | "ad";
+
+export async function useSkip(uid: string, mode: SpendMode, nonce?: string) {
+  const user = await getUserByUid(uid);
+  if (!user) throw new Error("User not found");
+
+  if (mode === "free") {
+    if (getFreeSkipsLeft(user) <= 0) throw new Error("No free skips left");
+    const { rows } = await pool.query(
+      `UPDATE users
+       SET free_skips_used = COALESCE(free_skips_used,0) + 1,
+           updated_at=NOW()
+       WHERE uid=$1
+       RETURNING *`,
+      [uid]
+    );
+    return { ok: true, user: rows[0] };
+  }
+
+  if (mode === "coins") {
+    const u = await spendCoins(uid, SKIP_COST_COINS);
+    // keep a ledger row for charts/audit (negative amounts are OK)
+    await pool.query(
+      `INSERT INTO reward_claims (uid,type,amount,created_at)
+       VALUES ($1,'skip_coin',-$2,NOW())`,
+      [uid, SKIP_COST_COINS]
+    );
+    return { ok: true, user: u };
+  }
+
+  // mode === "ad"
+  if (!nonce) throw new Error("Missing nonce");
+  // idempotent claim: same nonce cannot be used twice
+  const already = await pool.query(
+    `SELECT 1 FROM reward_claims WHERE uid=$1 AND type='skip_ad' AND nonce=$2`,
+    [uid, nonce]
   );
-  return { ok: true, user: rows[0] };
+  if (already.rowCount) return { ok: true, already: true, user };
+
+  await pool.query(
+    `INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
+     VALUES ($1,'skip_ad',$2,0,NOW())`,
+    [uid, nonce]
+  );
+  await trackAdView(uid, "skips");
+  return { ok: true, user };
 }
 
-export async function useHint(uid: string) {
-  const { rows } = await pool.query(
-    `
-    UPDATE users
-    SET free_hints_used = free_hints_used + 1
-    WHERE uid=$1
-    RETURNING *
-  `,
-    [uid]
+export async function useHint(uid: string, mode: SpendMode, nonce?: string) {
+  const user = await getUserByUid(uid);
+  if (!user) throw new Error("User not found");
+
+  if (mode === "free") {
+    if (getFreeHintsLeft(user) <= 0) throw new Error("No free hints left");
+    const { rows } = await pool.query(
+      `UPDATE users
+       SET free_hints_used = COALESCE(free_hints_used,0) + 1,
+           updated_at=NOW()
+       WHERE uid=$1
+       RETURNING *`,
+      [uid]
+    );
+    return { ok: true, user: rows[0] };
+  }
+
+  if (mode === "coins") {
+    const u = await spendCoins(uid, HINT_COST_COINS);
+    await pool.query(
+      `INSERT INTO reward_claims (uid,type,amount,created_at)
+       VALUES ($1,'hint_coin',-$2,NOW())`,
+      [uid, HINT_COST_COINS]
+    );
+    return { ok: true, user: u };
+  }
+
+  // mode === "ad"
+  if (!nonce) throw new Error("Missing nonce");
+  const already = await pool.query(
+    `SELECT 1 FROM reward_claims WHERE uid=$1 AND type='hint_ad' AND nonce=$2`,
+    [uid, nonce]
   );
-  return { ok: true, user: rows[0] };
+  if (already.rowCount) return { ok: true, already: true, user };
+
+  await pool.query(
+    `INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
+     VALUES ($1,'hint_ad',$2,0,NOW())`,
+    [uid, nonce]
+  );
+  await trackAdView(uid, "hints");
+  return { ok: true, user };
 }
 
 /* =====================================================
