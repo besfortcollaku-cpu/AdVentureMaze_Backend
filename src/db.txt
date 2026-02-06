@@ -1,5 +1,7 @@
 import { Pool } from "pg";
+import { PrismaClient } from "@prisma/client";
 
+export const db = new PrismaClient();
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_SSL === "true"
@@ -125,7 +127,24 @@ export async function addCoins(uid: string, delta: number) {
   );
   return rows[0];
 }
-
+export async function claimReward(
+  uid: number,
+  reward: {
+    type: "ad" | "level";
+    nonce: string;
+    amount: number;
+    cooldownSeconds?: number;
+  }
+)  {
+  return db.user.update({
+    where: { uid },
+    data: {
+      coins: {
+        increment: amount,
+      },
+    },
+  });
+}
 /* =====================================================
    PROGRESS
 ===================================================== */
@@ -158,32 +177,6 @@ export async function setProgressByUid({
    REWARDS
 ===================================================== */
 
-export async function claimReward({
-  uid, type, nonce, amount, cooldownSeconds,
-}: { 
-  uid: string; 
-  type: string; 
-  nonce: string; 
-  amount: number; 
-  cooldownSeconds: number; }) {
-  const { rowCount } = await pool.query(
-    `SELECT 1 FROM reward_claims WHERE uid=$1 AND nonce=$2`,
-    [uid, nonce]
-  );
-  if (rowCount) return { already: true };
-
-  await pool.query(
-    `
-    INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
-    VALUES ($1,$2,$3,$4,NOW())
-  `,
-    [uid, type, nonce, amount]
-  );
-
-  const user = await addCoins(uid, amount);
-  return { user };
-}
-
 export async function claimDailyLogin(uid: string) {
   const { rowCount } = await pool.query(
     `
@@ -208,25 +201,42 @@ export async function claimDailyLogin(uid: string) {
   return { user };
 }
 
-export async function claimLevelComplete(uid: string, level: number) {
-  const { rowCount } = await pool.query(
-    `SELECT 1 FROM level_rewards WHERE uid=$1 AND level=$2`,
-    [uid, level]
-  );
-  if (rowCount) return { already: true };
-
-  await pool.query(
-    `
-    INSERT INTO level_rewards (uid,level,created_at)
-    VALUES ($1,$2,NOW())
-  `,
-    [uid, level]
-  );
-
-  const user = await addCoins(uid, 1);
-  return { user };
+export async function claimLevelComplete(uid: string) {
+  await claimReward(uid, 1);
 }
 
+await db.user.update({
+  where: { uid },
+  data: {
+    coins: {
+      increment: 1,
+    },
+  },
+});
+  // prevent double-claim per level
+  const already = await db.levelProgress.findFirst({
+    where: { uid, level },
+  });
+
+  if (already) {
+    return { already: true };
+  }
+
+  // mark level completed
+  await db.levelProgress.create({
+    data: { uid, level },
+  });
+
+  // ✅ ADD +1 COIN HERE
+  const user = await db.user.update({
+    where: { uid },
+    data: {
+      coins: { increment: 1 },
+    },
+  });
+
+  return { already: false, user };
+}
 /* =====================================================
    SKIPS / HINTS
 ===================================================== */
@@ -589,13 +599,7 @@ export async function claimCoinAd(uid: string) {
   // 3️⃣ Use EXISTING reward system
   const nonce = `coin-ad-${currentMonthKey()}-${ads.ads_for_coins}`;
 
-  return await claimReward({
-    uid,
-    type: "ad",
-    nonce,
-    amount: coins,
-    cooldownSeconds: 0,
-  });
+  claimReward(uid, coins);
 }
 
 export async function getCompletedLevels(uid: string) {

@@ -179,7 +179,13 @@ console.log("AD +50 HIT", {
     const nonce = String(req.body?.nonce||"");
     if(!nonce) return res.status(400).json({ok:false});
 
-    const out = await claimReward(uid, 1);
+    const out = await claimReward({
+      uid,
+      type:"ad_50",
+      nonce,
+      amount:50,
+      cooldownSeconds:30,
+    });
 
     res.json({ ok:true, already:!!out?.already, user:out?.user });
   }catch(e:any){
@@ -187,16 +193,23 @@ console.log("AD +50 HIT", {
   }
 });
 
-app.post("/api/rewards/level-complete", async (req, res) => {
-  try {
+app.post("/api/rewards/level-complete", async (req,res)=>{
+  try{
     const { uid } = await requirePiUser(req);
-    const level = Number(req.body?.level || 0);
-
+    const level = Number(req.body?.level||0);
     const out = await claimLevelComplete(uid, level);
+    res.json({ ok:true, already:!!out?.already, user:out?.user });
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
+  }
+});
 
-    res.json({ ok: true, already: !!out?.already, user: out?.user });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
+app.post("/api/skip", async (req,res)=>{
+  try{
+    const { uid } = await requirePiUser(req);
+    res.json(await useSkip(uid));
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
   }
 });
 
