@@ -128,9 +128,14 @@ export async function addCoins(uid: string, delta: number) {
   return rows[0];
 }
 export async function claimReward(
-  uid: string,
-  amount: number
-) {
+  uid: number,
+  reward: {
+    type: "ad" | "level";
+    nonce: string;
+    amount: number;
+    cooldownSeconds?: number;
+  }
+)  {
   return db.user.update({
     where: { uid },
     data: {

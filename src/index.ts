@@ -180,10 +180,9 @@ console.log("AD +50 HIT", {
     if(!nonce) return res.status(400).json({ok:false});
 
     const out = await claimReward(uid, {
-  type: "ad",
-  nonce,
-  amount: 1,
-  cooldownSeconds: 10
+  type: "level",
+  nonce: `level-${level}`,
+  amount: 1
 });
 
     res.json({ ok:true, already:!!out?.already, user:out?.user });
