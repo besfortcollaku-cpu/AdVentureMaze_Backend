@@ -592,13 +592,12 @@ export async function claimCoinAd(uid: string) {
   // 3️⃣ Use EXISTING reward system
   const nonce = `coin-ad-${currentMonthKey()}-${ads.ads_for_coins}`;
 
-  return await claimReward({
-    uid,
-    type: "ad",
-    nonce,
-    amount: coins,
-    cooldownSeconds: 0,
-  });
+  return await claimReward(uid, {
+  type: "ad",
+  nonce,
+  amount: coins,
+  cooldownSeconds: 0,
+});
 }
 
 export async function getCompletedLevels(uid: string) {
