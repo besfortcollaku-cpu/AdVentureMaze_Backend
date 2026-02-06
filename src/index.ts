@@ -179,11 +179,7 @@ console.log("AD +50 HIT", {
     const nonce = String(req.body?.nonce||"");
     if(!nonce) return res.status(400).json({ok:false});
 
-    const out = await claimReward(uid, {
-  type: "level",
-  nonce: `level-${level}`,
-  amount: 1
-});
+    const out = await claimReward(uid, 1);
 
     res.json({ ok:true, already:!!out?.already, user:out?.user });
   }catch(e:any){
