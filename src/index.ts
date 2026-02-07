@@ -79,15 +79,12 @@ app.get("/api/me", async (req, res) => {
       ok: true,
       user,
       progress: progress ?? { uid, level: 1, coins: 0 },
-      free: {
-        skips_left: getFreeSkipsLeft(user),
-        hints_left: getFreeHintsLeft(user),
-      },
     });
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
+
 
 
 /* ---------------- PROGRESS ---------------- */
