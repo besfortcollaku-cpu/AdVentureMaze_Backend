@@ -20,10 +20,6 @@ import {
   claimLevelComplete,
   useSkip,
   useHint,
-  getFreeSkipsLeft,
-  getFreeHintsLeft,
-
-  closeMonthAndResetCoins,
 
   // sessions / admin
   adminListUsers,
@@ -39,7 +35,7 @@ import {
   // ✅ charts
   adminChartCoins,
   adminChartActiveUsers,
-} from "./db";
+}from "./db";
 
 const app = express();
 
@@ -84,7 +80,6 @@ app.get("/api/me", async (req, res) => {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
-
 
 
 /* ---------------- PROGRESS ---------------- */
@@ -212,14 +207,7 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
 app.post("/api/skip", async (req,res)=>{
   try{
     const { uid } = await requirePiUser(req);
-    const mode = String(req.body?.mode || "free");
-    const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
-    const out = await useSkip(uid, mode as any, nonce);
-    const u = out?.user;
-    res.json({
-      ...out,
-      free: u ? { skips_left: getFreeSkipsLeft(u), hints_left: getFreeHintsLeft(u) } : undefined,
-    });
+    res.json(await useSkip(uid));
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
   }
@@ -228,27 +216,9 @@ app.post("/api/skip", async (req,res)=>{
 app.post("/api/hint", async (req,res)=>{
   try{
     const { uid } = await requirePiUser(req);
-    const mode = String(req.body?.mode || "free");
-    const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
-    const out = await useHint(uid, mode as any, nonce);
-    const u = out?.user;
-    res.json({
-      ...out,
-      free: u ? { skips_left: getFreeSkipsLeft(u), hints_left: getFreeHintsLeft(u) } : undefined,
-    });
+    res.json(await useHint(uid));
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
-  }
-});
-
-/* ---------------- ADMIN: month close ---------------- */
-app.post("/admin/month-close", async (req,res)=>{
-  try{
-    requireAdmin(req);
-    const month = req.body?.month ? String(req.body.month) : undefined;
-    res.json(await closeMonthAndResetCoins({ month }));
-  }catch(e:any){
-    res.status(401).json({ok:false,error:e.message});
   }
 });
 
