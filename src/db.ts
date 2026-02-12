@@ -781,12 +781,14 @@ export async function adminChartActiveUsers({ days }: { days: number }) {
       [uid, month]
       );
 
-      const column =kind === "coins"
-      ? "ads_for_coins"
-      : kind === "skips"
-      ? "ads_for_skips"
-      : "ads_for_hints";
-      ? "ads_for_restarts"
+      const column =
+  kind === "coins"
+    ? "ads_for_coins"
+    : kind === "skips"
+    ? "ads_for_skips"
+    : kind === "hints"
+    ? "ads_for_hints"
+    : "ads_for_restarts";
       await pool.query(
       `
       UPDATE user_ads
