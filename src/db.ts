@@ -18,6 +18,7 @@ export async function initDB() {
       uid TEXT PRIMARY KEY,
       username TEXT,
       coins INT DEFAULT 0,
+      free_restarts_used INT DEFAULT 0,
       free_skips_used INT DEFAULT 0,
       free_hints_used INT DEFAULT 0,
       -- used for monthly rollover bookkeeping (optional)
@@ -80,10 +81,16 @@ export async function initDB() {
 /* =====================================================
    CONSTANTS
 ===================================================== */
+export const FREE_RESTARTS_PER_ACCOUNT = 3;
 export const FREE_SKIPS_PER_ACCOUNT = 3;
 export const FREE_HINTS_PER_ACCOUNT = 3;
 export const SKIP_COST_COINS = 50;
 export const HINT_COST_COINS = 50;
+
+export function getFreeRestartsLeft(u: any) {
+  const used = Number(u?.free_restarts_used || 0);
+  return Math.max(0, FREE_RESTARTS_PER_ACCOUNT - used);
+}
 
 export function getFreeSkipsLeft(u: any) {
   const used = Number(u?.free_skips_used || 0);
@@ -350,6 +357,52 @@ export async function claimLevelComplete(uid: string, level: number) {
    SKIPS / HINTS
 ===================================================== */
 type SpendMode = "free" | "coins" | "ad";
+
+export async function useRestarts(uid: string, mode: SpendMode, nonce?: string) {
+  const user = await getUserByUid(uid);
+  if (!user) throw new Error("User not found");
+
+  if (mode === "free") {
+    if (getFreeRestartsLeft(user) <= 0) throw new Error("No free Restarts left");
+    const { rows } = await pool.query(
+      `UPDATE users
+       SET free_restarts_used = COALESCE(free_restarts_used,0) + 1,
+           updated_at=NOW()
+       WHERE uid=$1
+       RETURNING *`,
+      [uid]
+    );
+    return { ok: true, user: rows[0] };
+  }
+
+  if (mode === "coins") {
+    const u = await spendCoins(uid, RESTART_COST_COINS);
+    // keep a ledger row for charts/audit (negative amounts are OK)
+    await pool.query(
+      `INSERT INTO reward_claims (uid,type,amount,created_at)
+       VALUES ($1,'skip_coin',-$2,NOW())`,
+      [uid, RESTARTS_COST_COINS]
+    );
+    return { ok: true, user: u };
+  }
+
+  // mode === "ad"
+  if (!nonce) throw new Error("Missing nonce");
+  // idempotent claim: same nonce cannot be used twice
+  const already = await pool.query(
+    `SELECT 1 FROM reward_claims WHERE uid=$1 AND type='restarts_ad' AND nonce=$2`,
+    [uid, nonce]
+  );
+  if (already.rowCount) return { ok: true, already: true, user };
+
+  await pool.query(
+    `INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
+     VALUES ($1,'skip_ad',$2,0,NOW())`,
+    [uid, nonce]
+  );
+  await trackAdView(uid, "restarts");
+  return { ok: true, user };
+}
 
 export async function useSkip(uid: string, mode: SpendMode, nonce?: string) {
   const user = await getUserByUid(uid);

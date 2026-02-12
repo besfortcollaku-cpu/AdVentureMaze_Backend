@@ -20,6 +20,11 @@ import {
   claimLevelComplete,
   useSkip,
   useHint,
+  getFreeRestartsLeft,
+  getFreeSkipsLeft,
+  getFreeHintsLeft,
+
+  closeMonthAndResetCoins,
 
   // sessions / admin
   adminListUsers,
@@ -35,7 +40,7 @@ import {
   // ✅ charts
   adminChartCoins,
   adminChartActiveUsers,
-}from "./db";
+} from "./db";
 
 const app = express();
 
@@ -72,10 +77,15 @@ app.get("/api/me", async (req, res) => {
     const progress = await getProgressByUid(uid);
 
     res.json({
-      ok: true,
-      user,
-      progress: progress ?? { uid, level: 1, coins: 0 },
-    });
+  ok: true,
+  user,
+  progress: progress ?? { uid, level: 1, coins: 0 },
+  free: {
+    restarts_left: getFreeRestartsLeft(user),
+    skips_left: getFreeSkipsLeft(user),
+    hints_left: getFreeHintsLeft(user),
+  },
+});
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
@@ -204,10 +214,32 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
   }
 });
 
+app.post("/api/restart", async (req,res)=>{
+  try{
+    const { uid } = await requirePiUser(req);
+    const mode = String(req.body?.mode || "free");
+    const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
+    const out = await use(uid, mode as any, nonce);
+    const u = out?.user;
+    res.json({
+      ...out,
+      free: u ? { restart_left: getFreeRestartsLeft(u), hints_left: getFreeHintsLeft(u) } : undefined,
+    });
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
+  }
+});
 app.post("/api/skip", async (req,res)=>{
   try{
     const { uid } = await requirePiUser(req);
-    res.json(await useSkip(uid));
+    const mode = String(req.body?.mode || "free");
+    const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
+    const out = await useSkip(uid, mode as any, nonce);
+    const u = out?.user;
+    res.json({
+      ...out,
+      free: u ? { skips_left: getFreeSkipsLeft(u), hints_left: getFreeHintsLeft(u) } : undefined,
+    });
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
   }
@@ -216,9 +248,27 @@ app.post("/api/skip", async (req,res)=>{
 app.post("/api/hint", async (req,res)=>{
   try{
     const { uid } = await requirePiUser(req);
-    res.json(await useHint(uid));
+    const mode = String(req.body?.mode || "free");
+    const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
+    const out = await useHint(uid, mode as any, nonce);
+    const u = out?.user;
+    res.json({
+      ...out,
+      free: u ? { skips_left: getFreeSkipsLeft(u), hints_left: getFreeHintsLeft(u) } : undefined,
+    });
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
+  }
+});
+
+/* ---------------- ADMIN: month close ---------------- */
+app.post("/admin/month-close", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const month = req.body?.month ? String(req.body.month) : undefined;
+    res.json(await closeMonthAndResetCoins({ month }));
+  }catch(e:any){
+    res.status(401).json({ok:false,error:e.message});
   }
 });
 
