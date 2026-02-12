@@ -20,6 +20,7 @@ import {
   claimLevelComplete,
   useSkip,
   useHint,
+  useRestarts,
   getFreeRestartsLeft,
   getFreeSkipsLeft,
   getFreeHintsLeft,
