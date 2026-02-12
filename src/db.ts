@@ -373,18 +373,18 @@ export async function useRestarts(uid: string, mode: SpendMode, nonce?: string) 
       [uid]
     );
     return { ok: true, user: rows[0] };
-  }
+  
 
   if (mode === "coins") {
     const u = await spendCoins(uid, RESTART_COST_COINS);
     // keep a ledger row for charts/audit (negative amounts are OK)
     await pool.query(
       `INSERT INTO reward_claims (uid,type,amount,created_at)
-       VALUES ($1,'skip_coin',-$2,NOW())`,
+       VALUES ($1,'restart_coin',-$2,NOW())`,
       [uid, RESTART_COST_COINS]
     );
     return { ok: true, user: u };
-  }
+  
 
   // mode === "ad"
   if (!nonce) throw new Error("Missing nonce");
@@ -397,7 +397,7 @@ export async function useRestarts(uid: string, mode: SpendMode, nonce?: string) 
 
   await pool.query(
     `INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
-     VALUES ($1,'skip_ad',$2,0,NOW())`,
+     VALUES ($1,'restart_ad',$2,0,NOW())`,
     [uid, nonce]
   );
   await trackAdView(uid, "restarts");
