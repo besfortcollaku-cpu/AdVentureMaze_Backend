@@ -357,49 +357,63 @@ export async function claimLevelComplete(uid: string, level: number) {
 /* =====================================================
   RESTARTS / SKIPS / HINTS 
 ===================================================== */
-type SpendType = "coins" | "skips" | "hints" | "restarts";
-export async function useRestarts(uid: string, mode: SpendMode, nonce?: string) {
+export async function useRestarts(
+  uid: string,
+  mode: SpendMode,
+  nonce?: string
+) {
   const user = await getUserByUid(uid);
   if (!user) throw new Error("User not found");
 
+  // ---- FREE ----
   if (mode === "free") {
-    if (getFreeRestartsLeft(user) <= 0) throw new Error("No free Restarts left");
+    if (getFreeRestartsLeft(user) <= 0)
+      throw new Error("No free restarts left");
+
     const { rows } = await pool.query(
       `UPDATE users
        SET free_restarts_used = COALESCE(free_restarts_used,0) + 1,
-           updated_at=NOW()
-       WHERE uid=$1
+           updated_at = NOW()
+       WHERE uid = $1
        RETURNING *`,
       [uid]
     );
-    return { ok: true, user: rows[0] };
-  
 
+    return { ok: true, user: rows[0] };
+  }
+
+  // ---- COINS ----
   if (mode === "coins") {
     const u = await spendCoins(uid, RESTART_COST_COINS);
-    // keep a ledger row for charts/audit (negative amounts are OK)
+
     await pool.query(
       `INSERT INTO reward_claims (uid,type,amount,created_at)
        VALUES ($1,'restart_coin',-$2,NOW())`,
       [uid, RESTART_COST_COINS]
     );
-    return { ok: true, user: u };
-  
 
-  // mode === "ad"
+    return { ok: true, user: u };
+  }
+
+  // ---- AD ----
   if (!nonce) throw new Error("Missing nonce");
-  // idempotent claim: same nonce cannot be used twice
+
   const already = await pool.query(
-    `SELECT 1 FROM reward_claims WHERE uid=$1 AND type='restarts_ad' AND nonce=$2`,
+    `SELECT 1 FROM reward_claims
+     WHERE uid = $1 AND type = 'restart_ad' AND nonce = $2`,
     [uid, nonce]
   );
-  if (already.rowCount) return { ok: true, already: true, user };
+
+  if (already.rowCount) {
+    return { ok: true, already: true, user };
+  }
 
   await pool.query(
     `INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
      VALUES ($1,'restart_ad',$2,0,NOW())`,
     [uid, nonce]
   );
+
   await trackAdView(uid, "restarts");
   return { ok: true, user };
 }
