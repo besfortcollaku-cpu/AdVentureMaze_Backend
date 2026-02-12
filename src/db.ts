@@ -381,7 +381,7 @@ export async function useRestarts(uid: string, mode: SpendMode, nonce?: string) 
     await pool.query(
       `INSERT INTO reward_claims (uid,type,amount,created_at)
        VALUES ($1,'skip_coin',-$2,NOW())`,
-      [uid, RESTARTS_COST_COINS]
+      [uid, RESTART_COST_COINS]
     );
     return { ok: true, user: u };
   }
