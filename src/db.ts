@@ -84,6 +84,7 @@ export async function initDB() {
 export const FREE_RESTARTS_PER_ACCOUNT = 3;
 export const FREE_SKIPS_PER_ACCOUNT = 3;
 export const FREE_HINTS_PER_ACCOUNT = 3;
+export const RESTART_COST_COINS = 50;
 export const SKIP_COST_COINS = 50;
 export const HINT_COST_COINS = 50;
 
@@ -354,10 +355,9 @@ export async function claimLevelComplete(uid: string, level: number) {
 }
 
 /* =====================================================
-   SKIPS / HINTS
+  RESTARTS / SKIPS / HINTS 
 ===================================================== */
-type SpendMode = "free" | "coins" | "ad";
-
+type SpendType = "coins" | "skips" | "hints" | "restarts";
 export async function useRestarts(uid: string, mode: SpendMode, nonce?: string) {
   const user = await getUserByUid(uid);
   if (!user) throw new Error("User not found");
@@ -753,7 +753,7 @@ export async function adminChartActiveUsers({ days }: { days: number }) {
       
       export async function trackAdView(
       uid: string,
-      kind: "coins" | "skips" | "hints"
+      kind: "coins" | "skips" | "hints"| "restarts"
       ) {
       const month = currentMonthKey();
 
@@ -772,7 +772,7 @@ export async function adminChartActiveUsers({ days }: { days: number }) {
       : kind === "skips"
       ? "ads_for_skips"
       : "ads_for_hints";
-
+      ? "ads_for_restarts"
       await pool.query(
       `
       UPDATE user_ads
