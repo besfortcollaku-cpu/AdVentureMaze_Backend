@@ -219,7 +219,7 @@ app.post("/api/restart", async (req,res)=>{
     const { uid } = await requirePiUser(req);
     const mode = String(req.body?.mode || "free");
     const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
-    const out = await useRestart(uid, mode as any, nonce);
+    const out = await useRestarts(uid, mode as any, nonce);
     const u = out?.user;
     res.json({
       ...out,
