@@ -90,10 +90,6 @@ export const RESTART_COST_COINS = 50;
 export const SKIP_COST_COINS = 50;
 export const HINT_COST_COINS = 50;
 
-export function getFreeRestartsLeft(u: any) {
-  const used = Number(u?.free_restarts_used || 0);
-  return Math.max(0, FREE_RESTARTS_PER_ACCOUNT - used);
-}
 
 export function getFreeSkipsLeft(u: any) {
   const used = Number(u?.free_skips_used || 0);
@@ -369,20 +365,21 @@ export async function useRestarts(
 
   // ---- FREE ----
   if (mode === "free") {
-    if (getFreeRestartsLeft(user) <= 0)
-      throw new Error("No free restarts left");
-
-    const { rows } = await pool.query(
-      `UPDATE users
-       SET free_restarts_used = COALESCE(free_restarts_used,0) + 1,
-           updated_at = NOW()
-       WHERE uid = $1
-       RETURNING *`,
-      [uid]
-    );
-
-    return { ok: true, user: rows[0] };
+  if (user.free_restarts_used >= 3) {
+    return { ok: false, error: "NO_FREE_RESTARTS" };
   }
+
+  const { rows } = await pool.query(
+    `UPDATE users
+     SET free_restarts_used = free_restarts_used + 1,
+         updated_at = NOW()
+     WHERE uid = $1
+     RETURNING *`,
+    [uid]
+  );
+
+  return { ok: true, user: rows[0] };
+}
 
   // ---- COINS ----
   if (mode === "coins") {
