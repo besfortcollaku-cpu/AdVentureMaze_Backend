@@ -406,6 +406,17 @@ export async function useRestarts(
   if (already.rowCount) {
     return { ok: true, already: true, user };
   }
+const r = await pool.query(
+  `
+  UPDATE users
+  SET free_restarts_used = COALESCE(free_restarts_used, 0) + 1
+  WHERE uid = $1
+  RETURNING free_restarts_used
+  `,
+  [uid]
+);
+
+user.free_restarts_used = r.rows[0].free_restarts_used;
 
   await pool.query(
     `INSERT INTO reward_claims (uid,type,nonce,amount,created_at)

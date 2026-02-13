@@ -21,7 +21,6 @@ import {
   useSkip,
   useHint,
   useRestarts,
-  getFreeRestartsLeft,
   getFreeSkipsLeft,
   getFreeHintsLeft,
 
@@ -82,7 +81,7 @@ app.get("/api/me", async (req, res) => {
   user,
   progress: progress ?? { uid, level: 1, coins: 0 },
   free: {
-    restarts_left: getFreeRestartsLeft(user),
+    restarts_left: Math.max(0, 3 - Number(user?.free_restarts_used || 0)),
     skips_left: getFreeSkipsLeft(user),
     hints_left: getFreeHintsLeft(user),
   },
@@ -223,9 +222,14 @@ app.post("/api/restart", async (req,res)=>{
     const out = await useRestarts(uid, mode as any, nonce);
     const u = out?.user;
     res.json({
-      ...out,
-      free: u ? { restart_left: getFreeRestartsLeft(u), hints_left: getFreeHintsLeft(u) } : undefined,
-    });
+  ...out,
+  free: u
+    ? {
+        restart_left: Math.max(0, 3 - (u.free_restarts_used || 0)),
+        hints_left: Math.max(0, 3 - (u.free_hints_used || 0)),
+      }
+    : undefined,
+});
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
   }
