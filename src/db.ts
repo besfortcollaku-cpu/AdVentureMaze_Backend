@@ -402,61 +402,72 @@ export async function useRestarts(
   }
 
 
-
-export async function useSkip(uid: string, mode: SpendMode, nonce?: string) {
+export async function useSkip(
+  uid: string,
+  mode: SpendMode,
+  nonce?: string
+) {
   const user = await getUserByUid(uid);
   if (!user) throw new Error("User not found");
 
+  // ---- FREE ----
   if (mode === "free") {
-  if (user.free_skips_used >= 3) {
-    return { ok: false, error: "NO_FREE_SKIPS" };
+    if (user.free_skips_used >= 3) {
+      return { ok: false, error: "NO_FREE_SKIPS" };
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE users
+       SET free_skips_used = free_skips_used + 1,
+           updated_at = NOW()
+       WHERE uid=$1
+       RETURNING *`,
+      [uid]
+    );
+
+    return { ok: true, user: rows[0] };
   }
 
-  const { rows } = await pool.query(
-    `UPDATE users
-     SET free_skips_used = free_skips_used + 1,
-         updated_at = NOW()
-     WHERE uid=$1
-     RETURNING *`,
-    [uid]
-  );
-
-  return { ok: true, user: rows[0] };
-}
-
+  // ---- COINS ----
   if (mode === "coins") {
     const u = await spendCoins(uid, SKIP_COST_COINS);
+
     await pool.query(
       `INSERT INTO reward_claims (uid,type,amount,created_at)
        VALUES ($1,'skip_coin',-$2,NOW())`,
       [uid, SKIP_COST_COINS]
     );
+
     return { ok: true, user: u };
+  }
+
+  // ---- AD ----
+  if (mode === "ad") {
+    if (!nonce) throw new Error("Missing nonce");
+
+    const already = await pool.query(
+      `SELECT 1 FROM reward_claims
+       WHERE uid=$1 AND type='skip_ad' AND nonce=$2`,
+      [uid, nonce]
+    );
+    if (already.rowCount) {
+      return { ok: true, already: true, user };
+    }
+
+    await pool.query(
+      `INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
+       VALUES ($1,'skip_ad',$2,0,NOW())`,
+      [uid, nonce]
+    );
+
+    await trackAdView(uid, "skips");
+    return { ok: true, user };
+  }
+
+  throw new Error("INVALID_SKIP_MODE");
 }
 
-  throw new Error("INVALID_RESTART_MODE");
-}
 
-  // mode === "ad"
-  if (!nonce) throw new Error("Missing nonce");
-  // idempotent claim: same nonce cannot be used twice
-  const already = await pool.query(
-    `SELECT 1 FROM reward_claims WHERE uid=$1 AND type='skip_ad' AND nonce=$2`,
-    [uid, nonce]
-  );
-  if (already.rowCount) return { ok: true, already: true, user };
-
-  await pool.query(
-    `INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
-     VALUES ($1,'skip_ad',$2,0,NOW())`,
-    [uid, nonce]
-  );
-  await trackAdView(uid, "skips");
-  return { ok: true, user };
-}
-
-throw new Error("INVALID_SKIP_MODE");
-}
 export async function useHint(uid: string, mode: SpendMode, nonce?: string) {
   const user = await getUserByUid(uid);
   if (!user) throw new Error("User not found");
