@@ -7,8 +7,6 @@ const pool = new Pool({
     : undefined,
 });
 
-
-type SpendMode = "free" | "coins" | "ad";
 /* =====================================================
    INIT  (✅ Fix 1: auto-create core tables incl. sessions)
 ===================================================== */
