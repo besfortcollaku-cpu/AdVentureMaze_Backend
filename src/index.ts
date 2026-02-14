@@ -20,7 +20,6 @@ import {
   claimLevelComplete,
   useSkip,
   useHint,
-  consumeItem,
   getFreeSkipsLeft,
   getFreeHintsLeft,
 
