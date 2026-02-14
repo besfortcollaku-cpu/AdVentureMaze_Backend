@@ -14,12 +14,12 @@ import {
   upsertUser,
   getProgressByUid,
   setProgressByUid,
-
+  consumeItem,
   claimReward,
   claimDailyLogin,
   claimLevelComplete,
   useSkip,
-  useHint,
+  useHint, 
   getFreeSkipsLeft,
   getFreeHintsLeft,
 

@@ -10,6 +10,27 @@ const pool = new Pool({
 /* =====================================================
    INIT  (✅ Fix 1: auto-create core tables incl. sessions)
 ===================================================== */
+export async function consumeItem(
+  uid: string,
+  item: "restart" | "skip" | "hint",
+  mode: SpendMode,
+  nonce?: string
+) {
+  switch (item) {
+    case "restart":
+      return useRestarts(uid, mode, nonce);
+
+    case "skip":
+      return useSkip(uid, mode, nonce);
+
+    case "hint":
+      return useHint(uid, mode, nonce);
+
+    default:
+      throw new Error("INVALID_ITEM");
+  }
+}
+
 export async function initDB() {
   await pool.query("SELECT 1");
   // create minimal tables if they don't exist
