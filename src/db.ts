@@ -401,39 +401,7 @@ export async function useRestarts(
     return { ok: true, user: u };
   }
 
-  // ---- AD ----
-  if (!nonce) throw new Error("Missing nonce");
 
-  const already = await pool.query(
-    `SELECT 1 FROM reward_claims
-     WHERE uid = $1 AND type = 'restart_ad' AND nonce = $2`,
-    [uid, nonce]
-  );
-
-  if (already.rowCount) {
-    return { ok: true, already: true, user };
-  }
-const r = await pool.query(
-  `
-  UPDATE users
-  SET free_restarts_used = COALESCE(free_restarts_used, 0) + 1
-  WHERE uid = $1
-  RETURNING free_restarts_used
-  `,
-  [uid]
-);
-
-user.free_restarts_used = r.rows[0].free_restarts_used;
-
-  await pool.query(
-    `INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
-     VALUES ($1,'restart_ad',$2,0,NOW())`,
-    [uid, nonce]
-  );
-
-  await trackAdView(uid, "restarts");
-  return { ok: true, user };
-}
 
 export async function useSkip(uid: string, mode: SpendMode, nonce?: string) {
   const user = await getUserByUid(uid);
