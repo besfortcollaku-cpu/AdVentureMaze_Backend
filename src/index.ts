@@ -241,10 +241,15 @@ app.post("/api/skip", async (req,res)=>{
     const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
     const out = await useSkip(uid, mode as any, nonce);
     const u = out?.user;
-    res.json({
-      ...out,
-      free: u ? { skips_left: getFreeSkipsLeft(u), hints_left: getFreeHintsLeft(u) } : undefined,
-    });
+
+res.json({
+  ...out,
+  free: u
+    ? {
+        skips_left: Math.max(0, 3 - (u.free_skips_used || 0)),
+      }
+    : undefined,
+});
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
   }

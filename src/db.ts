@@ -433,17 +433,21 @@ export async function useSkip(uid: string, mode: SpendMode, nonce?: string) {
   if (!user) throw new Error("User not found");
 
   if (mode === "free") {
-    if (getFreeSkipsLeft(user) <= 0) throw new Error("No free skips left");
-    const { rows } = await pool.query(
-      `UPDATE users
-       SET free_skips_used = COALESCE(free_skips_used,0) + 1,
-           updated_at=NOW()
-       WHERE uid=$1
-       RETURNING *`,
-      [uid]
-    );
-    return { ok: true, user: rows[0] };
+  if (user.free_skips_used >= 3) {
+    return { ok: false, error: "NO_FREE_SKIPS" };
   }
+
+  const { rows } = await pool.query(
+    `UPDATE users
+     SET free_skips_used = free_skips_used + 1,
+         updated_at = NOW()
+     WHERE uid=$1
+     RETURNING *`,
+    [uid]
+  );
+
+  return { ok: true, user: rows[0] };
+}
 
   if (mode === "coins") {
     const u = await spendCoins(uid, SKIP_COST_COINS);
