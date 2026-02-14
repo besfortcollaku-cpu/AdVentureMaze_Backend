@@ -433,7 +433,10 @@ export async function useSkip(uid: string, mode: SpendMode, nonce?: string) {
       [uid, SKIP_COST_COINS]
     );
     return { ok: true, user: u };
-  }
+}
+
+  throw new Error("INVALID_RESTART_MODE");
+}
 
   // mode === "ad"
   if (!nonce) throw new Error("Missing nonce");
@@ -453,6 +456,8 @@ export async function useSkip(uid: string, mode: SpendMode, nonce?: string) {
   return { ok: true, user };
 }
 
+throw new Error("INVALID_SKIP_MODE");
+}
 export async function useHint(uid: string, mode: SpendMode, nonce?: string) {
   const user = await getUserByUid(uid);
   if (!user) throw new Error("User not found");
