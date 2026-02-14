@@ -152,7 +152,7 @@ app.post("/api/consume", async (req, res) => {
     const { uid } = await requirePiUser(req);
     const { item, mode, nonce } = req.body || {};
 
-    const out = await consumeItem(uid, item, mode, nonce);
+    const out = await consumeItem(uid, item, mode as SpendMode, nonce);
     res.json(out);
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message });
@@ -228,7 +228,7 @@ app.post("/api/restart", async (req,res)=>{
     const { uid } = await requirePiUser(req);
     const mode = String(req.body?.mode || "free");
     const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
-    const out = await consumeItem(uid, "restart", mode, nonce);
+    const out = await consumeItem(uid, "restart", mode as SpendMode, nonce);
     const u = out?.user;
     res.json({
   ...out,
@@ -248,7 +248,7 @@ app.post("/api/skip", async (req, res) => {
     const { uid } = await requirePiUser(req);
     const { mode, nonce } = req.body || {};
 
-    const out = await consumeItem(uid, "skip", mode, nonce);
+    const out = await consumeItem(uid, "skip", mode as SpendMode, nonce);
     res.json(out);
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message });
@@ -260,7 +260,7 @@ app.post("/api/hint", async (req, res) => {
     const { uid } = await requirePiUser(req);
     const { mode, nonce } = req.body || {};
 
-    const out = await consumeItem(uid, "hint", mode, nonce);
+    const out = await consumeItem(uid, "hint", mode as SpendMode, nonce);
     res.json(out);
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message });
