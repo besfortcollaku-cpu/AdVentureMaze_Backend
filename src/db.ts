@@ -426,7 +426,6 @@ export async function useSkip(uid: string, mode: SpendMode, nonce?: string) {
 
   if (mode === "coins") {
     const u = await spendCoins(uid, SKIP_COST_COINS);
-    // keep a ledger row for charts/audit (negative amounts are OK)
     await pool.query(
       `INSERT INTO reward_claims (uid,type,amount,created_at)
        VALUES ($1,'skip_coin',-$2,NOW())`,
