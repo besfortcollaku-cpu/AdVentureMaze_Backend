@@ -400,7 +400,7 @@ export async function useRestarts(
 
     return { ok: true, user: u };
   }
-
+}
 
 export async function useSkip(
   uid: string,
