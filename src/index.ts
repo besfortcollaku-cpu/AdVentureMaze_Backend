@@ -148,7 +148,17 @@ async function verifyPiAccessToken(accessToken: string) {
 }
 
 
+app.post("/api/consume", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const { item, mode, nonce } = req.body || {};
 
+    const out = await consumeItem(uid, item, mode, nonce);
+    res.json(out);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
 
 /* ---------------- ADMIN AUTH ---------------- */
 function requireAdmin(req: express.Request) {
@@ -219,7 +229,7 @@ app.post("/api/restart", async (req,res)=>{
     const { uid } = await requirePiUser(req);
     const mode = String(req.body?.mode || "free");
     const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
-    const out = await useRestarts(uid, mode as any, nonce);
+    const out = await consumeItem(uid, "restart", mode, nonce);
     const u = out?.user;
     res.json({
   ...out,
@@ -234,40 +244,27 @@ app.post("/api/restart", async (req,res)=>{
     res.status(400).json({ok:false,error:e.message});
   }
 });
-app.post("/api/skip", async (req,res)=>{
-  try{
+app.post("/api/skip", async (req, res) => {
+  try {
     const { uid } = await requirePiUser(req);
-    const mode = String(req.body?.mode || "free");
-    const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
-    const out = await useSkip(uid, mode as any, nonce);
-    const u = out?.user;
+    const { mode, nonce } = req.body || {};
 
-res.json({
-  ...out,
-  free: u
-    ? {
-        skips_left: Math.max(0, 3 - (u.free_skips_used || 0)),
-      }
-    : undefined,
-});
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
+    const out = await consumeItem(uid, "skip", mode, nonce);
+    res.json(out);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 
-app.post("/api/hint", async (req,res)=>{
-  try{
+app.post("/api/hint", async (req, res) => {
+  try {
     const { uid } = await requirePiUser(req);
-    const mode = String(req.body?.mode || "free");
-    const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
-    const out = await useHint(uid, mode as any, nonce);
-    const u = out?.user;
-    res.json({
-      ...out,
-      free: u ? { skips_left: getFreeSkipsLeft(u), hints_left: getFreeHintsLeft(u) } : undefined,
-    });
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
+    const { mode, nonce } = req.body || {};
+
+    const out = await consumeItem(uid, "hint", mode, nonce);
+    res.json(out);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 

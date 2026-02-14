@@ -89,7 +89,14 @@ export const FREE_HINTS_PER_ACCOUNT = 3;
 export const RESTART_COST_COINS = 50;
 export const SKIP_COST_COINS = 50;
 export const HINT_COST_COINS = 50;
+export const CONSUMABLES = {
+  restart: { coinCost: 50, freeLimit: 3 },
+  skip:    { coinCost: 50, freeLimit: 3 },
+  hint:    { coinCost: 50, freeLimit: 3 },
+} as const;
 
+export type ConsumableKey = keyof typeof CONSUMABLES;
+export type SpendMode = "free" | "coins" | "ad" | "pi";
 
 export function getFreeSkipsLeft(u: any) {
   const used = Number(u?.free_skips_used || 0);
