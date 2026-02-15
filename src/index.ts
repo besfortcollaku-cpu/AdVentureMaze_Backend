@@ -15,6 +15,7 @@ import {
   getProgressByUid,
   setProgressByUid,
   consumeItem,
+  SpendMode,
   claimReward,
   claimDailyLogin,
   claimLevelComplete,
