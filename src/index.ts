@@ -23,7 +23,8 @@ import {
   useHint, 
   getFreeSkipsLeft,
   getFreeHintsLeft,
-
+  painted_keys,
+  resume,
   closeMonthAndResetCoins,
 
   // sessions / admin
@@ -99,13 +100,39 @@ app.get("/progress", async (req,res)=>{
   res.json({ ok:true, data:p ?? {uid,level:1,coins:0} });
 });
 
-app.post("/progress", async (req,res)=>{
-  await requirePiUser(req);
-  const { uid, level, coins } = req.body;
-  await setProgressByUid({ uid, level, coins });
-  res.json({ ok:true });
-});
+app.post("/progress", async (req, res) => {
+  const { uid } = await requirePiUser(req);
 
+  const {
+    level,
+    coins,
+    paintedKeys,
+    resume
+  } = req.body;
+
+  await pool.query(
+    `
+    INSERT INTO progress (uid, level, coins, painted_keys, resume)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (uid)
+    DO UPDATE SET
+      level = EXCLUDED.level,
+      coins = EXCLUDED.coins,
+      painted_keys = COALESCE($4, progress.painted_keys),
+      resume = $5,
+      updated_at = NOW()
+    `,
+    [
+      uid,
+      level ?? 1,
+      coins ?? 0,
+      paintedKeys ?? null,
+      resume ?? null
+    ]
+  );
+
+  res.json({ ok: true });
+});
 /* ---------------- HELPERS ---------------- */
 async function requirePiUser(req: express.Request) {
   const token = getBearerToken(req);

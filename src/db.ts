@@ -47,11 +47,13 @@ export async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS progress (
-      uid TEXT PRIMARY KEY,
-      level INT DEFAULT 1,
-      coins INT DEFAULT 0,
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
+  uid TEXT PRIMARY KEY,
+  level INT DEFAULT 1,
+  coins INT DEFAULT 0,
+  painted_keys JSONB DEFAULT '[]'::jsonb,
+  resume JSONB DEFAULT NULL,
+  updated_at TIMESTAMP DEFAULT NOW()
+);
     CREATE TABLE IF NOT EXISTS reward_claims (
       uid TEXT NOT NULL,
       type TEXT NOT NULL,
