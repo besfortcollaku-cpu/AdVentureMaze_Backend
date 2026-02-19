@@ -291,19 +291,37 @@ export async function getProgressByUid(uid: string) {
 }
 
 export async function setProgressByUid({
-  uid, level, coins,
-}: { uid: string; level: number; coins: number; }) {
+  uid,
+  level,
+  coins,
+  paintedKeys,
+  resume,
+}: {
+  uid: string;
+  level?: number;
+  coins?: number;
+  paintedKeys?: any;
+  resume?: any;
+}) {
   await pool.query(
     `
-    INSERT INTO progress (uid, level, coins, updated_at)
-    VALUES ($1,$2,$3,NOW())
+    INSERT INTO progress (uid, level, coins, painted_keys, resume)
+    VALUES ($1, $2, $3, $4, $5)
     ON CONFLICT (uid)
     DO UPDATE SET
       level = EXCLUDED.level,
       coins = EXCLUDED.coins,
+      painted_keys = COALESCE($4, progress.painted_keys),
+      resume = $5,
       updated_at = NOW()
-  `,
-    [uid, level, coins]
+    `,
+    [
+      uid,
+      level ?? 1,
+      coins ?? 0,
+      paintedKeys ?? null,
+      resume ?? null,
+    ]
   );
 }
 

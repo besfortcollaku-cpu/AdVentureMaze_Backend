@@ -80,7 +80,21 @@ app.get("/api/me", async (req, res) => {
     res.json({
   ok: true,
   user,
-  progress: progress ?? { uid, level: 1, coins: 0 },
+  progress: progress
+  ? {
+      uid: progress.uid,
+      level: progress.level,
+      coins: progress.coins,
+      paintedKeys: progress.painted_keys ?? [],
+      resume: progress.resume ?? null
+    }
+  : {
+      uid,
+      level: 1,
+      coins: 0,
+      paintedKeys: [],
+      resume: null
+    },
   free: {
     restarts_left: Math.max(0, 3 - Number(user?.free_restarts_used || 0)),
     skips_left: getFreeSkipsLeft(user),
@@ -103,33 +117,15 @@ app.get("/progress", async (req,res)=>{
 app.post("/progress", async (req, res) => {
   const { uid } = await requirePiUser(req);
 
-  const {
+  const { level, coins, paintedKeys, resume } = req.body;
+
+  await setProgressByUid({
+    uid,
     level,
     coins,
     paintedKeys,
-    resume
-  } = req.body;
-
-  await pool.query(
-    `
-    INSERT INTO progress (uid, level, coins, painted_keys, resume)
-    VALUES ($1, $2, $3, $4, $5)
-    ON CONFLICT (uid)
-    DO UPDATE SET
-      level = EXCLUDED.level,
-      coins = EXCLUDED.coins,
-      painted_keys = COALESCE($4, progress.painted_keys),
-      resume = $5,
-      updated_at = NOW()
-    `,
-    [
-      uid,
-      level ?? 1,
-      coins ?? 0,
-      paintedKeys ?? null,
-      resume ?? null
-    ]
-  );
+    resume,
+  });
 
   res.json({ ok: true });
 });
