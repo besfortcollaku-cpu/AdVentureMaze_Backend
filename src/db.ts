@@ -309,7 +309,7 @@ export async function setProgressByUid({
     VALUES ($1, $2, $3, $4, $5)
     ON CONFLICT (uid)
     DO UPDATE SET
-      level = EXCLUDED.level,
+      level = GREATEST(progress.level, EXCLUDED.level),
       coins = EXCLUDED.coins,
       painted_keys = COALESCE($4, progress.painted_keys),
       resume = $5,
