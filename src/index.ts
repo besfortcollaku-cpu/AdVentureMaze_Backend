@@ -23,8 +23,6 @@ import {
   useHint, 
   getFreeSkipsLeft,
   getFreeHintsLeft,
-  painted_keys,
-  resume,
   closeMonthAndResetCoins,
 
   // sessions / admin
