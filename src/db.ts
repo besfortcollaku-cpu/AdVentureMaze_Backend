@@ -311,7 +311,7 @@ export async function setProgressByUid({
     DO UPDATE SET
       level = GREATEST(progress.level, EXCLUDED.level),
       coins = EXCLUDED.coins,
-      painted_keys = COALESCE($4, progress.painted_keys),
+      painted_keys = COALESCE($4::jsonb, progress.painted_keys),
       resume = $5,
       updated_at = NOW()
     `,
