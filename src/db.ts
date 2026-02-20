@@ -319,8 +319,8 @@ export async function setProgressByUid({
       uid,
       level ?? 1,
       coins ?? 0,
-      paintedKeys ?? null,
-      resume ?? null,
+      paintedKeys ? JSON.stringify(paintedKeys) : null,
+resume ? JSON.stringify(resume) : null,
     ]
   );
 }
