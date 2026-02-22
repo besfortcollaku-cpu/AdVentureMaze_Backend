@@ -30,60 +30,58 @@ export async function consumeItem(
       throw new Error("INVALID_ITEM");
   }
 }
-
 export async function initDB() {
   await pool.query("SELECT 1");
-  // create minimal tables if they don't exist
+
+  // USERS TABLE
   await pool.query(`
-CREATE TABLE IF NOT EXISTS users (
-  uid TEXT PRIMARY KEY,
-  username TEXT,
+    CREATE TABLE IF NOT EXISTS users (
+      uid TEXT PRIMARY KEY,
+      username TEXT,
 
-  coins INT DEFAULT 0,
+      coins INT DEFAULT 0,
 
-  free_restarts_used INT DEFAULT 0,
-  free_skips_used INT DEFAULT 0,
-  free_hints_used INT DEFAULT 0,
+      free_restarts_used INT DEFAULT 0,
+      free_skips_used INT DEFAULT 0,
+      free_hints_used INT DEFAULT 0,
 
-  -- monthly bookkeeping
-  monthly_key TEXT,
-  monthly_coins_earned INT DEFAULT 0,
-  monthly_login_days INT DEFAULT 0,
-  monthly_levels_completed INT DEFAULT 0,
-  monthly_skips_used INT DEFAULT 0,
-  monthly_hints_used INT DEFAULT 0,
-  monthly_restarts_used INT DEFAULT 0,
-  monthly_ads_watched INT DEFAULT 0,
-  monthly_valid_invites INT DEFAULT 0,
-  monthly_max_win_streak INT DEFAULT 0,
+      monthly_key TEXT,
+      monthly_coins_earned INT DEFAULT 0,
+      monthly_login_days INT DEFAULT 0,
+      monthly_levels_completed INT DEFAULT 0,
+      monthly_skips_used INT DEFAULT 0,
+      monthly_hints_used INT DEFAULT 0,
+      monthly_restarts_used INT DEFAULT 0,
+      monthly_ads_watched INT DEFAULT 0,
+      monthly_valid_invites INT DEFAULT 0,
+      monthly_max_win_streak INT DEFAULT 0,
 
-  monthly_rate_breakdown JSONB DEFAULT '{}'::jsonb,
-  monthly_final_rate INT DEFAULT 50,
+      monthly_rate_breakdown JSONB DEFAULT '{}'::jsonb,
+      monthly_final_rate INT DEFAULT 50,
 
-  -- lifetime bookkeeping
-  lifetime_coins_earned INT DEFAULT 0,
-  lifetime_coins_spent INT DEFAULT 0,
-  lifetime_levels_completed INT DEFAULT 0,
-  lifetime_invites_valid INT DEFAULT 0,
+      lifetime_coins_earned INT DEFAULT 0,
+      lifetime_coins_spent INT DEFAULT 0,
+      lifetime_levels_completed INT DEFAULT 0,
+      lifetime_invites_valid INT DEFAULT 0,
 
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-await pool.query(`
-  ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS monthly_key TEXT;
-`);
-await pool.query(`
-  ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS monthly_key TEXT;
-`);
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // PROGRESS TABLE
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS progress (
-  uid TEXT PRIMARY KEY,
-  level INT DEFAULT 1,
-  coins INT DEFAULT 0,
-  painted_keys JSONB DEFAULT '[]'::jsonb,
-  resume JSONB DEFAULT NULL,
-  updated_at TIMESTAMP DEFAULT NOW()
-);
+      uid TEXT PRIMARY KEY,
+      level INT DEFAULT 1,
+      coins INT DEFAULT 0,
+      painted_keys JSONB DEFAULT '[]'::jsonb,
+      resume JSONB DEFAULT NULL,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // REWARD CLAIMS
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS reward_claims (
       uid TEXT NOT NULL,
       type TEXT NOT NULL,
@@ -91,11 +89,19 @@ await pool.query(`
       amount INT DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW()
     );
+  `);
+
+  // LEVEL REWARDS
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS level_rewards (
       uid TEXT NOT NULL,
       level INT NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     );
+  `);
+
+  // SESSIONS
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       uid TEXT PRIMARY KEY,
       session_id TEXT,
@@ -104,8 +110,10 @@ await pool.query(`
       started_at TIMESTAMP,
       last_seen_at TIMESTAMP NOT NULL
     );
+  `);
 
-    -- monthly payout ledger (idempotent month close)
+  // MONTHLY PAYOUTS
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS monthly_payouts (
       uid TEXT NOT NULL,
       month TEXT NOT NULL,
@@ -118,17 +126,18 @@ await pool.query(`
       PRIMARY KEY (uid, month)
     );
   `);
-  
+
+  // USER ADS
   await pool.query(`
-  CREATE TABLE IF NOT EXISTS user_ads (
-    uid TEXT NOT NULL,
-    month TEXT NOT NULL,
-    ads_for_coins INT DEFAULT 0,
-    ads_for_skips INT DEFAULT 0,
-    ads_for_hints INT DEFAULT 0,
-    PRIMARY KEY (uid, month)
-  );
-`);
+    CREATE TABLE IF NOT EXISTS user_ads (
+      uid TEXT NOT NULL,
+      month TEXT NOT NULL,
+      ads_for_coins INT DEFAULT 0,
+      ads_for_skips INT DEFAULT 0,
+      ads_for_hints INT DEFAULT 0,
+      PRIMARY KEY (uid, month)
+    );
+  `);
 }
 
 /* =====================================================
