@@ -80,8 +80,9 @@ app.get("/api/me", async (req, res) => {
 
     res.json({
   ok: true,
-  user,
-      monthly_final_rate: user?.monthly_final_rate ?? 50,
+  user: {
+    ...user,
+    monthly_final_rate: user?.monthly_final_rate ?? 50,
     monthly_rate_breakdown: user?.monthly_rate_breakdown ?? {},
     monthly_coins_earned: user?.monthly_coins_earned ?? 0,
     monthly_login_days: user?.monthly_login_days ?? 0,
