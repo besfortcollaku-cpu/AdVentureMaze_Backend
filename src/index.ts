@@ -144,7 +144,7 @@ await ensureMonthlyKey(uid);
 await touchUserOnline(uid);
 
 return { uid, username };
-
+}
 function getBearerToken(req: express.Request) {
   return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
 }
