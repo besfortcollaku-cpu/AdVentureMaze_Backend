@@ -35,17 +35,39 @@ export async function initDB() {
   await pool.query("SELECT 1");
   // create minimal tables if they don't exist
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      uid TEXT PRIMARY KEY,
-      username TEXT,
-      coins INT DEFAULT 0,
-      free_restarts_used INT DEFAULT 0,
-      free_skips_used INT DEFAULT 0,
-      free_hints_used INT DEFAULT 0,
-      -- used for monthly rollover bookkeeping (optional)
-      coins_month TEXT,
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
+CREATE TABLE IF NOT EXISTS users (
+  uid TEXT PRIMARY KEY,
+  username TEXT,
+
+  coins INT DEFAULT 0,
+
+  free_restarts_used INT DEFAULT 0,
+  free_skips_used INT DEFAULT 0,
+  free_hints_used INT DEFAULT 0,
+
+  -- monthly bookkeeping
+  monthly_key TEXT,
+  monthly_coins_earned INT DEFAULT 0,
+  monthly_login_days INT DEFAULT 0,
+  monthly_levels_completed INT DEFAULT 0,
+  monthly_skips_used INT DEFAULT 0,
+  monthly_hints_used INT DEFAULT 0,
+  monthly_restarts_used INT DEFAULT 0,
+  monthly_ads_watched INT DEFAULT 0,
+  monthly_valid_invites INT DEFAULT 0,
+  monthly_max_win_streak INT DEFAULT 0,
+
+  monthly_rate_breakdown JSONB DEFAULT '{}'::jsonb,
+  monthly_final_rate INT DEFAULT 50,
+
+  -- lifetime bookkeeping
+  lifetime_coins_earned INT DEFAULT 0,
+  lifetime_coins_spent INT DEFAULT 0,
+  lifetime_levels_completed INT DEFAULT 0,
+  lifetime_invites_valid INT DEFAULT 0,
+
+  updated_at TIMESTAMP DEFAULT NOW()
+);
     CREATE TABLE IF NOT EXISTS progress (
   uid TEXT PRIMARY KEY,
   level INT DEFAULT 1,
@@ -247,14 +269,20 @@ export async function getUserByUid(uid: string) {
   return rows[0] || null;
 }
 export async function addCoins(uid: string, delta: number) {
+  const d = Number(delta || 0);
+
   const { rows } = await pool.query(
     `
     UPDATE users
-    SET coins = COALESCE(coins,0) + $2, updated_at=NOW()
+    SET
+      coins = COALESCE(coins,0) + $2,
+      monthly_coins_earned = COALESCE(monthly_coins_earned,0) + GREATEST($2,0),
+      lifetime_coins_earned = COALESCE(lifetime_coins_earned,0) + GREATEST($2,0),
+      updated_at=NOW()
     WHERE uid=$1
     RETURNING *
   `,
-    [uid, delta]
+    [uid, d]
   );
   return rows[0];
 }
@@ -265,8 +293,11 @@ export async function spendCoins(uid: string, amount: number) {
 
   const { rows } = await pool.query(
     `
-      UPDATE users
-      SET coins = COALESCE(coins,0) - $2, updated_at=NOW()
+    UPDATE users
+SET
+  coins = COALESCE(coins,0) - $2,
+  lifetime_coins_spent = COALESCE(lifetime_coins_spent,0) + $2,
+  updated_at=NOW()
       WHERE uid=$1 AND COALESCE(coins,0) >= $2
       RETURNING *
     `,
@@ -352,6 +383,13 @@ export async function claimReward({
   );
 
   const user = await addCoins(uid, amount);
+  if (type === "ad_50" || type === "ad") {
+  await pool.query(
+    `UPDATE users SET monthly_ads_watched = COALESCE(monthly_ads_watched,0) + 1 WHERE uid=$1`,
+    [uid]
+  );
+  await recalcAndStoreMonthlyRate(uid);
+}
   return { user };
 }
 
@@ -376,6 +414,11 @@ export async function claimDailyLogin(uid: string) {
   );
 
   const user = await addCoins(uid, 5);
+  await pool.query(
+  `UPDATE users SET monthly_login_days = COALESCE(monthly_login_days,0) + 1 WHERE uid=$1`,
+  [uid]
+);
+await recalcAndStoreMonthlyRate(uid);
   return { user };
 }
 
@@ -395,6 +438,17 @@ export async function claimLevelComplete(uid: string, level: number) {
   );
 
   const user = await addCoins(uid, 1);
+  await pool.query(
+  `
+  UPDATE users
+  SET
+    monthly_levels_completed = COALESCE(monthly_levels_completed,0) + 1,
+    lifetime_levels_completed = COALESCE(lifetime_levels_completed,0) + 1
+  WHERE uid=$1
+  `,
+  [uid]
+);
+await recalcAndStoreMonthlyRate(uid);
   return { user };
 }
 
@@ -463,7 +517,16 @@ export async function useSkip(
        RETURNING *`,
       [uid]
     );
+await pool.query(
+    `
+    UPDATE users
+    SET monthly_skips_used = COALESCE(monthly_skips_used,0) + 1
+    WHERE uid=$1
+    `,
+    [uid]
+  );
 
+  await recalcAndStoreMonthlyRate(uid);
     return { ok: true, user: rows[0] };
   }
 
@@ -476,7 +539,16 @@ export async function useSkip(
        VALUES ($1,'skip_coin',-$2,NOW())`,
       [uid, SKIP_COST_COINS]
     );
+await pool.query(
+    `
+    UPDATE users
+    SET monthly_skips_used = COALESCE(monthly_skips_used,0) + 1
+    WHERE uid=$1
+    `,
+    [uid]
+  );
 
+  await recalcAndStoreMonthlyRate(uid);
     return { ok: true, user: u };
   }
 
@@ -500,6 +572,18 @@ export async function useSkip(
     );
 
     await trackAdView(uid, "skips");
+    await pool.query(
+    `
+    UPDATE users
+    SET
+      monthly_skips_used = COALESCE(monthly_skips_used,0) + 1,
+      monthly_ads_watched = COALESCE(monthly_ads_watched,0) + 1
+    WHERE uid=$1
+    `,
+    [uid]
+  );
+
+  await recalcAndStoreMonthlyRate(uid);
     return { ok: true, user };
   }
 
@@ -901,4 +985,205 @@ export async function getCompletedLevels(uid: string) {
     [uid]
   );
   return rows.map(r => r.level);
+}
+function prevMonthKey() {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = d.getUTCMonth() + 1; // 1..12
+  const prev = new Date(Date.UTC(y, m - 2, 1)); // previous month
+  return monthKeyForDate(prev);
+}
+
+export async function ensureMonthlyKey(uid: string) {
+  const mk = currentMonthKey();
+
+  const { rows } = await pool.query(
+    `SELECT monthly_key FROM users WHERE uid=$1`,
+    [uid]
+  );
+
+  const cur = rows[0]?.monthly_key ? String(rows[0].monthly_key) : null;
+
+  if (cur === mk) return mk;
+
+  await pool.query(
+    `
+    UPDATE users
+    SET
+      monthly_key = $2,
+      monthly_coins_earned = 0,
+      monthly_login_days = 0,
+      monthly_levels_completed = 0,
+      monthly_skips_used = 0,
+      monthly_hints_used = 0,
+      monthly_restarts_used = 0,
+      monthly_ads_watched = 0,
+      monthly_valid_invites = 0,
+      monthly_max_win_streak = 0,
+      monthly_rate_breakdown = '{}'::jsonb,
+      monthly_final_rate = 50,
+      updated_at = NOW()
+    WHERE uid = $1
+    `,
+    [uid, mk]
+  );
+
+  return mk;
+}
+
+export function calcMonthlyRate(u: any) {
+  const breakdown: Record<string, number> = {
+    daily: 0,
+    levels: 0,
+    invites: 0,
+    skill: 0,
+    engagement: 0,
+    streak: 0,
+  };
+
+  // BASE
+  let rate = 50;
+
+  // DAILY (max +10)
+  const days = Number(u?.monthly_login_days || 0);
+  if (days >= 20) breakdown.daily = 10;
+  else if (days >= 15) breakdown.daily = 7;
+  else if (days >= 7) breakdown.daily = 3;
+
+  // LEVELS (max +15)
+  const lv = Number(u?.monthly_levels_completed || 0);
+  if (lv >= 120) breakdown.levels = 15;
+  else if (lv >= 60) breakdown.levels = 10;
+  else if (lv >= 20) breakdown.levels = 5;
+
+  // INVITES (max +10)
+  const inv = Number(u?.monthly_valid_invites || 0);
+  if (inv >= 10) breakdown.invites = 10;
+  else if (inv >= 6) breakdown.invites = 6;
+  else if (inv >= 3) breakdown.invites = 3;
+
+  // SKILL (encourage usage) (max +5)
+  const skips = Number(u?.monthly_skips_used || 0);
+  const hints = Number(u?.monthly_hints_used || 0);
+  const restarts = Number(u?.monthly_restarts_used || 0);
+  let skill = 0;
+  if (skips >= 3) skill += 2;
+  if (hints >= 3) skill += 2;
+  if (restarts >= 1) skill += 1;
+  breakdown.skill = Math.min(5, skill);
+
+  // ADS (max +5)
+  const ads = Number(u?.monthly_ads_watched || 0);
+  if (ads >= 15) breakdown.engagement = 5;
+  else if (ads >= 5) breakdown.engagement = 2;
+
+  // STREAK (max +3 here)
+  const streak = Number(u?.monthly_max_win_streak || 0);
+  if (streak >= 7) breakdown.streak = 3;
+  else if (streak >= 3) breakdown.streak = 2;
+
+  rate +=
+    breakdown.daily +
+    breakdown.levels +
+    breakdown.invites +
+    breakdown.skill +
+    breakdown.engagement +
+    breakdown.streak;
+
+  if (rate > 100) rate = 100;
+
+  return { rate, breakdown };
+}
+
+export async function recalcAndStoreMonthlyRate(uid: string) {
+  const { rows } = await pool.query(`SELECT * FROM users WHERE uid=$1`, [uid]);
+  const u = rows[0];
+  if (!u) throw new Error("User not found");
+
+  const out = calcMonthlyRate(u);
+
+  const { rows: updated } = await pool.query(
+    `
+    UPDATE users
+    SET
+      monthly_rate_breakdown = $2::jsonb,
+      monthly_final_rate = $3,
+      updated_at = NOW()
+    WHERE uid=$1
+    RETURNING *
+    `,
+    [uid, JSON.stringify(out.breakdown), out.rate]
+  );
+
+  return { user: updated[0], breakdown: out.breakdown, rate: out.rate };
+}
+
+export async function claimMonthlyRewards(uid: string, opts?: { month?: string }) {
+  const month = String(opts?.month || prevMonthKey());
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // lock user
+    const { rows } = await client.query(
+      `SELECT * FROM users WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+    const u = rows[0];
+    if (!u) throw new Error("User not found");
+
+    // snapshot coins + rate
+    const coinsCollected = Number(u.coins || 0);
+    const rate = Math.max(0, Math.min(100, Number(u.monthly_final_rate || 50)));
+
+    // create payout row once
+    await client.query(
+      `
+      INSERT INTO monthly_payouts (uid, month, coins_collected, pi_amount, status, created_at)
+      VALUES ($1,$2,$3,NULL,'pending',NOW())
+      ON CONFLICT (uid, month) DO NOTHING
+      `,
+      [uid, month, coinsCollected]
+    );
+
+    // reset coins + monthly stats
+    await client.query(
+      `
+      UPDATE users
+      SET
+        coins = 0,
+        monthly_key = $2,
+        monthly_coins_earned = 0,
+        monthly_login_days = 0,
+        monthly_levels_completed = 0,
+        monthly_skips_used = 0,
+        monthly_hints_used = 0,
+        monthly_restarts_used = 0,
+        monthly_ads_watched = 0,
+        monthly_valid_invites = 0,
+        monthly_max_win_streak = 0,
+        monthly_rate_breakdown = '{}'::jsonb,
+        monthly_final_rate = 50,
+        updated_at = NOW()
+      WHERE uid=$1
+      RETURNING *
+      `,
+      [uid, currentMonthKey()]
+    );
+
+    await client.query("COMMIT");
+
+    return {
+      ok: true,
+      month,
+      coins_collected: coinsCollected,
+      rate_snapshot: rate,
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
 }

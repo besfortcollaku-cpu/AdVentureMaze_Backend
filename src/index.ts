@@ -24,6 +24,9 @@ import {
   getFreeSkipsLeft,
   getFreeHintsLeft,
   closeMonthAndResetCoins,
+  ensureMonthlyKey,
+claimMonthlyRewards,
+recalcAndStoreMonthlyRate,
 
   // sessions / admin
   adminListUsers,
@@ -78,6 +81,17 @@ app.get("/api/me", async (req, res) => {
     res.json({
   ok: true,
   user,
+      monthly_final_rate: user?.monthly_final_rate ?? 50,
+    monthly_rate_breakdown: user?.monthly_rate_breakdown ?? {},
+    monthly_coins_earned: user?.monthly_coins_earned ?? 0,
+    monthly_login_days: user?.monthly_login_days ?? 0,
+    monthly_levels_completed: user?.monthly_levels_completed ?? 0,
+    monthly_skips_used: user?.monthly_skips_used ?? 0,
+    monthly_hints_used: user?.monthly_hints_used ?? 0,
+    monthly_restarts_used: user?.monthly_restarts_used ?? 0,
+    monthly_ads_watched: user?.monthly_ads_watched ?? 0,
+    monthly_valid_invites: user?.monthly_valid_invites ?? 0,
+  },
   progress: progress
   ? {
       uid: progress.uid,
@@ -136,13 +150,14 @@ async function requirePiUser(req: express.Request) {
   const uid = String(piUser.uid);
   const username = String(piUser.username);
 
-  await upsertUser({ uid, username });
+await upsertUser({ uid, username });
 
-  // mark user online on ANY request
-  await touchUserOnline(uid);
+await ensureMonthlyKey(uid);
 
-  return { uid, username };
-}
+// mark user online on ANY request
+await touchUserOnline(uid);
+
+return { uid, username };
 
 function getBearerToken(req: express.Request) {
   return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
@@ -208,6 +223,21 @@ app.post("/api/pi/verify", async (req, res) => {
   }
 });
 
+
+app.post("/api/monthly/claim", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const month = req.body?.month ? String(req.body.month) : undefined;
+
+    // recalc before snapshot
+    await recalcAndStoreMonthlyRate(uid);
+
+    const out = await claimMonthlyRewards(uid, { month });
+    res.json({ ok: true, ...out });
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
 
 /* ---------------- REWARDS ---------------- */
 app.post("/api/rewards/ad-50", async (req,res)=>{
