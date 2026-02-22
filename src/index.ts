@@ -78,7 +78,7 @@ app.get("/api/me", async (req, res) => {
 
     const progress = await getProgressByUid(uid);
 
-    res.json({
+res.json({
   ok: true,
   user: {
     ...user,
@@ -94,27 +94,17 @@ app.get("/api/me", async (req, res) => {
     monthly_valid_invites: user?.monthly_valid_invites ?? 0,
   },
   progress: progress
-  ? {
-      uid: progress.uid,
-      level: progress.level,
-      coins: progress.coins,
-      paintedKeys: progress.painted_keys ?? [],
-      resume: progress.resume ?? null
-    }
-  : {
-      uid,
-      level: 1,
-      coins: 0,
-      paintedKeys: [],
-      resume: null
-    },
-  free: {
-    restarts_left: Math.max(0, 3 - Number(user?.free_restarts_used || 0)),
-    skips_left: getFreeSkipsLeft(user),
-    hints_left: getFreeHintsLeft(user),
-  },
-});
-  } catch (e: any) {
+    ? {
+        uid: progress.uid,
+        level: progress.level,
+        coins: progress.coins,
+        free_skips_used: progress.free_skips_used,
+        free_hints_used: progress.free_hints_used,
+        free_restarts_used: progress.free_restarts_used,
+      }
+    : null,
+});  
+} catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
