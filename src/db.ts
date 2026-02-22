@@ -68,6 +68,14 @@ CREATE TABLE IF NOT EXISTS users (
 
   updated_at TIMESTAMP DEFAULT NOW()
 );
+await pool.query(`
+  ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS monthly_key TEXT;
+`);
+await pool.query(`
+  ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS monthly_key TEXT;
+`);
     CREATE TABLE IF NOT EXISTS progress (
   uid TEXT PRIMARY KEY,
   level INT DEFAULT 1,
