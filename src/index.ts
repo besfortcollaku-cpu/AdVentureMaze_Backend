@@ -21,6 +21,7 @@ import {
   claimLevelComplete,
   useSkip,
   useHint, 
+  pool,
   getFreeSkipsLeft,
   getFreeHintsLeft,
   closeMonthAndResetCoins,
