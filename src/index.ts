@@ -67,48 +67,45 @@ app.get("/", (_req, res) => res.send("backend up"));
 /* ---------------- /api/me ---------------- */
 app.get("/api/me", async (req, res) => {
   try {
-    const { uid, username } = await requirePiUser(req);
+    const { uid } = await requirePiUser(req);
 
-    let user = await upsertUser({ uid, username });
+    const out = await getUserByUid(uid);
+    let user = out?.user ?? null;
 
-    try {
-      const out = await claimDailyLogin(uid);
-      if (out?.user) user = out.user;
-    } catch {}
+    if (out?.user) user = out.user;
 
     const progress = await getProgressByUid(uid);
 
-res.json({
-  ok: true,
-  user: {
-    ...user,
-    monthly_final_rate: user?.monthly_final_rate ?? 50,
-    monthly_rate_breakdown: user?.monthly_rate_breakdown ?? {},
-    monthly_coins_earned: user?.monthly_coins_earned ?? 0,
-    monthly_login_days: user?.monthly_login_days ?? 0,
-    monthly_levels_completed: user?.monthly_levels_completed ?? 0,
-    monthly_skips_used: user?.monthly_skips_used ?? 0,
-    monthly_hints_used: user?.monthly_hints_used ?? 0,
-    monthly_restarts_used: user?.monthly_restarts_used ?? 0,
-    monthly_ads_watched: user?.monthly_ads_watched ?? 0,
-    monthly_valid_invites: user?.monthly_valid_invites ?? 0,
-  },
-  progress: progress
-  ? {
-      uid: progress.uid,
-      level: progress.level,
-      coins: progress.coins,
-      free_skips_used: progress.free_skips_used,
-      free_hints_used: progress.free_hints_used,
-      free_restarts_used: progress.free_restarts_used,
-    }
-  : null,
-});  
-} catch (e: any) {
+    res.json({
+      ok: true,
+      user: {
+        ...user,
+        monthly_final_rate: user?.monthly_final_rate ?? 50,
+        monthly_rate_breakdown: user?.monthly_rate_breakdown ?? {},
+        monthly_coins_earned: user?.monthly_coins_earned ?? 0,
+        monthly_login_days: user?.monthly_login_days ?? 0,
+        monthly_levels_completed: user?.monthly_levels_completed ?? 0,
+        monthly_skips_used: user?.monthly_skips_used ?? 0,
+        monthly_hints_used: user?.monthly_hints_used ?? 0,
+        monthly_restarts_used: user?.monthly_restarts_used ?? 0,
+        monthly_ads_watched: user?.monthly_ads_watched ?? 0,
+        monthly_valid_invites: user?.monthly_valid_invites ?? 0,
+      },
+      progress: progress
+        ? {
+            uid: progress.uid,
+            level: progress.level,
+            coins: progress.coins,
+            free_skips_used: progress.free_skips_used,
+            free_hints_used: progress.free_hints_used,
+            free_restarts_used: progress.free_restarts_used,
+          }
+        : null,
+    });
+  } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
-
 
 /* ---------------- PROGRESS ---------------- */
 app.get("/progress", async (req,res)=>{
