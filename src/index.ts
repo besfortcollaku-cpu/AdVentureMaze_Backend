@@ -94,15 +94,15 @@ res.json({
     monthly_valid_invites: user?.monthly_valid_invites ?? 0,
   },
   progress: progress
-    ? {
-        uid: progress.uid,
-        level: progress.level,
-        coins: progress.coins,
-        free_skips_used: progress.free_skips_used,
-        free_hints_used: progress.free_hints_used,
-        free_restarts_used: progress.free_restarts_used,
-      }
-    : null,
+  ? {
+      uid: progress.uid,
+      level: progress.level,
+      coins: progress.coins,
+      free_skips_used: progress.free_skips_used,
+      free_hints_used: progress.free_hints_used,
+      free_restarts_used: progress.free_restarts_used,
+    }
+  : null,
 });  
 } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
