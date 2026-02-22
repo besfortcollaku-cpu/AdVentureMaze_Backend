@@ -72,8 +72,6 @@ app.get("/api/me", async (req, res) => {
     const out = await getUserByUid(uid);
     let user = out?.user ?? null;
 
-    if (out?.user) user = out.user;
-
     const progress = await getProgressByUid(uid);
 
     res.json({
