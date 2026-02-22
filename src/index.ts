@@ -227,7 +227,7 @@ app.post("/api/monthly/claim", async (req, res) => {
     await recalcAndStoreMonthlyRate(uid);
 
     const out = await claimMonthlyRewards(uid, { month });
-    res.json({ ok: true, ...out });
+res.json(out);
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message });
   }
