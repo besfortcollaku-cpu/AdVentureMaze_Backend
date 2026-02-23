@@ -1054,42 +1054,7 @@ function prevMonthKey() {
   return monthKeyForDate(prev);
 }
 
-export async function ensureMonthlyKey(uid: string) {
-  const mk = currentMonthKey();
 
-  const { rows } = await pool.query(
-    `SELECT monthly_key FROM users WHERE uid=$1`,
-    [uid]
-  );
-
-  const cur = rows[0]?.monthly_key ? String(rows[0].monthly_key) : null;
-
-  if (cur === mk) return mk;
-
-  await pool.query(
-    `
-    UPDATE users
-    SET
-      monthly_key = $2,
-      monthly_coins_earned = 0,
-      monthly_login_days = 0,
-      monthly_levels_completed = 0,
-      monthly_skips_used = 0,
-      monthly_hints_used = 0,
-      monthly_restarts_used = 0,
-      monthly_ads_watched = 0,
-      monthly_valid_invites = 0,
-      monthly_max_win_streak = 0,
-      monthly_rate_breakdown = '{}'::jsonb,
-      monthly_final_rate = 50,
-      updated_at = NOW()
-    WHERE uid = $1
-    `,
-    [uid, mk]
-  );
-
-  return mk;
-}
 
 export function calcMonthlyRate(u: any) {
   const breakdown: Record<string, number> = {
