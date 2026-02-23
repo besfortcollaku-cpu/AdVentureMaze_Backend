@@ -33,18 +33,21 @@ export async function consumeItem(
 export async function initDB() {
   await pool.query("SELECT 1");
 
-  // USERS TABLE
+  // --- core tables ---
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       uid TEXT PRIMARY KEY,
       username TEXT,
-
       coins INT DEFAULT 0,
 
       free_restarts_used INT DEFAULT 0,
       free_skips_used INT DEFAULT 0,
       free_hints_used INT DEFAULT 0,
 
+      -- monthly rollover bookkeeping (legacy)
+      coins_month TEXT,
+
+      -- NEW monthly key + metrics
       monthly_key TEXT,
       monthly_coins_earned INT DEFAULT 0,
       monthly_login_days INT DEFAULT 0,
@@ -55,23 +58,30 @@ export async function initDB() {
       monthly_ads_watched INT DEFAULT 0,
       monthly_valid_invites INT DEFAULT 0,
       monthly_max_win_streak INT DEFAULT 0,
-
       monthly_rate_breakdown JSONB DEFAULT '{}'::jsonb,
       monthly_final_rate INT DEFAULT 50,
-
-      lifetime_coins_earned INT DEFAULT 0,
-      lifetime_coins_spent INT DEFAULT 0,
-      lifetime_levels_completed INT DEFAULT 0,
-      lifetime_invites_valid INT DEFAULT 0,
 
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
-await pool.query(`
-  ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS monthly_key TEXT;
-`);
-  // PROGRESS TABLE
+
+  // --- upgrades for existing DBs (safe to run every boot) ---
+  await pool.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS monthly_key TEXT,
+      ADD COLUMN IF NOT EXISTS monthly_coins_earned INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS monthly_login_days INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS monthly_levels_completed INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS monthly_skips_used INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS monthly_hints_used INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS monthly_restarts_used INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS monthly_ads_watched INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS monthly_valid_invites INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS monthly_max_win_streak INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS monthly_rate_breakdown JSONB DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS monthly_final_rate INT DEFAULT 50;
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS progress (
       uid TEXT PRIMARY KEY,
@@ -83,7 +93,6 @@ await pool.query(`
     );
   `);
 
-  // REWARD CLAIMS
   await pool.query(`
     CREATE TABLE IF NOT EXISTS reward_claims (
       uid TEXT NOT NULL,
@@ -94,7 +103,6 @@ await pool.query(`
     );
   `);
 
-  // LEVEL REWARDS
   await pool.query(`
     CREATE TABLE IF NOT EXISTS level_rewards (
       uid TEXT NOT NULL,
@@ -103,7 +111,6 @@ await pool.query(`
     );
   `);
 
-  // SESSIONS
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       uid TEXT PRIMARY KEY,
@@ -115,7 +122,6 @@ await pool.query(`
     );
   `);
 
-  // MONTHLY PAYOUTS
   await pool.query(`
     CREATE TABLE IF NOT EXISTS monthly_payouts (
       uid TEXT NOT NULL,
@@ -130,6 +136,17 @@ await pool.query(`
     );
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_ads (
+      uid TEXT NOT NULL,
+      month TEXT NOT NULL,
+      ads_for_coins INT DEFAULT 0,
+      ads_for_skips INT DEFAULT 0,
+      ads_for_hints INT DEFAULT 0,
+      PRIMARY KEY (uid, month)
+    );
+  `);
+}
   // USER ADS
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_ads (
@@ -180,7 +197,40 @@ function currentMonthKey() {
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   return `${y}-${m}`; // e.g. 2026-01
 }
+export async function ensureMonthlyKey(uid: string) {
+  const mk = currentMonthKey();
 
+  // ensure column exists even on old DBs
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS monthly_key TEXT;`);
+
+  const { rows } = await pool.query(
+    `SELECT monthly_key FROM users WHERE uid=$1`,
+    [uid]
+  );
+
+  const existing = rows?.[0]?.monthly_key ? String(rows[0].monthly_key) : "";
+
+  if (existing !== mk) {
+    await pool.query(
+      `UPDATE users
+       SET monthly_key=$2,
+           monthly_coins_earned=0,
+           monthly_login_days=0,
+           monthly_levels_completed=0,
+           monthly_skips_used=0,
+           monthly_hints_used=0,
+           monthly_restarts_used=0,
+           monthly_ads_watched=0,
+           monthly_valid_invites=0,
+           monthly_max_win_streak=0,
+           monthly_rate_breakdown='{}'::jsonb,
+           monthly_final_rate=COALESCE(monthly_final_rate,50),
+           updated_at=NOW()
+       WHERE uid=$1`,
+      [uid, mk]
+    );
+  }
+}
 export function monthKeyForDate(d: Date) {
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
