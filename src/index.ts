@@ -158,6 +158,10 @@ function getBearerToken(req: express.Request) {
 }
 
 async function verifyPiAccessToken(accessToken: string) {
+  console.log("---- VERIFY PI TOKEN ----");
+  console.log("TOKEN:", accessToken);
+  console.log("TOKEN LENGTH:", accessToken?.length);
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 3000);
 
@@ -167,11 +171,19 @@ async function verifyPiAccessToken(accessToken: string) {
       signal: controller.signal,
     });
 
+    console.log("PI STATUS:", r.status);
+
+    const text = await r.text();
+    console.log("PI RAW RESPONSE:", text);
+
     if (!r.ok) {
       throw new Error("Invalid Pi access token");
     }
 
-    return await r.json();
+    return JSON.parse(text);
+  } catch (err) {
+    console.error("VERIFY ERROR:", err);
+    throw err;
   } finally {
     clearTimeout(timeout);
   }
