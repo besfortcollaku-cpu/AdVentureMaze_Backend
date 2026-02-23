@@ -67,6 +67,7 @@ app.get("/", (_req, res) => res.send("backend up"));
 
 /* ---------------- /api/me ---------------- */
 app.get("/api/me", async (req, res) => {
+res.set("Cache-Control", "no-store");
   try {
     const { uid } = await requirePiUser(req);
 
