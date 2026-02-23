@@ -147,18 +147,7 @@ export async function initDB() {
     );
   `);
 }
-  // USER ADS
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS user_ads (
-      uid TEXT NOT NULL,
-      month TEXT NOT NULL,
-      ads_for_coins INT DEFAULT 0,
-      ads_for_skips INT DEFAULT 0,
-      ads_for_hints INT DEFAULT 0,
-      PRIMARY KEY (uid, month)
-    );
-  `);
-}
+
 
 /* =====================================================
    CONSTANTS
