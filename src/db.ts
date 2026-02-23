@@ -231,6 +231,7 @@ export async function ensureMonthlyKey(uid: string) {
     );
   }
 }
+
 export function monthKeyForDate(d: Date) {
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
