@@ -114,13 +114,13 @@ const user = rows[0] ?? null;
 });
 
 /* ---------------- PROGRESS ---------------- */
-app.get("/progress", async (req,res)=>{
+app.get("/api/progress", async (req,res)=>{
   const uid = String(req.query.uid||"");
   const p = await getProgressByUid(uid);
   res.json({ ok:true, data:p ?? {uid,level:1,coins:0} });
 });
 
-app.post("/progress", async (req, res) => {
+app.post("/api/progress", async (req, res) => {
   const { uid } = await requirePiUser(req);
 
   const { level, coins, paintedKeys, resume } = req.body;
