@@ -145,8 +145,9 @@ app.post("/api/progress", async (req, res) => {
 
     res.json({ ok: true });
   } catch (e) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+  const message = e instanceof Error ? e.message : "Unknown error";
+  res.status(400).json({ ok: false, error: message });
+}
 });
 app.patch("/api/user/username", async (req, res) => {
   try {
