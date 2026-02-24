@@ -170,7 +170,7 @@ app.patch("/api/user/username", async (req, res) => {
       [username, uid]
     );
 
-    if (existing.rowCount > 0) {
+    if ((existing.rowCount ?? 0) > 0) {
       return res.status(400).json({ ok: false, error: "Username already taken" });
     }
 
