@@ -114,6 +114,26 @@ progress: progress
   }
 });
 
+
+app.patch("/api/user/username", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const { username } = req.body;
+
+    if (!username || username.length < 3 || username.length > 20) {
+      return res.status(400).json({ ok: false, error: "Invalid username" });
+    }
+
+    await pool.query(
+      `UPDATE users SET username=$1 WHERE uid=$2`,
+      [username, uid]
+    );
+
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(401).json({ ok: false, error: e.message });
+  }
+});
 /* ---------------- PROGRESS ---------------- */
 app.get("/api/progress", async (req,res)=>{
   const uid = String(req.query.uid||"");
