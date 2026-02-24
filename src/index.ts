@@ -86,6 +86,9 @@ const user = rows[0] ?? null;
         uid: user.uid,
         username: user.username,
         coins: user.coins,
+        free_skips_used: user.free_skips_used ?? 0,
+      free_hints_used: user.free_hints_used ?? 0,
+      free_restarts_used: user.free_restarts_used ?? 0,
         monthly_final_rate: user.monthly_final_rate ?? 50,
         monthly_rate_breakdown: user.monthly_rate_breakdown ?? {},
         monthly_coins_earned: user.monthly_coins_earned ?? 0,
@@ -98,16 +101,13 @@ const user = rows[0] ?? null;
         monthly_valid_invites: user.monthly_valid_invites ?? 0,
       }
     : null,
-  progress: progress
-    ? {
-        uid: progress.uid,
-        level: progress.level,
-        coins: progress.coins,
-        free_skips_used: progress.free_skips_used,
-        free_hints_used: progress.free_hints_used,
-        free_restarts_used: progress.free_restarts_used,
-      }
-    : null,
+progress: progress
+  ? {
+      uid: progress.uid,
+      level: progress.level,
+      coins: progress.coins,
+    }
+  : null,
 });
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
