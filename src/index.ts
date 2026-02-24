@@ -123,7 +123,31 @@ res.json({
   }
 });
 
+app.post("/api/progress", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const { level, coins, paintedKeys, resume } = req.body;
 
+    await pool.query(
+      `
+      INSERT INTO progress (uid, level, coins, painted_keys, resume)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (uid)
+      DO UPDATE SET
+        level = EXCLUDED.level,
+        coins = EXCLUDED.coins,
+        painted_keys = EXCLUDED.painted_keys,
+        resume = EXCLUDED.resume,
+        updated_at = NOW()
+      `,
+      [uid, level, coins, paintedKeys, resume]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
 app.patch("/api/user/username", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
