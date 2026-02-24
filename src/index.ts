@@ -79,16 +79,20 @@ const user = rows[0] ?? null;
 
     const progress = await getProgressByUid(uid);
 
-    res.json({
+res.json({
   ok: true,
+
   user: user
     ? {
         uid: user.uid,
         username: user.username,
         coins: user.coins,
-        free_skips_used: user.free_skips_used ?? 0,
-      free_hints_used: user.free_hints_used ?? 0,
-      free_restarts_used: user.free_restarts_used ?? 0,
+
+        // 🔹 paid balances (wallet)
+        skips_balance: user.skips_balance ?? 0,
+        hints_balance: user.hints_balance ?? 0,
+        restarts_balance: user.restarts_balance ?? 0,
+
         monthly_final_rate: user.monthly_final_rate ?? 50,
         monthly_rate_breakdown: user.monthly_rate_breakdown ?? {},
         monthly_coins_earned: user.monthly_coins_earned ?? 0,
@@ -101,15 +105,20 @@ const user = rows[0] ?? null;
         monthly_valid_invites: user.monthly_valid_invites ?? 0,
       }
     : null,
-progress: progress
-  ? {
-      uid: progress.uid,
-      level: progress.level,
-      coins: progress.coins,
-    }
-  : null,
-});
-  } catch (e: any) {
+
+  progress: progress
+    ? {
+        uid: progress.uid,
+        level: progress.level,
+        coins: progress.coins,
+
+        // 🔹 free usage counters
+        free_skips_used: progress.free_skips_used ?? 0,
+        free_hints_used: progress.free_hints_used ?? 0,
+        free_restarts_used: progress.free_restarts_used ?? 0,
+      }
+    : null,
+});  } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
@@ -135,26 +144,46 @@ app.patch("/api/user/username", async (req, res) => {
   }
 });
 /* ---------------- PROGRESS ---------------- */
-app.get("/api/progress", async (req,res)=>{
-  const uid = String(req.query.uid||"");
-  const p = await getProgressByUid(uid);
-  res.json({ ok:true, data:p ?? {uid,level:1,coins:0} });
-});
+app.patch("/api/user/username", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    let { username } = req.body;
 
-app.post("/api/progress", async (req, res) => {
-  const { uid } = await requirePiUser(req);
+    if (typeof username !== "string") {
+      return res.status(400).json({ ok: false, error: "Invalid username" });
+    }
 
-  const { level, coins, paintedKeys, resume } = req.body;
+    username = username.trim();
 
-  await setProgressByUid({
-    uid,
-    level,
-    coins,
-    paintedKeys,
-    resume,
-  });
+    if (username.length < 3 || username.length > 20) {
+      return res.status(400).json({ ok: false, error: "Username must be 3–20 characters" });
+    }
 
-  res.json({ ok: true });
+    // allow only letters, numbers, underscore
+    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+      return res.status(400).json({ ok: false, error: "Only letters, numbers and underscore allowed" });
+    }
+
+    // prevent duplicate usernames
+    const existing = await pool.query(
+      `SELECT uid FROM users WHERE LOWER(username)=LOWER($1) AND uid<>$2`,
+      [username, uid]
+    );
+
+    if (existing.rowCount > 0) {
+      return res.status(400).json({ ok: false, error: "Username already taken" });
+    }
+
+    await pool.query(
+      `UPDATE users SET username=$1 WHERE uid=$2`,
+      [username, uid]
+    );
+
+    res.json({ ok: true, username });
+
+  } catch (e: any) {
+    res.status(401).json({ ok: false, error: e.message });
+  }
 });
 /* ---------------- HELPERS ---------------- */
 async function requirePiUser(req: express.Request) {
@@ -301,51 +330,222 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
     res.status(400).json({ok:false,error:e.message});
   }
 });
-
-app.post("/api/restart", async (req,res)=>{
-  try{
+app.post("/api/restart", async (req, res) => {
+  try {
     const { uid } = await requirePiUser(req);
-    const mode = String(req.body?.mode || "free");
-    const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
-    const out = await consumeItem(uid, "restart", mode as SpendMode, nonce);
-    const u = out?.user;
+
+    await pool.query("BEGIN");
+
+    const userRes = await pool.query(
+      `SELECT restarts_balance FROM users WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+
+    const progressRes = await pool.query(
+      `SELECT free_restarts_used FROM progress WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    const progress = progressRes.rows[0];
+
+    if (!user || !progress) {
+      throw new Error("User or progress not found");
+    }
+
+    const FREE_RESTART_LIMIT = 3;
+    let usedFree = false;
+
+    if ((progress.free_restarts_used ?? 0) < FREE_RESTART_LIMIT) {
+      await pool.query(
+        `UPDATE progress
+         SET free_restarts_used = free_restarts_used + 1
+         WHERE uid=$1`,
+        [uid]
+      );
+      usedFree = true;
+    }
+    else if ((user.restarts_balance ?? 0) > 0) {
+      await pool.query(
+        `UPDATE users
+         SET restarts_balance = restarts_balance - 1
+         WHERE uid=$1`,
+        [uid]
+      );
+    }
+    else {
+      throw new Error("No restarts available");
+    }
+
+    await pool.query("COMMIT");
+
+    const updatedUser = await pool.query(
+      `SELECT restarts_balance FROM users WHERE uid=$1`,
+      [uid]
+    );
+
+    const updatedProgress = await pool.query(
+      `SELECT free_restarts_used FROM progress WHERE uid=$1`,
+      [uid]
+    );
+
     res.json({
-  ...out,
-  free: u
-    ? {
-        restart_left: Math.max(0, 3 - (u.free_restarts_used || 0)),
-        hints_left: Math.max(0, 3 - (u.free_hints_used || 0)),
-      }
-    : undefined,
-});
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
+      ok: true,
+      free_restarts_used: updatedProgress.rows[0].free_restarts_used,
+      restarts_balance: updatedUser.rows[0].restarts_balance,
+      usedFree
+    });
+
+  } catch (e: any) {
+    await pool.query("ROLLBACK");
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 app.post("/api/skip", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-    const { mode, nonce } = req.body || {};
 
-    const out = await consumeItem(uid, "skip", mode as SpendMode, nonce);
-    res.json(out);
+    await pool.query("BEGIN");
+
+    // Lock user + progress rows
+    const userRes = await pool.query(
+      `SELECT skips_balance FROM users WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+    const progressRes = await pool.query(
+      `SELECT free_skips_used FROM progress WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    const progress = progressRes.rows[0];
+
+    if (!user || !progress) {
+      throw new Error("User or progress not found");
+    }
+
+    const FREE_SKIP_LIMIT = 3;
+
+    let usedFree = false;
+
+    if ((progress.free_skips_used ?? 0) < FREE_SKIP_LIMIT) {
+      // consume free
+      await pool.query(
+        `UPDATE progress
+         SET free_skips_used = free_skips_used + 1
+         WHERE uid=$1`,
+        [uid]
+      );
+      usedFree = true;
+    } 
+    else if ((user.skips_balance ?? 0) > 0) {
+      // consume paid
+      await pool.query(
+        `UPDATE users
+         SET skips_balance = skips_balance - 1
+         WHERE uid=$1`,
+        [uid]
+      );
+    } 
+    else {
+      throw new Error("No skips available");
+    }
+
+    await pool.query("COMMIT");
+
+    // return fresh values
+    const updatedUser = await pool.query(
+      `SELECT skips_balance FROM users WHERE uid=$1`,
+      [uid]
+    );
+    const updatedProgress = await pool.query(
+      `SELECT free_skips_used FROM progress WHERE uid=$1`,
+      [uid]
+    );
+
+    res.json({
+      ok: true,
+      free_skips_used: updatedProgress.rows[0].free_skips_used,
+      skips_balance: updatedUser.rows[0].skips_balance,
+      usedFree
+    });
+
   } catch (e: any) {
+    await pool.query("ROLLBACK");
     res.status(400).json({ ok: false, error: e.message });
   }
 });
-
 app.post("/api/hint", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-    const { mode, nonce } = req.body || {};
 
-    const out = await consumeItem(uid, "hint", mode as SpendMode, nonce);
-    res.json(out);
+    await pool.query("BEGIN");
+
+    const userRes = await pool.query(
+      `SELECT hints_balance FROM users WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+
+    const progressRes = await pool.query(
+      `SELECT free_hints_used FROM progress WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    const progress = progressRes.rows[0];
+
+    if (!user || !progress) {
+      throw new Error("User or progress not found");
+    }
+
+    const FREE_HINT_LIMIT = 3;
+    let usedFree = false;
+
+    if ((progress.free_hints_used ?? 0) < FREE_HINT_LIMIT) {
+      await pool.query(
+        `UPDATE progress
+         SET free_hints_used = free_hints_used + 1
+         WHERE uid=$1`,
+        [uid]
+      );
+      usedFree = true;
+    }
+    else if ((user.hints_balance ?? 0) > 0) {
+      await pool.query(
+        `UPDATE users
+         SET hints_balance = hints_balance - 1
+         WHERE uid=$1`,
+        [uid]
+      );
+    }
+    else {
+      throw new Error("No hints available");
+    }
+
+    await pool.query("COMMIT");
+
+    const updatedUser = await pool.query(
+      `SELECT hints_balance FROM users WHERE uid=$1`,
+      [uid]
+    );
+
+    const updatedProgress = await pool.query(
+      `SELECT free_hints_used FROM progress WHERE uid=$1`,
+      [uid]
+    );
+
+    res.json({
+      ok: true,
+      free_hints_used: updatedProgress.rows[0].free_hints_used,
+      hints_balance: updatedUser.rows[0].hints_balance,
+      usedFree
+    });
+
   } catch (e: any) {
+    await pool.query("ROLLBACK");
     res.status(400).json({ ok: false, error: e.message });
   }
 });
-
 /* ---------------- ADMIN: month close ---------------- */
 app.post("/admin/month-close", async (req,res)=>{
   try{
