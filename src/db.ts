@@ -35,7 +35,7 @@ export async function initDB() {
 
   // --- core tables ---
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
+    CREATE TABLE IF NOT EXISTS public.users (
       uid TEXT PRIMARY KEY,
       username TEXT,
       coins INT DEFAULT 0,
@@ -67,7 +67,7 @@ export async function initDB() {
 
   // --- upgrades for existing DBs (safe to run every boot) ---
   await pool.query(`
-    ALTER TABLE users
+    ALTER TABLE public.users
       ADD COLUMN IF NOT EXISTS monthly_key TEXT,
       ADD COLUMN IF NOT EXISTS monthly_coins_earned INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS monthly_login_days INT DEFAULT 0,
@@ -190,10 +190,10 @@ export async function ensureMonthlyKey(uid: string) {
   const mk = currentMonthKey();
 
   // ensure column exists even on old DBs
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS monthly_key TEXT;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS monthly_key TEXT;`);
 
   const { rows } = await pool.query(
-    `SELECT monthly_key FROM users WHERE uid=$1`,
+    `SELECT monthly_key FROM public.users WHERE uid=$1`,
     [uid]
   );
 
@@ -201,7 +201,7 @@ export async function ensureMonthlyKey(uid: string) {
 
   if (existing !== mk) {
     await pool.query(
-      `UPDATE users
+      `UPDATE public.users
        SET monthly_key=$2,
            monthly_coins_earned=0,
            monthly_login_days=0,
@@ -244,7 +244,7 @@ export async function closeMonthAndResetCoins(opts?: { month?: string }) {
 
     const { rows } = await client.query(
       `SELECT uid, COALESCE(coins,0)::int AS coins
-       FROM users
+       FROM public.users
        WHERE COALESCE(coins,0) <> 0
        FOR UPDATE`,
     );
@@ -263,7 +263,7 @@ export async function closeMonthAndResetCoins(opts?: { month?: string }) {
 
       // reset coins (idempotent)
       await client.query(
-        `UPDATE users
+        `UPDATE public.users
          SET coins = 0,
              coins_month = $2,
              updated_at = NOW()
@@ -308,7 +308,7 @@ export async function upsertUser({
 }: { uid: string; username: string; }) {
   const { rows } = await pool.query(
     `
-    INSERT INTO users (uid, username, updated_at)
+    INSERT INTO public.users (uid, username, updated_at)
     VALUES ($1,$2,NOW())
     ON CONFLICT (uid)
     DO UPDATE SET
@@ -323,7 +323,7 @@ export async function upsertUser({
 
 export async function getUserByUid(uid: string) {
   const { rows } = await pool.query(
-    `SELECT * FROM users WHERE uid=$1`,
+    `SELECT * FROM public.users WHERE uid=$1`,
     [uid]
   );
   return rows[0] || null;
@@ -333,7 +333,7 @@ export async function addCoins(uid: string, delta: number) {
 
   const { rows } = await pool.query(
     `
-    UPDATE users
+    UPDATE public.users
     SET
       coins = COALESCE(coins,0) + $2,
       monthly_coins_earned = COALESCE(monthly_coins_earned,0) + GREATEST($2,0),
@@ -353,7 +353,7 @@ export async function spendCoins(uid: string, amount: number) {
 
   const { rows } = await pool.query(
     `
-    UPDATE users
+    UPDATE public.users
 SET
   coins = COALESCE(coins,0) - $2,
   lifetime_coins_spent = COALESCE(lifetime_coins_spent,0) + $2,
@@ -445,7 +445,7 @@ export async function claimReward({
   const user = await addCoins(uid, amount);
   if (type === "ad_50" || type === "ad") {
   await pool.query(
-    `UPDATE users SET monthly_ads_watched = COALESCE(monthly_ads_watched,0) + 1 WHERE uid=$1`,
+    `UPDATE public.users SET monthly_ads_watched = COALESCE(monthly_ads_watched,0) + 1 WHERE uid=$1`,
     [uid]
   );
   await recalcAndStoreMonthlyRate(uid);
@@ -475,7 +475,7 @@ export async function claimDailyLogin(uid: string) {
 
   const user = await addCoins(uid, 5);
   await pool.query(
-  `UPDATE users SET monthly_login_days = COALESCE(monthly_login_days,0) + 1 WHERE uid=$1`,
+  `UPDATE public.users SET monthly_login_days = COALESCE(monthly_login_days,0) + 1 WHERE uid=$1`,
   [uid]
 );
 await recalcAndStoreMonthlyRate(uid);
@@ -500,7 +500,7 @@ export async function claimLevelComplete(uid: string, level: number) {
   const user = await addCoins(uid, 1);
   await pool.query(
   `
-  UPDATE users
+  UPDATE public.users
   SET
     monthly_levels_completed = COALESCE(monthly_levels_completed,0) + 1,
     lifetime_levels_completed = COALESCE(lifetime_levels_completed,0) + 1
@@ -530,7 +530,7 @@ export async function useRestarts(
   }
 
   const { rows } = await pool.query(
-    `UPDATE users
+    `UPDATE public.users
      SET free_restarts_used = free_restarts_used + 1,
          updated_at = NOW()
      WHERE uid = $1
@@ -570,7 +570,7 @@ export async function useSkip(
     }
 
     const { rows } = await pool.query(
-      `UPDATE users
+      `UPDATE public.users
        SET free_skips_used = free_skips_used + 1,
            updated_at = NOW()
        WHERE uid=$1
@@ -579,7 +579,7 @@ export async function useSkip(
     );
 await pool.query(
     `
-    UPDATE users
+    UPDATE public.users
     SET monthly_skips_used = COALESCE(monthly_skips_used,0) + 1
     WHERE uid=$1
     `,
@@ -601,7 +601,7 @@ await pool.query(
     );
 await pool.query(
     `
-    UPDATE users
+    UPDATE public.users
     SET monthly_skips_used = COALESCE(monthly_skips_used,0) + 1
     WHERE uid=$1
     `,
@@ -634,7 +634,7 @@ await pool.query(
     await trackAdView(uid, "skips");
     await pool.query(
     `
-    UPDATE users
+    UPDATE public.users
     SET
       monthly_skips_used = COALESCE(monthly_skips_used,0) + 1,
       monthly_ads_watched = COALESCE(monthly_ads_watched,0) + 1
@@ -658,7 +658,7 @@ export async function useHint(uid: string, mode: SpendMode, nonce?: string) {
   if (mode === "free") {
     if (getFreeHintsLeft(user) <= 0) throw new Error("No free hints left");
     const { rows } = await pool.query(
-      `UPDATE users
+      `UPDATE public.users
        SET free_hints_used = COALESCE(free_hints_used,0) + 1,
            updated_at=NOW()
        WHERE uid=$1
@@ -764,7 +764,7 @@ export async function adminListUsers({
     const { rows } = await pool.query(
       `
       SELECT *
-      FROM users
+      FROM public.users
       WHERE username ILIKE '%' || $1 || '%'
          OR uid ILIKE '%' || $1 || '%'
       ORDER BY updated_at DESC
@@ -776,7 +776,7 @@ export async function adminListUsers({
     const { rows: c } = await pool.query(
       `
       SELECT COUNT(*)
-      FROM users
+      FROM public.users
       WHERE username ILIKE '%' || $1 || '%'
          OR uid ILIKE '%' || $1 || '%'
     `,
@@ -792,14 +792,14 @@ export async function adminListUsers({
   const { rows } = await pool.query(
     `
     SELECT *
-    FROM users
+    FROM public.users
     ORDER BY updated_at DESC
     LIMIT $1 OFFSET $2
   `,
     [limit, offset]
   );
 
-  const { rows: c } = await pool.query(`SELECT COUNT(*) FROM users`);
+  const { rows: c } = await pool.query(`SELECT COUNT(*) FROM public.users`);
   return { rows, count: Number(c[0].count) };
 }
 
@@ -828,7 +828,7 @@ export async function adminGetUser(uid: string) {
 export async function adminResetFreeCounters(uid: string) {
   const { rows } = await pool.query(
     `
-    UPDATE users
+    UPDATE public.users
     SET free_skips_used=0, free_hints_used=0
     WHERE uid=$1
     RETURNING *
@@ -840,7 +840,7 @@ export async function adminResetFreeCounters(uid: string) {
 export async function adminDeleteUser(uid: string) {
   // delete user
   await pool.query(
-    `DELETE FROM users WHERE uid = $1`,
+    `DELETE FROM public.users WHERE uid = $1`,
     [uid]
   );
 
@@ -859,8 +859,8 @@ export async function adminDeleteUser(uid: string) {
   return { ok: true };
 }
 export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }) {
-  const users = await pool.query(`SELECT COUNT(*) FROM users`);
-  const coins = await pool.query(`SELECT SUM(coins) FROM users`);
+  const public.users = await pool.query(`SELECT COUNT(*) FROM public.users`);
+  const coins = await pool.query(`SELECT SUM(coins) FROM public.users`);
   const online = await pool.query(
     `
     SELECT COUNT(*) FROM sessions
@@ -893,7 +893,7 @@ export async function adminListOnlineUsers({
     SELECT u.uid,u.username,u.coins,
            s.last_seen_at,s.started_at,s.user_agent
     FROM sessions s
-    JOIN users u ON u.uid=s.uid
+    JOIN public.users u ON u.uid=s.uid
     WHERE s.last_seen_at > NOW() - ($1 || ' minutes')::interval
     ORDER BY s.last_seen_at DESC
     LIMIT $2 OFFSET $3
@@ -1121,7 +1121,7 @@ export function calcMonthlyRate(u: any) {
 }
 
 export async function recalcAndStoreMonthlyRate(uid: string) {
-  const { rows } = await pool.query(`SELECT * FROM users WHERE uid=$1`, [uid]);
+  const { rows } = await pool.query(`SELECT * FROM public.users WHERE uid=$1`, [uid]);
   const u = rows[0];
   if (!u) throw new Error("User not found");
 
@@ -1129,7 +1129,7 @@ export async function recalcAndStoreMonthlyRate(uid: string) {
 
   const { rows: updated } = await pool.query(
     `
-    UPDATE users
+    UPDATE public.users
     SET
       monthly_rate_breakdown = $2::jsonb,
       monthly_final_rate = $3,
@@ -1152,7 +1152,7 @@ export async function claimMonthlyRewards(uid: string, opts?: { month?: string }
 
     // lock user
     const { rows } = await client.query(
-      `SELECT * FROM users WHERE uid=$1 FOR UPDATE`,
+      `SELECT * FROM public.users WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
     const u = rows[0];
@@ -1175,7 +1175,7 @@ export async function claimMonthlyRewards(uid: string, opts?: { month?: string }
     // reset coins + monthly stats
     await client.query(
       `
-      UPDATE users
+      UPDATE public.users
       SET
         coins = 0,
         monthly_key = $2,
