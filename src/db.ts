@@ -859,7 +859,7 @@ export async function adminDeleteUser(uid: string) {
   return { ok: true };
 }
 export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }) {
-  const public.users = await pool.query(`SELECT COUNT(*) FROM public.users`);
+  const users = await pool.query(`SELECT COUNT(*) FROM public.users`);
   const coins = await pool.query(`SELECT SUM(coins) FROM public.users`);
   const online = await pool.query(
     `
