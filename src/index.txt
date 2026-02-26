@@ -14,16 +14,20 @@ import {
   upsertUser,
   getProgressByUid,
   setProgressByUid,
-
+  consumeItem,
+  SpendMode,
   claimReward,
   claimDailyLogin,
   claimLevelComplete,
   useSkip,
-  useHint,
+  useHint, 
+  pool,
   getFreeSkipsLeft,
   getFreeHintsLeft,
-
   closeMonthAndResetCoins,
+  ensureMonthlyKey,
+claimMonthlyRewards,
+recalcAndStoreMonthlyRate,
 
   // sessions / admin
   adminListUsers,
@@ -36,10 +40,11 @@ import {
   adminGetStats,
   adminListOnlineUsers,
   adminResetFreeCounters,
-  // ✅ charts
+  // ✅ charts1
   adminChartCoins,
   adminChartActiveUsers,
 } from "./db";
+
 
 const app = express();
 
@@ -63,48 +68,147 @@ app.get("/", (_req, res) => res.send("backend up"));
 
 /* ---------------- /api/me ---------------- */
 app.get("/api/me", async (req, res) => {
+res.set("Cache-Control", "no-store");
   try {
-    const { uid, username } = await requirePiUser(req);
+    const { uid } = await requirePiUser(req);
 
-    let user = await upsertUser({ uid, username });
-
-    try {
-      const out = await claimDailyLogin(uid);
-      if (out?.user) user = out.user;
-    } catch {}
+    const { rows } = await pool.query(
+  `SELECT * FROM public.users WHERE uid=$1`,
+  [uid]
+);
+const user = rows[0] ?? null;
 
     const progress = await getProgressByUid(uid);
 
-    res.json({
+res.json({
   ok: true,
-  user,
-  progress: progress ?? { uid, level: 1, coins: 0 },
-  free: {
-    restarts_left: Math.max(0, 3 - Number(user?.free_restarts_used || 0)),
-    skips_left: getFreeSkipsLeft(user),
-    hints_left: getFreeHintsLeft(user),
-  },
-});
-  } catch (e: any) {
+
+  user: user
+    ? {
+        uid: user.uid,
+        username: user.username,
+        coins: user.coins,
+
+        // 🔹 paid balances (wallet)
+        skips_balance: user.skips_balance ?? 0,
+        hints_balance: user.hints_balance ?? 0,
+        restarts_balance: user.restarts_balance ?? 0,
+        free_skips_used: user.free_skips_used ?? 0,
+free_hints_used: user.free_hints_used ?? 0,
+free_restarts_used: user.free_restarts_used ?? 0,
+
+        monthly_final_rate: user.monthly_final_rate ?? 50,
+        monthly_rate_breakdown: user.monthly_rate_breakdown ?? {},
+        monthly_coins_earned: user.monthly_coins_earned ?? 0,
+        monthly_login_days: user.monthly_login_days ?? 0,
+        monthly_levels_completed: user.monthly_levels_completed ?? 0,
+        monthly_skips_used: user.monthly_skips_used ?? 0,
+        monthly_hints_used: user.monthly_hints_used ?? 0,
+        monthly_restarts_used: user.monthly_restarts_used ?? 0,
+        monthly_ads_watched: user.monthly_ads_watched ?? 0,
+        monthly_valid_invites: user.monthly_valid_invites ?? 0,
+      }
+    : null,
+
+  progress: progress
+    ? {
+        uid: progress.uid,
+        level: progress.level,
+        coins: progress.coins,
+      }
+    : null,
+});  } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
 
+app.post("/api/progress", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const { level, coins, paintedKeys, resume } = req.body;
 
+    await pool.query(
+      `
+      INSERT INTO progress (uid, level, coins, painted_keys, resume)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (uid)
+      DO UPDATE SET
+        level = EXCLUDED.level,
+        coins = EXCLUDED.coins,
+        painted_keys = EXCLUDED.painted_keys,
+        resume = EXCLUDED.resume,
+        updated_at = NOW()
+      `,
+      [uid, level, coins, paintedKeys, resume]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+  const message = e instanceof Error ? e.message : "Unknown error";
+  res.status(400).json({ ok: false, error: message });
+}
+});
+app.patch("/api/user/username", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const { username } = req.body;
+
+    if (!username || username.length < 3 || username.length > 20) {
+      return res.status(400).json({ ok: false, error: "Invalid username" });
+    }
+
+    await pool.query(
+      `UPDATE public.users SET username=$1 WHERE uid=$2`,
+      [username, uid]
+    );
+
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(401).json({ ok: false, error: e.message });
+  }
+});
 /* ---------------- PROGRESS ---------------- */
-app.get("/progress", async (req,res)=>{
-  const uid = String(req.query.uid||"");
-  const p = await getProgressByUid(uid);
-  res.json({ ok:true, data:p ?? {uid,level:1,coins:0} });
-});
+app.patch("/api/user/username", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    let { username } = req.body;
 
-app.post("/progress", async (req,res)=>{
-  await requirePiUser(req);
-  const { uid, level, coins } = req.body;
-  await setProgressByUid({ uid, level, coins });
-  res.json({ ok:true });
-});
+    if (typeof username !== "string") {
+      return res.status(400).json({ ok: false, error: "Invalid username" });
+    }
 
+    username = username.trim();
+
+    if (username.length < 3 || username.length > 20) {
+      return res.status(400).json({ ok: false, error: "Username must be 3–20 characters" });
+    }
+
+    // allow only letters, numbers, underscore
+    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+      return res.status(400).json({ ok: false, error: "Only letters, numbers and underscore allowed" });
+    }
+
+    // prevent duplicate usernames
+    const existing = await pool.query(
+      `SELECT uid FROM public.users WHERE LOWER(username)=LOWER($1) AND uid<>$2`,
+      [username, uid]
+    );
+
+    if ((existing.rowCount ?? 0) > 0) {
+      return res.status(400).json({ ok: false, error: "Username already taken" });
+    }
+
+    await pool.query(
+      `UPDATE public.users SET username=$1 WHERE uid=$2`,
+      [username, uid]
+    );
+
+    res.json({ ok: true, username });
+
+  } catch (e: any) {
+    res.status(401).json({ ok: false, error: e.message });
+  }
+});
 /* ---------------- HELPERS ---------------- */
 async function requirePiUser(req: express.Request) {
   const token = getBearerToken(req);
@@ -114,19 +218,24 @@ async function requirePiUser(req: express.Request) {
   const uid = String(piUser.uid);
   const username = String(piUser.username);
 
-  await upsertUser({ uid, username });
+await upsertUser({ uid, username });
 
-  // mark user online on ANY request
-  await touchUserOnline(uid);
+await ensureMonthlyKey(uid);
 
-  return { uid, username };
+// mark user online on ANY request
+await touchUserOnline(uid);
+
+return { uid, username };
 }
-
 function getBearerToken(req: express.Request) {
   return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
 }
 
 async function verifyPiAccessToken(accessToken: string) {
+  console.log("---- VERIFY PI TOKEN ----");
+  console.log("TOKEN:", accessToken);
+  console.log("TOKEN LENGTH:", accessToken?.length);
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 3000);
 
@@ -136,11 +245,19 @@ async function verifyPiAccessToken(accessToken: string) {
       signal: controller.signal,
     });
 
+    console.log("PI STATUS:", r.status);
+
+    const text = await r.text();
+    console.log("PI RAW RESPONSE:", text);
+
     if (!r.ok) {
       throw new Error("Invalid Pi access token");
     }
 
-    return await r.json();
+    return JSON.parse(text);
+  } catch (err) {
+    console.error("VERIFY ERROR:", err);
+    throw err;
   } finally {
     clearTimeout(timeout);
   }
@@ -152,7 +269,7 @@ app.post("/api/consume", async (req, res) => {
     const { uid } = await requirePiUser(req);
     const { item, mode, nonce } = req.body || {};
 
-    const out = await consumeItem(uid, item, mode, nonce);
+    const out = await consumeItem(uid, item, mode as SpendMode, nonce);
     res.json(out);
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message });
@@ -186,6 +303,21 @@ app.post("/api/pi/verify", async (req, res) => {
   }
 });
 
+
+app.post("/api/monthly/claim", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const month = req.body?.month ? String(req.body.month) : undefined;
+
+    // recalc before snapshot
+    await recalcAndStoreMonthlyRate(uid);
+
+    const out = await claimMonthlyRewards(uid, { month });
+res.json(out);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
 
 /* ---------------- REWARDS ---------------- */
 app.post("/api/rewards/ad-50", async (req,res)=>{
@@ -222,51 +354,222 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
     res.status(400).json({ok:false,error:e.message});
   }
 });
-
-app.post("/api/restart", async (req,res)=>{
-  try{
+app.post("/api/restart", async (req, res) => {
+  try {
     const { uid } = await requirePiUser(req);
-    const mode = String(req.body?.mode || "free");
-    const nonce = req.body?.nonce ? String(req.body.nonce) : undefined;
-    const out = await consumeItem(uid, "restart", mode, nonce);
-    const u = out?.user;
+
+    await pool.query("BEGIN");
+
+    const userRes = await pool.query(
+      `SELECT restarts_balance FROM public.users WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+
+    const progressRes = await pool.query(
+      `SELECT free_restarts_used FROM progress WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    const progress = progressRes.rows[0];
+
+    if (!user || !progress) {
+      throw new Error("User or progress not found");
+    }
+
+    const FREE_RESTART_LIMIT = 3;
+    let usedFree = false;
+
+    if ((progress.free_restarts_used ?? 0) < FREE_RESTART_LIMIT) {
+      await pool.query(
+        `UPDATE progress
+         SET free_restarts_used = free_restarts_used + 1
+         WHERE uid=$1`,
+        [uid]
+      );
+      usedFree = true;
+    }
+    else if ((user.restarts_balance ?? 0) > 0) {
+      await pool.query(
+        `UPDATE public.users
+         SET restarts_balance = restarts_balance - 1
+         WHERE uid=$1`,
+        [uid]
+      );
+    }
+    else {
+      throw new Error("No restarts available");
+    }
+
+    await pool.query("COMMIT");
+
+    const updatedUser = await pool.query(
+      `SELECT restarts_balance FROM public.users WHERE uid=$1`,
+      [uid]
+    );
+
+    const updatedProgress = await pool.query(
+      `SELECT free_restarts_used FROM progress WHERE uid=$1`,
+      [uid]
+    );
+
     res.json({
-  ...out,
-  free: u
-    ? {
-        restart_left: Math.max(0, 3 - (u.free_restarts_used || 0)),
-        hints_left: Math.max(0, 3 - (u.free_hints_used || 0)),
-      }
-    : undefined,
-});
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
+      ok: true,
+      free_restarts_used: updatedProgress.rows[0].free_restarts_used,
+      restarts_balance: updatedUser.rows[0].restarts_balance,
+      usedFree
+    });
+
+  } catch (e: any) {
+    await pool.query("ROLLBACK");
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 app.post("/api/skip", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-    const { mode, nonce } = req.body || {};
 
-    const out = await consumeItem(uid, "skip", mode, nonce);
-    res.json(out);
+    await pool.query("BEGIN");
+
+    // Lock user + progress rows
+    const userRes = await pool.query(
+      `SELECT skips_balance FROM public.users WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+    const progressRes = await pool.query(
+      `SELECT free_skips_used FROM progress WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    const progress = progressRes.rows[0];
+
+    if (!user || !progress) {
+      throw new Error("User or progress not found");
+    }
+
+    const FREE_SKIP_LIMIT = 3;
+
+    let usedFree = false;
+
+    if ((progress.free_skips_used ?? 0) < FREE_SKIP_LIMIT) {
+      // consume free
+      await pool.query(
+        `UPDATE progress
+         SET free_skips_used = free_skips_used + 1
+         WHERE uid=$1`,
+        [uid]
+      );
+      usedFree = true;
+    } 
+    else if ((user.skips_balance ?? 0) > 0) {
+      // consume paid
+      await pool.query(
+        `UPDATE public.users
+         SET skips_balance = skips_balance - 1
+         WHERE uid=$1`,
+        [uid]
+      );
+    } 
+    else {
+      throw new Error("No skips available");
+    }
+
+    await pool.query("COMMIT");
+
+    // return fresh values
+    const updatedUser = await pool.query(
+      `SELECT skips_balance FROM public.users WHERE uid=$1`,
+      [uid]
+    );
+    const updatedProgress = await pool.query(
+      `SELECT free_skips_used FROM progress WHERE uid=$1`,
+      [uid]
+    );
+
+    res.json({
+      ok: true,
+      free_skips_used: updatedProgress.rows[0].free_skips_used,
+      skips_balance: updatedUser.rows[0].skips_balance,
+      usedFree
+    });
+
   } catch (e: any) {
+    await pool.query("ROLLBACK");
     res.status(400).json({ ok: false, error: e.message });
   }
 });
-
 app.post("/api/hint", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-    const { mode, nonce } = req.body || {};
 
-    const out = await consumeItem(uid, "hint", mode, nonce);
-    res.json(out);
+    await pool.query("BEGIN");
+
+    const userRes = await pool.query(
+      `SELECT hints_balance FROM public.users WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+
+    const progressRes = await pool.query(
+      `SELECT free_hints_used FROM progress WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    const progress = progressRes.rows[0];
+
+    if (!user || !progress) {
+      throw new Error("User or progress not found");
+    }
+
+    const FREE_HINT_LIMIT = 3;
+    let usedFree = false;
+
+    if ((progress.free_hints_used ?? 0) < FREE_HINT_LIMIT) {
+      await pool.query(
+        `UPDATE progress
+         SET free_hints_used = free_hints_used + 1
+         WHERE uid=$1`,
+        [uid]
+      );
+      usedFree = true;
+    }
+    else if ((user.hints_balance ?? 0) > 0) {
+      await pool.query(
+        `UPDATE public.users
+         SET hints_balance = hints_balance - 1
+         WHERE uid=$1`,
+        [uid]
+      );
+    }
+    else {
+      throw new Error("No hints available");
+    }
+
+    await pool.query("COMMIT");
+
+    const updatedUser = await pool.query(
+      `SELECT hints_balance FROM public.users WHERE uid=$1`,
+      [uid]
+    );
+
+    const updatedProgress = await pool.query(
+      `SELECT free_hints_used FROM progress WHERE uid=$1`,
+      [uid]
+    );
+
+    res.json({
+      ok: true,
+      free_hints_used: updatedProgress.rows[0].free_hints_used,
+      hints_balance: updatedUser.rows[0].hints_balance,
+      usedFree
+    });
+
   } catch (e: any) {
+    await pool.query("ROLLBACK");
     res.status(400).json({ ok: false, error: e.message });
   }
 });
-
 /* ---------------- ADMIN: month close ---------------- */
 app.post("/admin/month-close", async (req,res)=>{
   try{
