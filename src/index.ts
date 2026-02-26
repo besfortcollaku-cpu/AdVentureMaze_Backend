@@ -92,11 +92,6 @@ res.json({
         // 🔹 paid balances (wallet)
         skips_balance: user.skips_balance ?? 0,
         hints_balance: user.hints_balance ?? 0,
-        restarts_balance: user.restarts_balance ?? 0,
-        free_skips_used: user.free_skips_used ?? 0,
-free_hints_used: user.free_hints_used ?? 0,
-free_restarts_used: user.free_restarts_used ?? 0,
-
         monthly_final_rate: user.monthly_final_rate ?? 50,
         monthly_rate_breakdown: user.monthly_rate_breakdown ?? {},
         monthly_coins_earned: user.monthly_coins_earned ?? 0,
@@ -115,6 +110,9 @@ free_restarts_used: user.free_restarts_used ?? 0,
         uid: progress.uid,
         level: progress.level,
         coins: progress.coins,
+        free_skips_used: progress.free_skips_used ?? 0,
+        free_hints_used: progress.free_hints_used ?? 0,
+        free_restarts_used: progress.free_restarts_used ?? 0,
       }
     : null,
 });  } catch (e: any) {
