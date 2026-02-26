@@ -45,6 +45,14 @@ recalcAndStoreMonthlyRate,
   adminChartActiveUsers,
 } from "./db";
 
+
+const test = await pool.query(`
+  SELECT column_name
+  FROM information_schema.columns
+  WHERE table_name = 'users'
+  AND table_schema = 'public'
+`);
+console.log("DB COLUMNS:", test.rows);
 const app = express();
 
 /* ---------------- CORS ---------------- */
