@@ -46,8 +46,6 @@ recalcAndStoreMonthlyRate,
 } from "./db";
 
 
-
-console.log("DB COLUMNS:", test.rows);
 const app = express();
 
 /* ---------------- CORS ---------------- */
