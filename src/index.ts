@@ -402,12 +402,7 @@ app.post("/api/restart", async (req, res) => {
     else {
       throw new Error("No restarts available");
     }
-const test = await pool.query(`
-  SELECT column_name
-  FROM information_schema.columns
-  WHERE table_name = 'users'
-  AND table_schema = 'public'
-`);
+
     await pool.query("COMMIT");
 
     const updatedUser = await pool.query(
