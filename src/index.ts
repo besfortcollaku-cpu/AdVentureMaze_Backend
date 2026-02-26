@@ -72,7 +72,7 @@ res.set("Cache-Control", "no-store");
     const { uid } = await requirePiUser(req);
 
     const { rows } = await pool.query(
-  `SELECT * FROM users WHERE uid=$1`,
+  `SELECT * FROM public.users WHERE uid=$1`,
   [uid]
 );
 const user = rows[0] ?? null;
@@ -157,7 +157,7 @@ app.patch("/api/user/username", async (req, res) => {
     }
 
     await pool.query(
-      `UPDATE users SET username=$1 WHERE uid=$2`,
+      `UPDATE public.users SET username=$1 WHERE uid=$2`,
       [username, uid]
     );
 
@@ -189,7 +189,7 @@ app.patch("/api/user/username", async (req, res) => {
 
     // prevent duplicate usernames
     const existing = await pool.query(
-      `SELECT uid FROM users WHERE LOWER(username)=LOWER($1) AND uid<>$2`,
+      `SELECT uid FROM public.users WHERE LOWER(username)=LOWER($1) AND uid<>$2`,
       [username, uid]
     );
 
@@ -198,7 +198,7 @@ app.patch("/api/user/username", async (req, res) => {
     }
 
     await pool.query(
-      `UPDATE users SET username=$1 WHERE uid=$2`,
+      `UPDATE public.users SET username=$1 WHERE uid=$2`,
       [username, uid]
     );
 
@@ -360,7 +360,7 @@ app.post("/api/restart", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT restarts_balance FROM users WHERE uid=$1 FOR UPDATE`,
+      `SELECT restarts_balance FROM public.users WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
 
@@ -390,7 +390,7 @@ app.post("/api/restart", async (req, res) => {
     }
     else if ((user.restarts_balance ?? 0) > 0) {
       await pool.query(
-        `UPDATE users
+        `UPDATE public.users
          SET restarts_balance = restarts_balance - 1
          WHERE uid=$1`,
         [uid]
@@ -403,7 +403,7 @@ app.post("/api/restart", async (req, res) => {
     await pool.query("COMMIT");
 
     const updatedUser = await pool.query(
-      `SELECT restarts_balance FROM users WHERE uid=$1`,
+      `SELECT restarts_balance FROM public.users WHERE uid=$1`,
       [uid]
     );
 
@@ -432,7 +432,7 @@ app.post("/api/skip", async (req, res) => {
 
     // Lock user + progress rows
     const userRes = await pool.query(
-      `SELECT skips_balance FROM users WHERE uid=$1 FOR UPDATE`,
+      `SELECT skips_balance FROM public.users WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
     const progressRes = await pool.query(
@@ -464,7 +464,7 @@ app.post("/api/skip", async (req, res) => {
     else if ((user.skips_balance ?? 0) > 0) {
       // consume paid
       await pool.query(
-        `UPDATE users
+        `UPDATE public.users
          SET skips_balance = skips_balance - 1
          WHERE uid=$1`,
         [uid]
@@ -478,7 +478,7 @@ app.post("/api/skip", async (req, res) => {
 
     // return fresh values
     const updatedUser = await pool.query(
-      `SELECT skips_balance FROM users WHERE uid=$1`,
+      `SELECT skips_balance FROM public.users WHERE uid=$1`,
       [uid]
     );
     const updatedProgress = await pool.query(
@@ -505,7 +505,7 @@ app.post("/api/hint", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT hints_balance FROM users WHERE uid=$1 FOR UPDATE`,
+      `SELECT hints_balance FROM public.users WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
 
@@ -535,7 +535,7 @@ app.post("/api/hint", async (req, res) => {
     }
     else if ((user.hints_balance ?? 0) > 0) {
       await pool.query(
-        `UPDATE users
+        `UPDATE public.users
          SET hints_balance = hints_balance - 1
          WHERE uid=$1`,
         [uid]
@@ -548,7 +548,7 @@ app.post("/api/hint", async (req, res) => {
     await pool.query("COMMIT");
 
     const updatedUser = await pool.query(
-      `SELECT hints_balance FROM users WHERE uid=$1`,
+      `SELECT hints_balance FROM public.users WHERE uid=$1`,
       [uid]
     );
 
