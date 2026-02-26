@@ -678,21 +678,16 @@ async function start() {
   try {
     await initDB();
     console.log("Database initialized");
-async function start() {
-  const info = await pool.query(`
-    SELECT current_database(), inet_server_addr(), inet_server_port()
-  `);
-  console.log("DB INFO:", info.rows);
 
-  app.listen(PORT, () => {
-    console.log(`Backend listening on ${PORT}`);
-  });
-}
+    const info = await pool.query(`
+      SELECT current_database(), inet_server_addr(), inet_server_port()
+    `);
+    console.log("DB INFO:", info.rows);
 
-start();
     app.listen(PORT, "0.0.0.0", () => {
       console.log("Backend listening on", PORT);
     });
+
   } catch (err) {
     console.error("Startup failed:", err);
     process.exit(1);
