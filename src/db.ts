@@ -1,5 +1,5 @@
 import { Pool } from "pg";
-console.log("Backend v2.0.0 SUPABASE BUILD - listening on", PORT);
+console.log("Backend v2.0.0");
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_SSL === "true"
