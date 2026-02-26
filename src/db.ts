@@ -1,5 +1,5 @@
 import { Pool } from "pg";
-console.log("Backend v2.0.0");
+console.log("Backend v2.0.1");
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_SSL === "true"
