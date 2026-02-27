@@ -90,6 +90,7 @@ res.json({
         coins: user.coins,
 
         // 🔹 paid balances (wallet)
+        restarts_balance: user.restarts_balance ?? 0,
         skips_balance: user.skips_balance ?? 0,
         hints_balance: user.hints_balance ?? 0,
         monthly_final_rate: user.monthly_final_rate ?? 50,
