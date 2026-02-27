@@ -467,6 +467,7 @@ app.post("/api/skip", async (req, res) => {
 
     if (!user || !progress) {
       throw new Error("User or progress not found");
+      }
 const FREE_SKIP_LIMIT = 3;
 const SKIP_PRICE = 50;
 
