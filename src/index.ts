@@ -359,7 +359,7 @@ app.post("/api/restart", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT restarts_balance FROM public.users WHERE uid=$1 FOR UPDATE`,
+      `SELECT restarts_balance, coins FROM public.users WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
 
