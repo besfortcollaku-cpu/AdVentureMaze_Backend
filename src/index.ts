@@ -563,51 +563,50 @@ app.post("/api/hint", async (req, res) => {
     }
 
     const FREE_HINT_LIMIT = 3;
-const HINT_PRICE = 50;
+    const HINT_PRICE = 50;
 
-let usedFree = false;
+    let usedFree = false;
 
-if ((progress.free_hints_used ?? 0) < FREE_HINT_LIMIT) {
+    if ((progress.free_hints_used ?? 0) < FREE_HINT_LIMIT) {
 
-  await pool.query(
-    `UPDATE progress
-     SET free_hints_used = free_hints_used + 1
-     WHERE uid=$1`,
-    [uid]
-  );
+      await pool.query(
+        `UPDATE progress
+         SET free_hints_used = free_hints_used + 1
+         WHERE uid=$1`,
+        [uid]
+      );
 
-  usedFree = true;
+      usedFree = true;
 
-} else if ((user.hints_balance ?? 0) > 0) {
+    } else if ((user.hints_balance ?? 0) > 0) {
 
-  await pool.query(
-    `UPDATE public.users
-     SET hints_balance = hints_balance - 1
-     WHERE uid=$1`,
-    [uid]
-  );
+      await pool.query(
+        `UPDATE public.users
+         SET hints_balance = hints_balance - 1
+         WHERE uid=$1`,
+        [uid]
+      );
 
-} else if (req.body.mode === "coins") {
+    } else if (req.body.mode === "coins") {
 
-  if ((user.coins ?? 0) < HINT_PRICE) {
-    throw new Error("Not enough coins");
-  }
+      if ((user.coins ?? 0) < HINT_PRICE) {
+        throw new Error("Not enough coins");
+      }
 
-  await pool.query(
-    `UPDATE public.users
-     SET coins = coins - $1
-     WHERE uid=$2`,
-    [HINT_PRICE, uid]
-  );
+      await pool.query(
+        `UPDATE public.users
+         SET coins = coins - $1
+         WHERE uid=$2`,
+        [HINT_PRICE, uid]
+      );
 
-} else if (req.body.mode === "ad") {
+    } else if (req.body.mode === "ad") {
 
-  // instant hint granted
+      // ad grants instant hint
 
-} else {
-
-  throw new Error("No hints available");
-}
+    } else {
+      throw new Error("No hints available");
+    }
 
     await pool.query("COMMIT");
 
@@ -622,12 +621,12 @@ if ((progress.free_hints_used ?? 0) < FREE_HINT_LIMIT) {
     );
 
     res.json({
-  ok: true,
-  free_hints_used: updatedProgress.rows[0].free_hints_used,
-  hints_balance: updatedUser.rows[0].hints_balance,
-  coins: updatedUser.rows[0].coins,
-  usedFree
-});
+      ok: true,
+      free_hints_used: updatedProgress.rows[0].free_hints_used,
+      hints_balance: updatedUser.rows[0].hints_balance,
+      coins: updatedUser.rows[0].coins,
+      usedFree
+    });
 
   } catch (e: any) {
     await pool.query("ROLLBACK");
