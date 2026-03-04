@@ -498,7 +498,7 @@ export async function claimLevelComplete(uid: string, level: number) {
   }
   const insert = await pool.query(
     `
-    INSERT INTO level_rewards (uid, level, created_at)
+    INSERT INTO public.level_rewards (uid, level, created_at)
     VALUES ($1, $2, NOW())
     ON CONFLICT (uid, level) DO NOTHING
     `,
