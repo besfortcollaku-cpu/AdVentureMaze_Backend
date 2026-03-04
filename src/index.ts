@@ -366,9 +366,10 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
     const out = await claimLevelComplete(uid, level);
 
     res.json({ ok:true, already:!!out?.already, user:out?.user });
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
-  }
+catch(e:any){
+  console.error("LEVEL COMPLETE ERROR:", e);
+  res.status(400).json({ok:false,error:e?.message || "unknown_error"});
+}
 });
 app.post("/api/restart", async (req, res) => {
   try {
