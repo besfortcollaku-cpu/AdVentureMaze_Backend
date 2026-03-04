@@ -359,8 +359,12 @@ console.log("AD +50 HIT", {
 app.post("/api/rewards/level-complete", async (req,res)=>{
   try{
     const { uid } = await requirePiUser(req);
-    const level = Number(req.body?.level||0);
+    const level = Number(req.body?.level || 0);
+
+    console.log("LEVEL COMPLETE REQUEST", { uid, level });
+
     const out = await claimLevelComplete(uid, level);
+
     res.json({ ok:true, already:!!out?.already, user:out?.user });
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
