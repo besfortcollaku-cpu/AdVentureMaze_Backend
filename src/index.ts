@@ -356,8 +356,8 @@ console.log("AD +50 HIT", {
   }
 });
 
-app.post("/api/rewards/level-complete", async (req,res)=>{
-  try{
+app.post("/api/rewards/level-complete", async (req, res) => {
+  try {
     const { uid } = await requirePiUser(req);
     const level = Number(req.body?.level || 0);
 
@@ -365,11 +365,11 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
 
     const out = await claimLevelComplete(uid, level);
 
-    res.json({ ok:true, already:!!out?.already, user:out?.user });
-catch(e:any){
-  console.error("LEVEL COMPLETE ERROR:", e);
-  res.status(400).json({ok:false,error:e?.message || "unknown_error"});
-}
+    res.json({ ok: true, already: !!out?.already, user: out?.user });
+  } catch (e: any) {
+    console.error("LEVEL COMPLETE ERROR:", e);
+    res.status(400).json({ ok: false, error: e?.message || "unknown_error" });
+  }
 });
 app.post("/api/restart", async (req, res) => {
   try {
