@@ -112,7 +112,8 @@ export async function initDB() {
     CREATE TABLE IF NOT EXISTS level_rewards (
       uid TEXT NOT NULL,
       level INT NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW()
+      created_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (uid, level)
     );
   `);
 
@@ -488,32 +489,32 @@ await recalcAndStoreMonthlyRate(uid);
 }
 
 export async function claimLevelComplete(uid: string, level: number) {
-  const { rowCount } = await pool.query(
-    `SELECT 1 FROM level_rewards WHERE uid=$1 AND level=$2`,
+  const insert = await pool.query(
+    `
+    INSERT INTO level_rewards (uid, level, created_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (uid, level) DO NOTHING
+    `,
     [uid, level]
   );
-  if (rowCount) return { already: true };
+
+  // if already claimed, do not add coin
+  if ((insert.rowCount ?? 0) === 0) return { already: true };
+
+  const user = await addCoins(uid, 1);
 
   await pool.query(
     `
-    INSERT INTO level_rewards (uid,level,created_at)
-    VALUES ($1,$2,NOW())
-  `,
-    [uid, level]
+    UPDATE public.users
+    SET
+      monthly_levels_completed = COALESCE(monthly_levels_completed,0) + 1,
+      lifetime_levels_completed = COALESCE(lifetime_levels_completed,0) + 1
+    WHERE uid=$1
+    `,
+    [uid]
   );
 
-  const user = await addCoins(uid, 1);
-  await pool.query(
-  `
-  UPDATE public.users
-  SET
-    monthly_levels_completed = COALESCE(monthly_levels_completed,0) + 1,
-    lifetime_levels_completed = COALESCE(lifetime_levels_completed,0) + 1
-  WHERE uid=$1
-  `,
-  [uid]
-);
-await recalcAndStoreMonthlyRate(uid);
+  await recalcAndStoreMonthlyRate(uid);
   return { user };
 }
 
