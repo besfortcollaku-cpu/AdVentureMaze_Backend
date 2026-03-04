@@ -109,14 +109,17 @@ export async function initDB() {
   `);
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS level_rewards (
-      uid TEXT NOT NULL,
-      level INT NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY (uid, level)
-    );
-  `);
+  CREATE TABLE IF NOT EXISTS public.level_rewards (
+    uid TEXT NOT NULL,
+    level INT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+  );
+`);
 
+await pool.query(`
+  CREATE UNIQUE INDEX IF NOT EXISTS level_rewards_uid_level_unique
+  ON public.level_rewards (uid, level)
+`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       uid TEXT PRIMARY KEY,
