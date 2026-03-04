@@ -64,6 +64,11 @@ export async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  // daily login reward tracking
+  await pool.query(`
+    ALTER TABLE public.users
+    ADD COLUMN IF NOT EXISTS last_daily_login DATE
+  `);
 
   // --- upgrades for existing DBs (safe to run every boot) ---
   await pool.query(`

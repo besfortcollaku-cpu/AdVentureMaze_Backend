@@ -72,6 +72,19 @@ res.set("Cache-Control", "no-store");
   try {
     const { uid } = await requirePiUser(req);
 
+    // daily login: +5 coins once per day
+    await pool.query(
+      `
+      UPDATE public.users
+      SET
+        coins = coins + 5,
+        last_daily_login = CURRENT_DATE
+      WHERE uid = $1
+        AND (last_daily_login IS NULL OR last_daily_login < CURRENT_DATE)
+      `,
+      [uid]
+    );
+
     const { rows } = await pool.query(
   `SELECT * FROM public.users WHERE uid=$1`,
   [uid]
