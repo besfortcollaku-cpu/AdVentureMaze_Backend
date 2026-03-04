@@ -489,6 +489,10 @@ await recalcAndStoreMonthlyRate(uid);
 }
 
 export async function claimLevelComplete(uid: string, level: number) {
+
+  if (!Number.isInteger(level) || level < 1) {
+    throw new Error("invalid_level");
+  }
   const insert = await pool.query(
     `
     INSERT INTO level_rewards (uid, level, created_at)
