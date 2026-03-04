@@ -120,15 +120,19 @@ res.json({
     : null,
 
   progress: progress
-    ? {
-        uid: progress.uid,
-        level: progress.level,
-        coins: progress.coins,
-        free_skips_used: progress.free_skips_used ?? 0,
-        free_hints_used: progress.free_hints_used ?? 0,
-        free_restarts_used: progress.free_restarts_used ?? 0,
-      }
-    : null,
+  ? {
+      uid: progress.uid,
+      level: progress.level,
+      coins: progress.coins,
+      free_skips_used: progress.free_skips_used ?? 0,
+      free_hints_used: progress.free_hints_used ?? 0,
+      free_restarts_used: progress.free_restarts_used ?? 0,
+
+      // ✅ required for resume feature
+      paintedKeys: progress.painted_keys ?? [],
+      resume: progress.resume ?? null,
+    }
+  : null,
 });  } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
@@ -137,28 +141,25 @@ res.json({
 app.post("/api/progress", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-    const { level, coins, paintedKeys, resume } = req.body;
 
-    await pool.query(
-      `
-      INSERT INTO progress (uid, level, coins, painted_keys, resume)
-      VALUES ($1, $2, $3, $4, $5)
-      ON CONFLICT (uid)
-      DO UPDATE SET
-        level = EXCLUDED.level,
-        coins = EXCLUDED.coins,
-        painted_keys = EXCLUDED.painted_keys,
-        resume = EXCLUDED.resume,
-        updated_at = NOW()
-      `,
-      [uid, level, coins, paintedKeys, resume]
-    );
+    const level = Number(req.body?.level ?? 1);
+    const coins = Number(req.body?.coins ?? 0);
+    const paintedKeys = req.body?.paintedKeys ?? null;
+    const resume = req.body?.resume ?? null;
+
+    await setProgressByUid({
+      uid,
+      level,
+      coins,
+      paintedKeys,
+      resume,
+    });
 
     res.json({ ok: true });
   } catch (e) {
-  const message = e instanceof Error ? e.message : "Unknown error";
-  res.status(400).json({ ok: false, error: message });
-}
+    const message = e instanceof Error ? e.message : "Unknown error";
+    res.status(400).json({ ok: false, error: message });
+  }
 });
 app.patch("/api/user/username", async (req, res) => {
   try {
