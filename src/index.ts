@@ -729,7 +729,7 @@ app.post("/api/hint", async (req, res) => {
     } else {
       throw new Error("No hints available");
     }
-    }
+    
 
     await pool.query("COMMIT");
 
