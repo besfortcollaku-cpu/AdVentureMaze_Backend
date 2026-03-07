@@ -523,8 +523,110 @@ app.post("/api/restart", async (req, res) => {
   }
 });
 
+app.post("/api/skip", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const nonce = String(req.body?.nonce || "");
+    const mode = String(req.body?.mode || "");
 
-app.post("/api/hint", async (req, res) => {
+    await pool.query("BEGIN");
+
+    const userRes = await pool.query(
+      `SELECT skips_balance, coins FROM public.users WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+    const progressRes = await pool.query(
+      `SELECT free_skips_used FROM progress WHERE uid=$1 FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    const progress = progressRes.rows[0];
+
+    if (!user || !progress) {
+      throw new Error("User or progress not found");
+    }
+
+    const FREE_SKIP_LIMIT = 3;
+    const SKIP_PRICE = 50;
+
+    let usedFree = false;
+
+    if ((progress.free_skips_used ?? 0) < FREE_SKIP_LIMIT) {
+      await pool.query(
+        `UPDATE progress
+         SET free_skips_used = free_skips_used + 1
+         WHERE uid=$1`,
+        [uid]
+      );
+
+      usedFree = true;
+
+    } else if ((user.skips_balance ?? 0) > 0) {
+      await pool.query(
+        `UPDATE public.users
+         SET skips_balance = skips_balance - 1
+         WHERE uid=$1`,
+        [uid]
+      );
+
+    } else if (mode === "coins") {
+      if ((user.coins ?? 0) < SKIP_PRICE) {
+        throw new Error("Not enough coins");
+      }
+
+      await pool.query(
+        `UPDATE public.users
+         SET coins = coins - $1
+         WHERE uid=$2`,
+        [SKIP_PRICE, uid]
+      );
+
+    } else if (mode === "ad") {
+      if (!nonce) {
+        throw new Error("missing_nonce");
+      }
+
+      const reward = await claimReward({
+        uid,
+        type: "skip_ad",
+        nonce,
+        amount: 1,
+        cooldownSeconds: 30,
+      });
+
+      if (reward?.already) {
+        throw new Error("Ad already claimed");
+      }
+
+    } else {
+      throw new Error("No skips available");
+    }
+
+    await pool.query("COMMIT");
+
+    const updatedUser = await pool.query(
+      `SELECT skips_balance, coins FROM public.users WHERE uid=$1`,
+      [uid]
+    );
+    const updatedProgress = await pool.query(
+      `SELECT free_skips_used FROM progress WHERE uid=$1`,
+      [uid]
+    );
+
+    res.json({
+      ok: true,
+      free_skips_used: updatedProgress.rows[0].free_skips_used,
+      skips_balance: updatedUser.rows[0].skips_balance,
+      coins: updatedUser.rows[0].coins,
+      usedFree,
+    });
+
+  } catch (e: any) {
+    await pool.query("ROLLBACK");
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});app.post("/api/hint", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce || "");
@@ -623,132 +725,6 @@ app.post("/api/hint", async (req, res) => {
       hints_balance: updatedUser.rows[0].hints_balance,
       coins: updatedUser.rows[0].coins,
       usedFree,
-    });
-
-  } catch (e: any) {
-    await pool.query("ROLLBACK");
-    res.status(400).json({ ok: false, error: e.message });
-  }
-});
-
-app.post("/api/hint", async (req, res) => {
-  try {
-    const { uid } = await requirePiUser(req);
-    const nonce = String(req.body?.nonce || "");
-    const mode = String(req.body?.mode || "");
-
-    await pool.query("BEGIN");
-
-    const userRes = await pool.query(
-      `SELECT hints_balance, coins FROM public.users WHERE uid=$1 FOR UPDATE`,
-      [uid]
-    );
-
-    const progressRes = await pool.query(
-      `SELECT free_hints_used FROM progress WHERE uid=$1 FOR UPDATE`,
-      [uid]
-    );
-
-    const user = userRes.rows[0];
-    const progress = progressRes.rows[0];
-
-    if (!user || !progress) {
-      throw new Error("User or progress not found");
-    }
-
-    const FREE_HINT_LIMIT = 3;
-    const HINT_PRICE = 50;
-
-    let usedFree = false;
-
-    if ((progress.free_hints_used ?? 0) < FREE_HINT_LIMIT) {
-
-      await pool.query(
-        `UPDATE progress
-         SET free_hints_used = free_hints_used + 1
-         WHERE uid=$1`,
-        [uid]
-      );
-
-      usedFree = true;
-
-    } else if ((user.hints_balance ?? 0) > 0) {
-
-      await pool.query(
-        `UPDATE public.users
-         SET hints_balance = hints_balance - 1
-         WHERE uid=$1`,
-        [uid]
-      );
-
-    } else if (mode === "coins") {
-
-      if ((user.coins ?? 0) < HINT_PRICE) {
-        throw new Error("Not enough coins");
-      }
-
-      await pool.query(
-        `UPDATE public.users
-         SET coins = coins - $1
-         WHERE uid=$2`,
-        [HINT_PRICE, uid]
-      );
-
-} else if (mode === "ad") {
-
-      if (!nonce) {
-        throw new Error("missing_nonce");
-      }
-
-      const reward = await claimReward({
-        uid,
-        type: "hint_ad",
-        nonce,
-        amount: 1,
-        cooldownSeconds: 30,
-      });
-
-      if (reward?.already) {
-        throw new Error("Ad already claimed");
-      }
-
-      await pool.query(
-        `UPDATE public.users
-         SET hints_balance = hints_balance + 1
-         WHERE uid=$1`,
-        [uid]
-      );
-
-      await pool.query(
-        `UPDATE public.users
-         SET hints_balance = hints_balance - 1
-         WHERE uid=$1`,
-        [uid]
-      );
-
-    } else {
-      throw new Error("No hints available");
-    }
-    
-
-    await pool.query("COMMIT");
-
-    const updatedUser = await pool.query(
-      `SELECT hints_balance, coins FROM public.users WHERE uid=$1`,
-      [uid]
-    );
-
-    const updatedProgress = await pool.query(
-      `SELECT free_hints_used FROM progress WHERE uid=$1`,
-      [uid]
-    );
-
-    res.json({
-      ok: true,
-      free_hints_used: updatedProgress.rows[0].free_hints_used,
-      hints_balance: updatedUser.rows[0].hints_balance,
-      coins: updatedUser.rows[0].coins,
-      usedFree
     });
 
   } catch (e: any) {
