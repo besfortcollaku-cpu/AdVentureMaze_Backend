@@ -372,7 +372,7 @@ console.log("AD +50 HIT", {
       type:"ad_50",
       nonce,
       amount:50,
-      cooldownSeconds:30,
+      cooldownSeconds:180,
     });
 
     res.json({ ok:true, already:!!out?.already, user:out?.user });
