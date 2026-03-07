@@ -447,34 +447,67 @@ resume ? JSON.stringify(resume) : null,
 
 export async function claimReward({
   uid, type, nonce, amount, cooldownSeconds,
-}: { 
-  uid: string; 
-  type: string; 
-  nonce: string; 
-  amount: number; 
-  cooldownSeconds: number; }) {
-  const { rowCount } = await pool.query(
-    `SELECT 1 FROM reward_claims WHERE uid=$1 AND nonce=$2`,
+}: {
+  uid: string;
+  type: string;
+  nonce: string;
+  amount: number;
+  cooldownSeconds: number;
+}) {
+  if (!nonce) {
+    throw new Error("missing_nonce");
+  }
+
+  // 1) block exact replay of same request
+  const nonceRes = await pool.query(
+    `SELECT 1 FROM reward_claims WHERE uid=$1 AND nonce=$2 LIMIT 1`,
     [uid, nonce]
   );
-  if (rowCount) return { already: true };
+  if ((nonceRes.rowCount ?? 0) > 0) {
+    return { already: true };
+  }
 
+  // 2) block same reward type inside cooldown window
+  if (cooldownSeconds > 0) {
+    const cooldownRes = await pool.query(
+      `
+      SELECT 1
+      FROM reward_claims
+      WHERE uid = $1
+        AND type = $2
+        AND created_at > NOW() - ($3 * INTERVAL '1 second')
+      LIMIT 1
+      `,
+      [uid, type, cooldownSeconds]
+    );
+
+    if ((cooldownRes.rowCount ?? 0) > 0) {
+      return { already: true, cooldown: true };
+    }
+  }
+
+  // 3) record claim
   await pool.query(
     `
-    INSERT INTO reward_claims (uid,type,nonce,amount,created_at)
-    VALUES ($1,$2,$3,$4,NOW())
-  `,
+    INSERT INTO reward_claims (uid, type, nonce, amount, created_at)
+    VALUES ($1, $2, $3, $4, NOW())
+    `,
     [uid, type, nonce, amount]
   );
 
+  // 4) grant coins
   const user = await addCoins(uid, amount);
+
   if (type === "ad_50" || type === "ad") {
-  await pool.query(
-    `UPDATE public.users SET monthly_ads_watched = COALESCE(monthly_ads_watched,0) + 1 WHERE uid=$1`,
-    [uid]
-  );
-  await recalcAndStoreMonthlyRate(uid);
-}
+    await pool.query(
+      `UPDATE public.users
+       SET monthly_ads_watched = COALESCE(monthly_ads_watched,0) + 1
+       WHERE uid=$1`,
+      [uid]
+    );
+    await recalcAndStoreMonthlyRate(uid);
+  }
+
   return { user };
 }
 
