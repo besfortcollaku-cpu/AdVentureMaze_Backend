@@ -415,10 +415,11 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
   }
-});
-app.post("/api/restart", async (req, res) => {
+});app.post("/api/restart", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
+    const nonce = String(req.body?.nonce || "");
+    const mode = String(req.body?.mode || "");
 
     await pool.query("BEGIN");
 
@@ -438,59 +439,71 @@ app.post("/api/restart", async (req, res) => {
     if (!user || !progress) {
       throw new Error("User or progress not found");
     }
+
     const FREE_RESTART_LIMIT = 3;
-const RESTART_PRICE = 50;
+    const RESTART_PRICE = 50;
 
-let usedFree = false;
+    let usedFree = false;
 
-if ((progress.free_restarts_used ?? 0) < FREE_RESTART_LIMIT) {
+    if ((progress.free_restarts_used ?? 0) < FREE_RESTART_LIMIT) {
 
-  await pool.query(
-    `UPDATE progress
-     SET free_restarts_used = free_restarts_used + 1
-     WHERE uid=$1`,
-    [uid]
-  );
+      await pool.query(
+        `UPDATE progress
+         SET free_restarts_used = free_restarts_used + 1
+         WHERE uid=$1`,
+        [uid]
+      );
 
-  usedFree = true;
+      usedFree = true;
 
-} else if ((user.restarts_balance ?? 0) > 0) {
+    } else if ((user.restarts_balance ?? 0) > 0) {
 
-  await pool.query(
-    `UPDATE public.users
-     SET restarts_balance = restarts_balance - 1
-     WHERE uid=$1`,
-    [uid]
-  );
+      await pool.query(
+        `UPDATE public.users
+         SET restarts_balance = restarts_balance - 1
+         WHERE uid=$1`,
+        [uid]
+      );
 
-} else if (mode === "coins") {
+    } else if (mode === "coins") {
 
-  if ((user.coins ?? 0) < RESTART_PRICE) {
-    throw new Error("Not enough coins");
-  }
+      if ((user.coins ?? 0) < RESTART_PRICE) {
+        throw new Error("Not enough coins");
+      }
 
-  await pool.query(
-    `UPDATE public.users
-     SET coins = coins - $1
-     WHERE uid=$2`,
-    [RESTART_PRICE, uid]
-  );
+      await pool.query(
+        `UPDATE public.users
+         SET coins = coins - $1
+         WHERE uid=$2`,
+        [RESTART_PRICE, uid]
+      );
 
-} else if (req.body.mode === "ad") {
+    } else if (mode === "ad") {
 
-  // Ad gives instant restart, no balance change
+      if (!nonce) throw new Error("missing_nonce");
 
-} else {
+      const reward = await claimReward({
+        uid,
+        type: "restart_ad",
+        nonce,
+        amount: 1,
+        cooldownSeconds: 30,
+      });
 
-  throw new Error("No restarts available");
-}
+      if (reward?.already) {
+        throw new Error("Ad already claimed");
+      }
+
+    } else {
+      throw new Error("No restarts available");
+    }
 
     await pool.query("COMMIT");
 
-const updatedUser = await pool.query(
-  `SELECT restarts_balance, coins FROM public.users WHERE uid=$1`,
-  [uid]
-);
+    const updatedUser = await pool.query(
+      `SELECT restarts_balance, coins FROM public.users WHERE uid=$1`,
+      [uid]
+    );
 
     const updatedProgress = await pool.query(
       `SELECT free_restarts_used FROM progress WHERE uid=$1`,
@@ -498,18 +511,19 @@ const updatedUser = await pool.query(
     );
 
     res.json({
-  ok: true,
-  free_restarts_used: updatedProgress.rows[0].free_restarts_used,
-  restarts_balance: updatedUser.rows[0].restarts_balance,
-  coins: updatedUser.rows[0].coins,
-  usedFree
-});
+      ok: true,
+      free_restarts_used: updatedProgress.rows[0].free_restarts_used,
+      restarts_balance: updatedUser.rows[0].restarts_balance,
+      coins: updatedUser.rows[0].coins,
+      usedFree
+    });
 
   } catch (e: any) {
     await pool.query("ROLLBACK");
     res.status(400).json({ ok: false, error: e.message });
   }
 });
+
 app.post("/api/restart", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);

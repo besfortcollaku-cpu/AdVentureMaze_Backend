@@ -1,5 +1,0 @@
-
-
-DATABASE_URL=postgresql://postgres:X3qkvyi4QG_dh2k@db.iosqffobllfippzduugq.supabase.co:5432/postgres
-
-DATABASE_SSL=true
