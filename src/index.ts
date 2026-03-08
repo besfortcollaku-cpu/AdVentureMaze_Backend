@@ -89,7 +89,6 @@ app.get("/api/me", async (req, res) => {
       let missedDay = null;
 
 if (user?.last_daily_claim_date) {
-
   const last = new Date(user.last_daily_claim_date);
   const now = new Date();
 
@@ -110,27 +109,51 @@ if (user?.last_daily_claim_date) {
   }
 }
 
-    let dailyReward = {
-      canClaim: false,
-      day: 0,
-      coins: 0,
-    };
+let dailyReward = {
+  canClaim: false,
+  day: 0,
+  coins: 0,
+  days: [] as Array<{
+    day: number;
+    coins: number;
+    state: "claimed" | "today" | "missed" | "upcoming";
+  }>,
+  bonusState: "locked" as "locked" | "available" | "claimed",
+};
 
-    if (user && lastClaim !== today) {
-      const nextDay = Math.min((Number(user.daily_streak ?? 0) || 0) + 1, 7);
+const currentStreak = Number(user?.daily_streak ?? 0) || 0;
+const nextDay = Math.min(currentStreak + 1, 7);
 
-      dailyReward = {
-        canClaim: true,
-        day: nextDay,
-        coins: dailyRewardCoinsForDay(nextDay),
-      };
-    }
-    let mysteryChest = false;
-
-if (user && Number(user.daily_streak ?? 0) >= 7) {
-  mysteryChest = true;
+if (user && lastClaim !== today) {
+  dailyReward.canClaim = true;
+  dailyReward.day = nextDay;
+  dailyReward.coins = dailyRewardCoinsForDay(nextDay);
 }
 
+for (let day = 1; day <= 7; day++) {
+  let state: "claimed" | "today" | "missed" | "upcoming" = "upcoming";
+
+  if (missedDay?.day === day) {
+    state = "missed";
+  } else if (user && lastClaim !== today && day === nextDay) {
+    state = "today";
+  } else if (day <= currentStreak) {
+    state = "claimed";
+  }
+
+  dailyReward.days.push({
+    day,
+    coins: dailyRewardCoinsForDay(day),
+    state,
+  });
+}
+
+let mysteryChest = false;
+
+if (user && currentStreak >= 7 && lastClaim === today) {
+  mysteryChest = true;
+  dailyReward.bonusState = "available";
+}
     res.json({
       ok: true,
 
