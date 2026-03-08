@@ -207,7 +207,7 @@ if (user && currentStreak >= 7 && lastClaim === today) {
     { "day": 7, "coins": 50, "state": "upcoming" }
   ],
   "bonusState": "locked"
-}
+},
       missedDay,
       mysteryChest,
     });
