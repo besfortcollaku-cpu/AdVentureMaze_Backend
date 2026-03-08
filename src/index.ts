@@ -658,14 +658,18 @@ app.post("/api/rewards/daily-claim", async (req, res) => {
       throw new Error("user_not_found");
     }
 
-    const today = new Date().toISOString().slice(0, 10);
+    const today = new Date().toISOString().slice(0,10);
 
-    if (user.last_daily_claim_date === today) {
-      return res.json({
-        ok: true,
-        already: true,
-      });
-    }
+const lastClaim = user.last_daily_claim_date
+  ? new Date(user.last_daily_claim_date).toISOString().slice(0,10)
+  : null;
+
+if (lastClaim === today) {
+  return res.json({
+    ok: true,
+    already: true,
+  });
+}
 
     const nextDay = Math.min((user.daily_streak ?? 0) + 1, 7);
     const reward = dailyRewardCoinsForDay(nextDay);
