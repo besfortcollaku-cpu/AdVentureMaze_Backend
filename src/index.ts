@@ -90,9 +90,52 @@ res.set("Cache-Control", "no-store");
   [uid]
 );
 const user = rows[0] ?? null;
+const today = new Date();
+const streakInfo = nextDailyStreak(user?.last_daily_claim_date ?? null, today);
+
+let dailyReward = {
+  canClaim: false,
+  day: 0,
+  coins: 0,
+};
+
+if (user && streakInfo.canClaim) {
+  const nextDay =
+    streakInfo.continueStreak
+      ? Math.min((Number(user.daily_streak ?? 0) || 0) + 1, 7)
+      : 1;
+
+  dailyReward = {
+    canClaim: true,
+    day: nextDay,
+    coins: dailyRewardCoinsForDay(nextDay),
+  };
+}
 
     const progress = await getProgressByUid(uid);
+const today = new Date();
+const streakInfo = nextDailyStreak(user?.last_daily_claim_date ?? null, today);
 
+let dailyReward = {
+  canClaim: false,
+  day: 0,
+  coins: 0
+};
+
+if (user && streakInfo.canClaim) {
+
+  const nextDay =
+    streakInfo.continueStreak
+      ? Math.min((Number(user.daily_streak ?? 0) || 0) + 1, 7)
+      : 1;
+
+  dailyReward = {
+    canClaim: true,
+    day: nextDay,
+    coins: dailyRewardCoinsForDay(nextDay)
+  };
+
+}
 res.json({
   ok: true,
 
@@ -133,6 +176,7 @@ res.json({
       resume: progress.resume ?? null,
     }
   : null,
+  dailyReward,
 });  } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
@@ -205,6 +249,71 @@ app.patch("/api/user/username", async (req, res) => {
   }
 });
 /* ---------------- PROGRESS ---------------- */
+app.post("/api/daily-reward/claim", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+
+    await pool.query("BEGIN");
+
+    const userRes = await pool.query(
+      `SELECT uid, coins, daily_streak, last_daily_claim_date
+       FROM public.users
+       WHERE uid = $1
+       FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    const today = new Date();
+    const streakInfo = nextDailyStreak(user.last_daily_claim_date ?? null, today);
+
+    if (!streakInfo.canClaim) {
+      await pool.query("ROLLBACK");
+      return res.json({ ok: false, error: "already_claimed_today" });
+    }
+
+    const nextDay =
+      streakInfo.continueStreak
+        ? Math.min((Number(user.daily_streak ?? 0) || 0) + 1, 7)
+        : 1;
+
+    const rewardCoins = dailyRewardCoinsForDay(nextDay);
+
+    await pool.query(
+      `
+      UPDATE public.users
+      SET
+        coins = coins + $2,
+        daily_streak = $3,
+        last_daily_claim_date = CURRENT_DATE
+      WHERE uid = $1
+      `,
+      [uid, rewardCoins, nextDay]
+    );
+
+    await pool.query("COMMIT");
+
+    const updatedRes = await pool.query(
+      `SELECT * FROM public.users WHERE uid = $1`,
+      [uid]
+    );
+
+    return res.json({
+      ok: true,
+      day: nextDay,
+      coinsAwarded: rewardCoins,
+      user: updatedRes.rows[0],
+    });
+
+  } catch (e: any) {
+    await pool.query("ROLLBACK");
+    return res.status(400).json({ ok: false, error: e.message });
+  }
+});
 app.patch("/api/user/username", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
@@ -247,6 +356,31 @@ app.patch("/api/user/username", async (req, res) => {
   }
 });
 /* ---------------- HELPERS ---------------- */
+function dailyRewardCoinsForDay(day: number) {
+  const map = [5, 7, 10, 15, 20, 30, 50];
+  return map[Math.max(0, Math.min(map.length - 1, day - 1))];
+}
+
+function nextDailyStreak(lastClaimDate: string | null, today: Date) {
+  const todayStr = today.toISOString().slice(0, 10);
+
+  if (!lastClaimDate) {
+    return { canClaim: true, day: 1, todayStr };
+  }
+
+  const last = new Date(lastClaimDate + "T00:00:00.000Z");
+  const diffDays = Math.floor((today.getTime() - last.getTime()) / 86400000);
+
+  if (diffDays <= 0) {
+    return { canClaim: false, day: 0, todayStr };
+  }
+
+  if (diffDays === 1) {
+    return { canClaim: true, continueStreak: true, todayStr };
+  }
+
+  return { canClaim: true, resetStreak: true, todayStr };
+}
 async function requirePiUser(req: express.Request) {
   const token = getBearerToken(req);
   if (!token) throw new Error("Missing token");
