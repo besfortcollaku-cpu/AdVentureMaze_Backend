@@ -90,6 +90,8 @@ res.set("Cache-Control", "no-store");
   [uid]
 );
 const user = rows[0] ?? null;
+const progress = await getProgressByUid(uid);
+
 const today = new Date();
 const streakInfo = nextDailyStreak(user?.last_daily_claim_date ?? null, today);
 
@@ -110,31 +112,6 @@ if (user && streakInfo.canClaim) {
     day: nextDay,
     coins: dailyRewardCoinsForDay(nextDay),
   };
-}
-
-    const progress = await getProgressByUid(uid);
-const today = new Date();
-const streakInfo = nextDailyStreak(user?.last_daily_claim_date ?? null, today);
-
-let dailyReward = {
-  canClaim: false,
-  day: 0,
-  coins: 0
-};
-
-if (user && streakInfo.canClaim) {
-
-  const nextDay =
-    streakInfo.continueStreak
-      ? Math.min((Number(user.daily_streak ?? 0) || 0) + 1, 7)
-      : 1;
-
-  dailyReward = {
-    canClaim: true,
-    day: nextDay,
-    coins: dailyRewardCoinsForDay(nextDay)
-  };
-
 }
 res.json({
   ok: true,
