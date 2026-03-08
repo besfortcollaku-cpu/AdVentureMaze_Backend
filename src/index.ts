@@ -644,13 +644,15 @@ app.post("/api/rewards/daily-claim", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
 
-    const userRes = await pool.query(
-      `SELECT coins, daily_streak, last_daily_claim_date
-       FROM public.users
-       WHERE uid=$1
-       FOR UPDATE`,
-      [uid]
-    );
+    await pool.query("BEGIN");
+
+const userRes = await pool.query(
+  `SELECT coins, daily_streak, last_daily_claim_date
+   FROM public.users
+   WHERE uid=$1
+   FOR UPDATE`,
+  [uid]
+);
 
     const user = userRes.rows[0];
 
@@ -670,7 +672,6 @@ if (lastClaim === today) {
     already: true,
   });
 }
-
     const nextDay = Math.min((user.daily_streak ?? 0) + 1, 7);
     const reward = dailyRewardCoinsForDay(nextDay);
 
@@ -690,16 +691,19 @@ if (lastClaim === today) {
       [uid]
     );
 
-    res.json({
-      ok: true,
-      day: nextDay,
-      coins: reward,
-      user: updated.rows[0],
-    });
+    await pool.query("COMMIT");
 
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+res.json({
+  ok: true,
+  day: nextDay,
+  coins: reward,
+  user: updated.rows[0],
+});
+
+} catch (e: any) {
+  await pool.query("ROLLBACK");
+  res.status(400).json({ ok: false, error: e.message });
+}
 });
 
 app.post("/api/skip", async (req, res) => {
