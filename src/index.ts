@@ -86,6 +86,29 @@ app.get("/api/me", async (req, res) => {
     const lastClaim = user?.last_daily_claim_date
       ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
       : null;
+      let missedDay = null;
+
+if (user?.last_daily_claim_date) {
+
+  const last = new Date(user.last_daily_claim_date);
+  const now = new Date();
+
+  const diffDays = Math.floor(
+    (now.getTime() - last.getTime()) / (1000 * 60 * 60 * 24)
+  );
+
+  if (diffDays > 1) {
+    const missedDayIndex = Math.min(
+      (Number(user.daily_streak ?? 0) || 0) + 1,
+      7
+    );
+
+    missedDay = {
+      day: missedDayIndex,
+      coins: dailyRewardCoinsForDay(missedDayIndex),
+    };
+  }
+}
 
     let dailyReward = {
       canClaim: false,
@@ -102,6 +125,11 @@ app.get("/api/me", async (req, res) => {
         coins: dailyRewardCoinsForDay(nextDay),
       };
     }
+    let mysteryChest = false;
+
+if (user && Number(user.daily_streak ?? 0) >= 7) {
+  mysteryChest = true;
+}
 
     res.json({
       ok: true,
@@ -143,6 +171,8 @@ app.get("/api/me", async (req, res) => {
         : null,
 
       dailyReward,
+      missedDay,
+      mysteryChest,
     });
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
@@ -222,6 +252,50 @@ const DAILY_REWARDS = [5,7,10,15,20,30,50];
 function rewardForDay(day:number){
   return DAILY_REWARDS[Math.min(day-1, DAILY_REWARDS.length-1)];
 }
+
+app.post("/api/rewards/mystery-chest", async (req,res)=>{
+
+  try{
+
+    const { uid } = await requirePiUser(req);
+
+    const userRes = await pool.query(
+      `SELECT daily_streak FROM public.users WHERE uid=$1`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+
+    if (!user || user.daily_streak < 7) {
+      throw new Error("not_available");
+    }
+
+    const reward = mysteryChestReward();
+
+    await pool.query(
+      `UPDATE public.users
+       SET coins = coins + $1,
+           daily_streak = 0
+       WHERE uid=$2`,
+      [reward, uid]
+    );
+
+    const updated = await pool.query(
+      `SELECT coins FROM public.users WHERE uid=$1`,
+      [uid]
+    );
+
+    res.json({
+      ok:true,
+      reward,
+      user:updated.rows[0]
+    });
+
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
+  }
+
+});
 app.post("/api/daily-reward/claim", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
@@ -287,6 +361,38 @@ app.post("/api/daily-reward/claim", async (req, res) => {
     return res.status(400).json({ ok: false, error: e.message });
   }
 });
+app.post("/api/rewards/recover-day", async (req,res)=>{
+  try{
+    const { uid } = await requirePiUser(req);
+
+    const day = Number(req.body?.day || 0);
+
+    if(!day) throw new Error("invalid_day");
+
+    const coins = dailyRewardCoinsForDay(day);
+
+    await pool.query(
+      `UPDATE public.users
+       SET coins = coins + $1
+       WHERE uid=$2`,
+      [coins, uid]
+    );
+
+    const updated = await pool.query(
+      `SELECT coins FROM public.users WHERE uid=$1`,
+      [uid]
+    );
+
+    res.json({
+      ok:true,
+      coins,
+      user:updated.rows[0]
+    });
+
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
+  }
+});
 app.patch("/api/user/username", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
@@ -329,6 +435,16 @@ app.patch("/api/user/username", async (req, res) => {
   }
 });
 /* ---------------- HELPERS ---------------- */
+function mysteryChestReward() {
+
+  const r = Math.random();
+
+  if (r < 0.4) return 50;
+  if (r < 0.7) return 100;
+  if (r < 0.9) return 150;
+  return 200;
+
+}
 function dailyRewardCoinsForDay(day: number) {
   const map = [5, 7, 10, 15, 20, 30, 50];
   return map[Math.max(0, Math.min(map.length - 1, day - 1))];
