@@ -226,6 +226,13 @@ app.patch("/api/user/username", async (req, res) => {
   }
 });
 /* ---------------- PROGRESS ---------------- */
+
+
+const DAILY_REWARDS = [5,7,10,15,20,30,50];
+
+function rewardForDay(day:number){
+  return DAILY_REWARDS[Math.min(day-1, DAILY_REWARDS.length-1)];
+}
 app.post("/api/daily-reward/claim", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
@@ -630,6 +637,63 @@ app.post("/api/restart", async (req, res) => {
 
   } catch (e: any) {
     await pool.query("ROLLBACK");
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+app.post("/api/rewards/daily-claim", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+
+    const userRes = await pool.query(
+      `SELECT coins, daily_streak, last_daily_claim_date
+       FROM public.users
+       WHERE uid=$1
+       FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+
+    if (!user) {
+      throw new Error("user_not_found");
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+
+    if (user.last_daily_claim_date === today) {
+      return res.json({
+        ok: true,
+        already: true,
+      });
+    }
+
+    const nextDay = Math.min((user.daily_streak ?? 0) + 1, 7);
+    const reward = dailyRewardCoinsForDay(nextDay);
+
+    await pool.query(
+      `UPDATE public.users
+       SET coins = coins + $1,
+           daily_streak = $2,
+           last_daily_claim_date = $3
+       WHERE uid = $4`,
+      [reward, nextDay, today, uid]
+    );
+
+    const updated = await pool.query(
+      `SELECT coins, daily_streak
+       FROM public.users
+       WHERE uid=$1`,
+      [uid]
+    );
+
+    res.json({
+      ok: true,
+      day: nextDay,
+      coins: reward,
+      user: updated.rows[0],
+    });
+
+  } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
