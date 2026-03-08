@@ -68,81 +68,86 @@ app.get("/", (_req, res) => res.send("backend up"));
 
 /* ---------------- /api/me ---------------- */
 app.get("/api/me", async (req, res) => {
-res.set("Cache-Control", "no-store");
+  res.set("Cache-Control", "no-store");
+
   try {
     const { uid } = await requirePiUser(req);
 
-    const user = rows[0] ?? null;
-const progress = await getProgressByUid(uid);
+    const userRes = await pool.query(
+      `SELECT * FROM public.users WHERE uid = $1 LIMIT 1`,
+      [uid]
+    );
 
-const today = new Date().toISOString().slice(0, 10);
+    const user = userRes.rows[0] ?? null;
+    const progress = await getProgressByUid(uid);
 
-const lastClaim = user?.last_daily_claim_date
-  ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
-  : null;
+    const today = new Date().toISOString().slice(0, 10);
 
-let dailyReward = {
-  canClaim: false,
-  day: 0,
-  coins: 0,
-};
+    const lastClaim = user?.last_daily_claim_date
+      ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
+      : null;
 
-if (user && lastClaim !== today) {
-  const nextDay = Math.min((Number(user.daily_streak ?? 0) || 0) + 1, 7);
+    let dailyReward = {
+      canClaim: false,
+      day: 0,
+      coins: 0,
+    };
 
-  dailyReward = {
-    canClaim: true,
-    day: nextDay,
-    coins: dailyRewardCoinsForDay(nextDay),
-  };
-}
-}
-res.json({
-  ok: true,
+    if (user && lastClaim !== today) {
+      const nextDay = Math.min((Number(user.daily_streak ?? 0) || 0) + 1, 7);
 
-  user: user
-    ? {
-        uid: user.uid,
-        username: user.username,
-        coins: user.coins,
-
-        // 🔹 paid balances (wallet)
-        restarts_balance: user.restarts_balance ?? 0,
-        skips_balance: user.skips_balance ?? 0,
-        hints_balance: user.hints_balance ?? 0,
-        monthly_final_rate: user.monthly_final_rate ?? 50,
-        monthly_rate_breakdown: user.monthly_rate_breakdown ?? {},
-        monthly_coins_earned: user.monthly_coins_earned ?? 0,
-        monthly_login_days: user.monthly_login_days ?? 0,
-        monthly_levels_completed: user.monthly_levels_completed ?? 0,
-        monthly_skips_used: user.monthly_skips_used ?? 0,
-        monthly_hints_used: user.monthly_hints_used ?? 0,
-        monthly_restarts_used: user.monthly_restarts_used ?? 0,
-        monthly_ads_watched: user.monthly_ads_watched ?? 0,
-        monthly_valid_invites: user.monthly_valid_invites ?? 0,
-      }
-    : null,
-
-  progress: progress
-  ? {
-      uid: progress.uid,
-      level: progress.level,
-      coins: progress.coins,
-      free_skips_used: progress.free_skips_used ?? 0,
-      free_hints_used: progress.free_hints_used ?? 0,
-      free_restarts_used: progress.free_restarts_used ?? 0,
-
-      // ✅ required for resume feature
-      paintedKeys: progress.painted_keys ?? [],
-      resume: progress.resume ?? null,
+      dailyReward = {
+        canClaim: true,
+        day: nextDay,
+        coins: dailyRewardCoinsForDay(nextDay),
+      };
     }
-  : null,
-  dailyReward,
-});  } catch (e: any) {
+
+    res.json({
+      ok: true,
+
+      user: user
+        ? {
+            uid: user.uid,
+            username: user.username,
+            coins: user.coins,
+
+            // 🔹 paid balances (wallet)
+            restarts_balance: user.restarts_balance ?? 0,
+            skips_balance: user.skips_balance ?? 0,
+            hints_balance: user.hints_balance ?? 0,
+            monthly_final_rate: user.monthly_final_rate ?? 50,
+            monthly_rate_breakdown: user.monthly_rate_breakdown ?? {},
+            monthly_coins_earned: user.monthly_coins_earned ?? 0,
+            monthly_login_days: user.monthly_login_days ?? 0,
+            monthly_levels_completed: user.monthly_levels_completed ?? 0,
+            monthly_skips_used: user.monthly_skips_used ?? 0,
+            monthly_hints_used: user.monthly_hints_used ?? 0,
+            monthly_restarts_used: user.monthly_restarts_used ?? 0,
+            monthly_ads_watched: user.monthly_ads_watched ?? 0,
+            monthly_valid_invites: user.monthly_valid_invites ?? 0,
+          }
+        : null,
+
+      progress: progress
+        ? {
+            uid: progress.uid,
+            level: progress.level,
+            coins: progress.coins,
+            free_skips_used: progress.free_skips_used ?? 0,
+            free_hints_used: progress.free_hints_used ?? 0,
+            free_restarts_used: progress.free_restarts_used ?? 0,
+            paintedKeys: progress.painted_keys ?? [],
+            resume: progress.resume ?? null,
+          }
+        : null,
+
+      dailyReward,
+    });
+  } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
-
 app.post("/api/progress", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);

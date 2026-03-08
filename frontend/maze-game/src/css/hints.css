@@ -1,0 +1,147 @@
+/* ===== Popup Backdrop ===== */
+.popup {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease;
+}
+
+.popup::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+
+  background-image: var(--ui-bg);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+
+  z-index: 0;
+}
+
+.popup::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 1;
+}
+
+.popup:not(.hidden) {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* ===== Popup Card ===== */
+.popup-card {
+  position: relative;
+  z-index: 2;
+
+  width: min(92vw, 420px);
+  padding: 22px;
+  border-radius: 26px;
+
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.10),
+    rgba(255, 255, 255, 0.05)
+  );
+
+  box-shadow:
+    0 18px 60px rgba(0, 0, 0, 0.55),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+
+  animation: softBounceIn 0.25s ease-out;
+}
+
+/* ===== Title ===== */
+.popup-card h3 {
+  margin: 0 0 16px;
+  font-size: 22px;
+  font-weight: 700;
+}
+
+/* ===== Buttons ===== */
+.popup-card button {
+  width: 100%;
+  border: none;
+  border-radius: 16px;
+  padding: 14px 16px;
+  margin-top: 12px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.08s ease, opacity 0.08s ease;
+}
+
+.popup-card button:active {
+  transform: scale(0.97);
+}
+
+/* Primary */
+#freeHintBtn {
+  background: linear-gradient(180deg, #2fd4ff, #16a3ff);
+  color: #00121f;
+}
+
+/* Secondary */
+#buyHintBtn,
+#watchAdHintBtn {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+/* Close */
+#closeHintBtn {
+  background: transparent;
+  color: #9fb3c8;
+  font-size: 14px;
+}
+
+.theme-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease;
+}
+
+.theme-overlay::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+
+  background-image: var(--ui-bg);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+
+  z-index: 0;
+}
+
+.theme-overlay::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 1;
+}
+
+.theme-overlay:not(.hidden) {
+  opacity: 1;
+  pointer-events: auto;
+}

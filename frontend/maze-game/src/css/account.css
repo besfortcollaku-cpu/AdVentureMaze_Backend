@@ -1,0 +1,200 @@
+/* src/ui/account.css */
+.accountOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+
+  display: none;
+  align-items: center;
+  justify-content: center;
+
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease;
+}
+
+.accountOverlay::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+
+  background-image: var(--ui-bg);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+
+  z-index: 0;
+}
+
+.accountOverlay::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 1;
+}
+
+.accountOverlay.show {
+  display: flex;
+  opacity: 1;
+  pointer-events: auto;
+}
+.accountCard.full {
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+
+  display: flex;
+  flex-direction: column;
+
+  background: linear-gradient(
+    180deg,
+    rgba(15,15,25,0.95),
+    rgba(10,10,20,0.95)
+  );
+
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+
+  color: #fff;
+}
+.accountHeader{
+  display:flex;
+  align-items:center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.accountTitle{
+  font-size: 18px;
+  font-weight: 950;
+  letter-spacing: .3px;
+}
+.accountClose {
+  background: transparent;
+  border: none;
+  color: #9fb3c8;
+  font-size: 20px;
+  cursor: pointer;
+}
+.accountSection{
+  margin-top: 10px;
+  padding: 12px 10px;
+  border-radius: 16px;
+  background: rgba(255,255,255,.04);
+  border: 1px solid rgba(255,255,255,.08);
+}
+
+.accountLabel{
+  font-size: 12px;
+  opacity: .78;
+  margin-bottom: 6px;
+}
+
+.accountValue{
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.accountValue.mono{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-weight: 800;
+  font-size: 12px;
+  opacity: .92;
+  word-break: break-all;
+}
+
+.accountNote{
+  margin-top: 12px;
+  font-size: 12px;
+  opacity: .7;
+  text-align: center;
+}
+.accountInviteRow {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.accountInviteInput {
+  flex: 1;
+  border-radius: 12px;
+  border: none;
+  padding: 10px;
+  background: rgba(255,255,255,0.08);
+  color: #fff;
+  font-size: 12px;
+}
+
+.accountInviteBtn {
+  border: none;
+  border-radius: 12px;
+  padding: 10px 14px;
+  background: linear-gradient(180deg, #2fd4ff, #16a3ff);
+  color: #00121f;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.accountInviteStats {
+  margin-top: 10px;
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+.accountTopBar {
+
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+
+  padding: 18px 20px;
+
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+    padding-top: 26px;
+}
+
+.accountTopLeft {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.accountTopName {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.accountTopCoins {
+  font-size: 14px;
+  opacity: 0.9;
+}
+
+.accountScroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+}
+
+.accountContent {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.accountEditBtn {
+  background: none;
+  border: none;
+  color: #aaa;
+  margin-left: 8px;
+  cursor: pointer;
+}
+
+.accountNameInput {
+  background: transparent;
+  border: 1px solid #444;
+  color: white;
+  padding: 4px;
+}

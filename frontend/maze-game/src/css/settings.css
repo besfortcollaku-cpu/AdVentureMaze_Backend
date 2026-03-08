@@ -1,0 +1,195 @@
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  background: transparent;
+}
+
+.settings-overlay.hidden {
+  display: none;
+}
+
+.settings-overlay::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+
+  background-image: var(--ui-bg);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+
+  z-index: 0;
+}
+
+.settings-overlay::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 1;
+}
+
+.settings-card {
+  position: relative;
+  z-index: 2;
+}
+.settings-card {
+  position: relative;
+  z-index: 2;
+
+  width: min(92vw, 420px);
+  padding: 22px;
+  border-radius: 26px;
+
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.10),
+    rgba(255, 255, 255, 0.05)
+  );
+
+  box-shadow:
+    0 18px 60px rgba(0, 0, 0, 0.55),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+
+  color: #fff;
+
+  animation: softBounceIn 0.25s ease-out;
+}
+.settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.settings-header h2 {
+  margin: 0;
+}
+.popup.hidden {
+  display: none;
+  pointer-events: none;
+}
+.popup {
+  pointer-events: auto;
+}
+.close-btn {
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 20px;
+}
+
+.settings-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 16px 0;
+  opacity: 1;
+}
+
+.settings-item.disabled {
+  opacity: 0.4;
+}
+
+.desc {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.settings-hint {
+  font-size: 12px;
+  color: #94a3b8;
+  margin-top: 16px;
+  text-align: center;
+}
+
+/* SWITCH */
+.switch {
+  position: relative;
+  width: 44px;
+  height: 24px;
+}
+
+.switch input {
+  display: none;
+}
+
+.slider {
+  position: absolute;
+  inset: 0;
+  background: #334155;
+  border-radius: 999px;
+  transition: 0.2s;
+}
+
+.slider::before {
+  content: "";
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  left: 3px;
+  top: 3px;
+  background: white;
+  border-radius: 50%;
+  transition: 0.2s;
+}
+
+input:checked + .slider {
+  background: #22d3ee;
+}
+
+input:checked + .slider::before {
+  transform: translateX(20px);
+}
+
+/* =========================
+   THEMED SETTINGS PANEL
+========================= */
+
+
+/* ===== ICE ===== */
+body.theme-ice .slider {
+  background: #1e3a8a;
+}
+body.theme-ice input:checked + .slider {
+  background: #38bdf8;
+}
+
+/* ===== FOREST ===== */
+
+body.theme-forest .slider {
+  background: #14532d;
+}
+body.theme-forest input:checked + .slider {
+  background: #4ade80;
+}
+
+/* ===== LAVA ===== */
+
+
+body.theme-lava .slider {
+  background: #7c2d12;
+}
+body.theme-lava input:checked + .slider {
+  background: #fb923c;
+}
+
+.close-btn {
+  background: transparent;
+  border: none;
+  color: #9fb3c8;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+
+
+.settings-card {
+  animation: softBounceIn 0.35s ease-out;
+}
