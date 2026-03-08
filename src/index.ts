@@ -193,7 +193,21 @@ if (user && currentStreak >= 7 && lastClaim === today) {
           }
         : null,
 
-      dailyReward,
+      "dailyReward": {
+  "canClaim": true,
+  "day": 6,
+  "coins": 30,
+  "days": [
+    { "day": 1, "coins": 5, "state": "claimed" },
+    { "day": 2, "coins": 7, "state": "claimed" },
+    { "day": 3, "coins": 10, "state": "claimed" },
+    { "day": 4, "coins": 15, "state": "claimed" },
+    { "day": 5, "coins": 20, "state": "claimed" },
+    { "day": 6, "coins": 30, "state": "today" },
+    { "day": 7, "coins": 50, "state": "upcoming" }
+  ],
+  "bonusState": "locked"
+}
       missedDay,
       mysteryChest,
     });
