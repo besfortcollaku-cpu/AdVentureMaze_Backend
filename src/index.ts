@@ -109,6 +109,9 @@ if (user?.last_daily_claim_date) {
   }
 }
 
+const currentStreak = Number(user?.daily_streak ?? 0) || 0;
+const nextDay = Math.min(currentStreak + 1, 7);
+
 let dailyReward = {
   canClaim: false,
   day: 0,
@@ -121,28 +124,14 @@ let dailyReward = {
   bonusState: "locked" as "locked" | "available" | "claimed",
 };
 
-const currentStreak = Number(user?.daily_streak ?? 0) || 0;
-const nextDay = Math.min(currentStreak + 1, 7);
-
-
-if (!user) {
-  dailyReward.canClaim = false;
-  dailyReward.day = 0;
-  dailyReward.coins = 0;
-}
-else if (lastClaim === today) {
-  dailyReward.canClaim = false;
-  dailyReward.day = 0;
-  dailyReward.coins = 0;
-}
-else {
-  const nextDay = Math.min(currentStreak + 1, 7);
-
+// only allow claim if user exists AND has not claimed today
+if (user && lastClaim !== today) {
   dailyReward.canClaim = true;
   dailyReward.day = nextDay;
   dailyReward.coins = dailyRewardCoinsForDay(nextDay);
 }
 
+// build the 7 day calendar
 for (let day = 1; day <= 7; day++) {
   let state: "claimed" | "today" | "missed" | "upcoming" = "upcoming";
 
@@ -163,7 +152,8 @@ for (let day = 1; day <= 7; day++) {
 
 let mysteryChest = false;
 
-if (user && currentStreak >= 7 && lastClaim === today) {
+// chest only available after day 7 was claimed today
+if (user && currentStreak === 7 && lastClaim === today) {
   mysteryChest = true;
   dailyReward.bonusState = "available";
 }
