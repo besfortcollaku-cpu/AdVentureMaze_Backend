@@ -154,6 +154,14 @@ if (user && currentStreak >= 7 && lastClaim === today) {
   mysteryChest = true;
   dailyReward.bonusState = "available";
 }
+console.log("DAILY DEBUG", {
+  uid,
+  db_streak: user?.daily_streak,
+  last_daily_claim_date: user?.last_daily_claim_date,
+  today,
+  nextDay,
+  dailyReward
+});
     res.json({
       ok: true,
 
