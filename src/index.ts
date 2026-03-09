@@ -77,40 +77,51 @@ app.get("/api/me", async (req, res) => {
       `SELECT * FROM public.users WHERE uid = $1 LIMIT 1`,
       [uid]
     );
+const user = userRes.rows[0] ?? null;
+const progress = await getProgressByUid(uid);
 
-    const user = userRes.rows[0] ?? null;
-    const progress = await getProgressByUid(uid);
+const today = new Date().toISOString().slice(0, 10);
 
-    const today = new Date().toISOString().slice(0, 10);
+const lastClaim = user?.last_daily_claim_date
+  ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
+  : null;
 
-    const lastClaim = user?.last_daily_claim_date
-      ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
-      : null;
-      let missedDay = null;
+let missedDay = null;
 
+const currentStreak = Number(user?.daily_streak ?? 0) || 0;
+
+let diffDays = 0;
 if (user?.last_daily_claim_date) {
   const last = new Date(user.last_daily_claim_date);
   const now = new Date();
 
-  const diffDays = Math.floor(
+  diffDays = Math.floor(
     (now.getTime() - last.getTime()) / (1000 * 60 * 60 * 24)
   );
-
-  if (diffDays > 1) {
-    const missedDayIndex = Math.min(
-      (Number(user.daily_streak ?? 0) || 0) + 1,
-      7
-    );
-
-    missedDay = {
-      day: missedDayIndex,
-      coins: dailyRewardCoinsForDay(missedDayIndex),
-    };
-  }
 }
 
-const currentStreak = Number(user?.daily_streak ?? 0) || 0;
-const nextDay = Math.min(currentStreak + 1, 7);
+if (diffDays > 1) {
+  const missedDayIndex = Math.min(currentStreak + 1, 7);
+
+  missedDay = {
+    day: missedDayIndex,
+    coins: dailyRewardCoinsForDay(missedDayIndex),
+  };
+}
+
+// calendar rule:
+// same day claim -> no claimable reward
+// next day -> nextDay = currentStreak + 1
+// missed days -> jump forward by diffDays
+let nextDay = 0;
+
+if (user && lastClaim !== today) {
+  if (!lastClaim) {
+    nextDay = Math.min(currentStreak + 1, 7);
+  } else {
+    nextDay = Math.min(currentStreak + Math.max(diffDays, 1), 7);
+  }
+}
 
 let dailyReward = {
   canClaim: false,
@@ -124,14 +135,12 @@ let dailyReward = {
   bonusState: "locked" as "locked" | "available" | "claimed",
 };
 
-// only allow claim if user exists AND has not claimed today
-if (user && lastClaim !== today) {
+if (user && lastClaim !== today && nextDay > 0) {
   dailyReward.canClaim = true;
   dailyReward.day = nextDay;
   dailyReward.coins = dailyRewardCoinsForDay(nextDay);
 }
 
-// build the 7 day calendar
 for (let day = 1; day <= 7; day++) {
   let state: "claimed" | "today" | "missed" | "upcoming" = "upcoming";
 
@@ -152,12 +161,11 @@ for (let day = 1; day <= 7; day++) {
 
 let mysteryChest = false;
 
-// chest only available after day 7 was claimed today
 if (user && currentStreak === 7 && lastClaim === today) {
   mysteryChest = true;
   dailyReward.bonusState = "available";
 }
-const DAILY_DEBUG_VERSION = "ME_FIX_V2";
+
     res.json({
       ok: true,
 
@@ -199,7 +207,6 @@ const DAILY_DEBUG_VERSION = "ME_FIX_V2";
       dailyReward,
       missedDay,
       mysteryChest,
-       debugVersion: DAILY_DEBUG_VERSION,
     });
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
@@ -344,16 +351,34 @@ app.post("/api/daily-reward/claim", async (req, res) => {
 
     const today = new Date().toISOString().slice(0, 10);
 
-const lastClaim = user.last_daily_claim_date
-  ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
-  : null;
+    const lastClaim = user.last_daily_claim_date
+      ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
+      : null;
 
-if (lastClaim === today) {
-  await pool.query("ROLLBACK");
-  return res.json({ ok: true, already: true });
-}
+    if (lastClaim === today) {
+      await pool.query("ROLLBACK");
+      return res.json({ ok: true, already: true });
+    }
 
-const nextDay = Math.min((Number(user.daily_streak ?? 0) || 0) + 1, 7);
+    const currentStreak = Number(user.daily_streak ?? 0) || 0;
+
+    let diffDays = 0;
+    if (user.last_daily_claim_date) {
+      const last = new Date(user.last_daily_claim_date);
+      const now = new Date();
+
+      diffDays = Math.floor(
+        (now.getTime() - last.getTime()) / (1000 * 60 * 60 * 24)
+      );
+    }
+
+    let nextDay = 0;
+
+    if (!lastClaim) {
+      nextDay = Math.min(currentStreak + 1, 7);
+    } else {
+      nextDay = Math.min(currentStreak + Math.max(diffDays, 1), 7);
+    }
 
     const rewardCoins = dailyRewardCoinsForDay(nextDay);
 
@@ -382,7 +407,6 @@ const nextDay = Math.min((Number(user.daily_streak ?? 0) || 0) + 1, 7);
       coinsAwarded: rewardCoins,
       user: updatedRes.rows[0],
     });
-
   } catch (e: any) {
     await pool.query("ROLLBACK");
     return res.status(400).json({ ok: false, error: e.message });
