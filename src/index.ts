@@ -352,18 +352,18 @@ app.post("/api/daily-reward/claim", async (req, res) => {
       throw new Error("User not found");
     }
 
-    const today = new Date();
-    const streakInfo = nextDailyStreak(user.last_daily_claim_date ?? null, today);
+    const today = new Date().toISOString().slice(0, 10);
 
-    if (!streakInfo.canClaim) {
-      await pool.query("ROLLBACK");
-      return res.json({ ok: false, error: "already_claimed_today" });
-    }
+const lastClaim = user.last_daily_claim_date
+  ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
+  : null;
 
-    const nextDay =
-      streakInfo.continueStreak
-        ? Math.min((Number(user.daily_streak ?? 0) || 0) + 1, 7)
-        : 1;
+if (lastClaim === today) {
+  await pool.query("ROLLBACK");
+  return res.json({ ok: true, already: true });
+}
+
+const nextDay = Math.min((Number(user.daily_streak ?? 0) || 0) + 1, 7);
 
     const rewardCoins = dailyRewardCoinsForDay(nextDay);
 
