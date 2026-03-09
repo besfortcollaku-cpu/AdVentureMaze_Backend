@@ -330,6 +330,94 @@ app.post("/api/rewards/mystery-chest", async (req,res)=>{
   }
 
 });
+app.post("/api/daily-reward/recover", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+
+    await pool.query("BEGIN");
+
+    const userRes = await pool.query(
+      `SELECT uid, coins, daily_streak, last_daily_claim_date
+       FROM public.users
+       WHERE uid = $1
+       FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    if (!user.last_daily_claim_date) {
+      await pool.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "no_missed_day" });
+    }
+
+    const last = new Date(user.last_daily_claim_date);
+    const now = new Date();
+
+    const diffDays = Math.floor(
+      (now.getTime() - last.getTime()) / (1000 * 60 * 60 * 24)
+    );
+
+    if (diffDays <= 1) {
+      await pool.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "no_missed_day" });
+    }
+
+    const currentStreak = Number(user.daily_streak ?? 0) || 0;
+    const missedDay = Math.min(currentStreak + 1, 7);
+    const rewardCoins = dailyRewardCoinsForDay(missedDay);
+
+    const cycleAnchor = new Date(user.last_daily_claim_date)
+      .toISOString()
+      .slice(0, 10);
+
+    const existingRecovery = await pool.query(
+      `SELECT 1
+       FROM daily_reward_recoveries
+       WHERE uid = $1 AND day = $2 AND cycle_anchor = $3
+       LIMIT 1`,
+      [uid, missedDay, cycleAnchor]
+    );
+
+    if (existingRecovery.rowCount) {
+      await pool.query("ROLLBACK");
+      return res.json({ ok: true, already: true });
+    }
+
+    await pool.query(
+      `INSERT INTO daily_reward_recoveries (uid, day, cycle_anchor)
+       VALUES ($1, $2, $3)`,
+      [uid, missedDay, cycleAnchor]
+    );
+
+    await pool.query(
+      `UPDATE public.users
+       SET coins = coins + $2
+       WHERE uid = $1`,
+      [uid, rewardCoins]
+    );
+
+    await pool.query("COMMIT");
+
+    const updatedRes = await pool.query(
+      `SELECT * FROM public.users WHERE uid = $1`,
+      [uid]
+    );
+
+    return res.json({
+      ok: true,
+      recoveredDay: missedDay,
+      coinsAwarded: rewardCoins,
+      user: updatedRes.rows[0],
+    });
+  } catch (e: any) {
+    await pool.query("ROLLBACK");
+    return res.status(400).json({ ok: false, error: e.message });
+  }
+});
 app.post("/api/daily-reward/claim", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
