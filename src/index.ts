@@ -127,25 +127,21 @@ const nextDay = Math.min(currentStreak + 1, 7);
 const currentStreak = Number(user?.daily_streak ?? 0) || 0;
 
 if (!user) {
-  dailyReward = { canClaim:false, day:0, coins:0 };
+  dailyReward.canClaim = false;
+  dailyReward.day = 0;
+  dailyReward.coins = 0;
 }
-
 else if (lastClaim === today) {
-  dailyReward = {
-    canClaim:false,
-    day:0,
-    coins:0
-  };
+  dailyReward.canClaim = false;
+  dailyReward.day = 0;
+  dailyReward.coins = 0;
 }
-
 else {
   const nextDay = Math.min(currentStreak + 1, 7);
 
-  dailyReward = {
-    canClaim:true,
-    day:nextDay,
-    coins:dailyRewardCoinsForDay(nextDay)
-  };
+  dailyReward.canClaim = true;
+  dailyReward.day = nextDay;
+  dailyReward.coins = dailyRewardCoinsForDay(nextDay);
 }
 
 for (let day = 1; day <= 7; day++) {
