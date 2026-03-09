@@ -154,14 +154,7 @@ if (user && currentStreak >= 7 && lastClaim === today) {
   mysteryChest = true;
   dailyReward.bonusState = "available";
 }
-console.log("DAILY DEBUG", {
-  uid,
-  db_streak: user?.daily_streak,
-  last_daily_claim_date: user?.last_daily_claim_date,
-  today,
-  nextDay,
-  dailyReward
-});
+
     res.json({
       ok: true,
 
@@ -537,9 +530,6 @@ function getBearerToken(req: express.Request) {
 }
 
 async function verifyPiAccessToken(accessToken: string) {
-  console.log("---- VERIFY PI TOKEN ----");
-  console.log("TOKEN:", accessToken);
-  console.log("TOKEN LENGTH:", accessToken?.length);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 3000);
@@ -550,11 +540,7 @@ async function verifyPiAccessToken(accessToken: string) {
       signal: controller.signal,
     });
 
-    console.log("PI STATUS:", r.status);
-
     const text = await r.text();
-    console.log("PI RAW RESPONSE:", text);
-
     if (!r.ok) {
       throw new Error("Invalid Pi access token");
     }
@@ -626,11 +612,7 @@ res.json(out);
 
 /* ---------------- REWARDS ---------------- */
 app.post("/api/rewards/ad-50", async (req,res)=>{
-console.log("HEADERS", req.headers.authorization);
-console.log("AD +50 HIT", {
-  hasUser: !!req.user,
-  uid: req.user?.uid,
-});  try{
+  try{
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce||"");
     if(!nonce) return res.status(400).json({ok:false});
@@ -1157,7 +1139,8 @@ app.delete("/admin/users/:uid", async (req, res) => {
   try {
     requireAdmin(req);
 
-    console.log("[ADMIN DELETE] HIT", req.params.uid);
+    
+    
     await adminDeleteUser(req.params.uid);
     res.json({ ok: true });
 
@@ -1172,15 +1155,11 @@ const PORT = Number(process.env.PORT) || 8080;
 async function start() {
   try {
     await initDB();
-    console.log("Database initialized");
-
     const info = await pool.query(`
       SELECT current_database(), inet_server_addr(), inet_server_port()
     `);
-    console.log("DB INFO:", info.rows);
-
     app.listen(PORT, "0.0.0.0", () => {
-      console.log("Backend listening on", PORT);
+     
     });
 
   } catch (err) {
