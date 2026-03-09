@@ -124,7 +124,6 @@ let dailyReward = {
 const currentStreak = Number(user?.daily_streak ?? 0) || 0;
 const nextDay = Math.min(currentStreak + 1, 7);
 
-const currentStreak = Number(user?.daily_streak ?? 0) || 0;
 
 if (!user) {
   dailyReward.canClaim = false;
