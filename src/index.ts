@@ -98,36 +98,22 @@ if (user?.last_daily_claim_date) {
   );
 }
 
-let missedDays: number[] = [];
+const missedRowsRes = await pool.query(
+  `SELECT day, is_recovered
+   FROM daily_reward_missed_days
+   WHERE uid = $1`,
+  [uid]
+);
 
-if (diffDays > 1) {
-  const missedCount = Math.min(diffDays - 1, 7);
-  for (let i = 1; i <= missedCount; i++) {
-    const missed = currentDay + i;
-    if (missed >= 1 && missed <= 7) {
-      missedDays.push(missed);
-    }
-  }
-}
+const missedDays = missedRowsRes.rows
+  .filter((r: any) => !r.is_recovered)
+  .map((r: any) => Number(r.day))
+  .filter((n: number) => Number.isInteger(n));
 
-let recoveredDays: number[] = [];
-
-if (user?.last_daily_claim_date) {
-  const cycleAnchor = new Date(user.last_daily_claim_date)
-    .toISOString()
-    .slice(0, 10);
-
-  const recoveryRes = await pool.query(
-    `SELECT day
-     FROM daily_reward_recoveries
-     WHERE uid = $1 AND cycle_anchor = $2`,
-    [uid, cycleAnchor]
-  );
-
-  recoveredDays = recoveryRes.rows
-    .map((r: any) => Number(r.day))
-    .filter((n: number) => Number.isInteger(n));
-}
+const recoveredDays = missedRowsRes.rows
+  .filter((r: any) => r.is_recovered)
+  .map((r: any) => Number(r.day))
+  .filter((n: number) => Number.isInteger(n));
 
 let todayDay = 0;
 
@@ -162,12 +148,10 @@ for (let day = 1; day <= 7; day++) {
 
   if (recoveredDays.includes(day)) {
     state = "recovered";
-  } else if (day === currentDay && lastClaim === today) {
-    state = "claimed";
-  } else if (day < currentDay) {
-    state = "claimed";
   } else if (missedDays.includes(day)) {
     state = "missed";
+  } else if (day <= currentDay) {
+    state = "claimed";
   } else if (day === todayDay && lastClaim !== today) {
     state = "today";
   }
@@ -187,7 +171,7 @@ if (user && currentDay === 7 && lastClaim === today) {
 }
 
 let missedDay = null;
-const firstRecoverableMissedDay = missedDays.find((d) => !recoveredDays.includes(d));
+const firstRecoverableMissedDay = missedDays[0] ?? null;
 
 if (firstRecoverableMissedDay) {
   missedDay = {
@@ -195,7 +179,6 @@ if (firstRecoverableMissedDay) {
     coins: dailyRewardCoinsForDay(firstRecoverableMissedDay),
   };
 }
-
     res.json({
       ok: true,
 
@@ -498,6 +481,20 @@ app.post("/api/daily-reward/claim", async (req, res) => {
       todayDay = Math.min(currentDay + Math.max(diffDays, 1), 7);
     }
 
+    const missedCount = Math.max(diffDays - 1, 0);
+
+    for (let i = 1; i <= missedCount; i++) {
+      const missed = currentDay + i;
+      if (missed >= 1 && missed < todayDay && missed <= 7) {
+        await pool.query(
+          `INSERT INTO daily_reward_missed_days (uid, day, is_recovered)
+           VALUES ($1, $2, FALSE)
+           ON CONFLICT (uid, day) DO NOTHING`,
+          [uid, missed]
+        );
+      }
+    }
+
     const rewardCoins = dailyRewardCoinsForDay(todayDay);
 
     await pool.query(
@@ -530,7 +527,6 @@ app.post("/api/daily-reward/claim", async (req, res) => {
     return res.status(400).json({ ok: false, error: e.message });
   }
 });
-
 app.post("/api/rewards/recover-day", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
@@ -542,66 +538,22 @@ app.post("/api/rewards/recover-day", async (req, res) => {
 
     await pool.query("BEGIN");
 
-    const userRes = await pool.query(
-      `SELECT uid, coins, daily_streak, last_daily_claim_date
-       FROM public.users
-       WHERE uid = $1
-       FOR UPDATE`,
-      [uid]
-    );
-
-    const user = userRes.rows[0];
-    if (!user) {
-      throw new Error("User not found");
-    }
-
-    if (!user.last_daily_claim_date) {
-      await pool.query("ROLLBACK");
-      return res.status(400).json({ ok: false, error: "no_missed_day" });
-    }
-
-    const currentDay = Number(user.daily_streak ?? 0) || 0;
-
-    const last = new Date(user.last_daily_claim_date);
-    const now = new Date();
-
-    const diffDays = Math.floor(
-      (now.getTime() - last.getTime()) / (1000 * 60 * 60 * 24)
-    );
-
-    if (diffDays <= 1) {
-      await pool.query("ROLLBACK");
-      return res.status(400).json({ ok: false, error: "no_missed_day" });
-    }
-
-    let allowedMissedDays: number[] = [];
-    const missedCount = Math.min(diffDays - 1, 7);
-
-    for (let i = 1; i <= missedCount; i++) {
-      const missed = currentDay + i;
-      if (missed >= 1 && missed <= 7) {
-        allowedMissedDays.push(missed);
-      }
-    }
-
-    if (!allowedMissedDays.includes(day)) {
-      await pool.query("ROLLBACK");
-      return res.status(400).json({ ok: false, error: "invalid_recover_day" });
-    }
-
-    const cycleAnchor = new Date(user.last_daily_claim_date)
-      .toISOString()
-      .slice(0, 10);
-
-    const existingRecovery = await pool.query(
-      `SELECT 1
-       FROM daily_reward_recoveries
-       WHERE uid = $1 AND cycle_anchor = $2 AND day = $3
+    const missedRes = await pool.query(
+      `SELECT day, is_recovered
+       FROM daily_reward_missed_days
+       WHERE uid = $1 AND day = $2
        LIMIT 1`,
-      [uid, cycleAnchor, day]
+      [uid, day]
     );
 
-    if (existingRecovery.rowCount) {
+    const missed = missedRes.rows[0];
+
+    if (!missed) {
+      await pool.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "no_missed_day" });
+    }
+
+    if (missed.is_recovered) {
       await pool.query("ROLLBACK");
       return res.json({ ok: true, already: true });
     }
@@ -609,9 +561,10 @@ app.post("/api/rewards/recover-day", async (req, res) => {
     const coins = dailyRewardCoinsForDay(day);
 
     await pool.query(
-      `INSERT INTO daily_reward_recoveries (uid, cycle_anchor, day)
-       VALUES ($1, $2, $3)`,
-      [uid, cycleAnchor, day]
+      `UPDATE daily_reward_missed_days
+       SET is_recovered = TRUE
+       WHERE uid = $1 AND day = $2`,
+      [uid, day]
     );
 
     await pool.query(
@@ -639,7 +592,6 @@ app.post("/api/rewards/recover-day", async (req, res) => {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
-
 app.patch("/api/user/username", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
