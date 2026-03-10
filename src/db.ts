@@ -114,6 +114,8 @@ export async function initDB() {
     );
   `);
 
+await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_pending BOOLEAN NOT NULL DEFAULT FALSE`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS reward_claims (
       uid TEXT NOT NULL,
@@ -172,6 +174,7 @@ await pool.query(`
     );
   `);
 }
+
 
 
 /* =====================================================

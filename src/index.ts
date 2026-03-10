@@ -179,7 +179,7 @@ for (let day = 1; day <= 7; day++) {
 
 let mysteryChest = false;
 
-if (user && currentDay === 7 && lastClaim === today) {
+if (user?.mystery_box_pending === true) {
   mysteryChest = true;
   dailyReward.bonusState = "available";
 }
@@ -314,20 +314,24 @@ function rewardForDay(day:number){
   return DAILY_REWARDS[Math.min(day-1, DAILY_REWARDS.length-1)];
 }
 
-app.post("/api/rewards/mystery-chest", async (req,res)=>{
-
-  try{
-
+app.post("/api/rewards/mystery-chest", async (req, res) => {
+  try {
     const { uid } = await requirePiUser(req);
 
+    await pool.query("BEGIN");
+
     const userRes = await pool.query(
-      `SELECT daily_streak FROM public.users WHERE uid=$1`,
+      `SELECT uid, coins, daily_streak, last_daily_claim_date, mystery_box_pending
+       FROM public.users
+       WHERE uid = $1
+       FOR UPDATE`,
       [uid]
     );
 
     const user = userRes.rows[0];
 
-    if (!user || user.daily_streak < 7) {
+    if (!user || user.mystery_box_pending !== true) {
+      await pool.query("ROLLBACK");
       throw new Error("not_available");
     }
 
@@ -335,29 +339,38 @@ app.post("/api/rewards/mystery-chest", async (req,res)=>{
 
     await pool.query(
       `UPDATE public.users
-       SET coins = coins + $1,
-           daily_streak = 0
-       WHERE uid=$2`,
+       SET
+         coins = coins + $1,
+         daily_streak = 0,
+         mystery_box_pending = FALSE,
+         last_daily_claim_date = CURRENT_DATE
+       WHERE uid = $2`,
       [reward, uid]
     );
 
+    await pool.query(
+      `DELETE FROM daily_reward_missed_days
+       WHERE uid = $1`,
+      [uid]
+    );
+
+    await pool.query("COMMIT");
+
     const updated = await pool.query(
-      `SELECT coins FROM public.users WHERE uid=$1`,
+      `SELECT * FROM public.users WHERE uid = $1`,
       [uid]
     );
 
     res.json({
-      ok:true,
+      ok: true,
       reward,
-      user:updated.rows[0]
+      user: updated.rows[0]
     });
-
-  }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
+  } catch (e: any) {
+    await pool.query("ROLLBACK");
+    res.status(400).json({ ok: false, error: e.message });
   }
-
-});
-app.post("/api/daily-reward/recover", async (req, res) => {
+});app.post("/api/daily-reward/recover", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
 
@@ -452,7 +465,7 @@ app.post("/api/daily-reward/claim", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT uid, coins, daily_streak, last_daily_claim_date
+      `SELECT uid, coins, daily_streak, last_daily_claim_date, mystery_box_pending
        FROM public.users
        WHERE uid = $1
        FOR UPDATE`,
@@ -511,17 +524,64 @@ app.post("/api/daily-reward/claim", async (req, res) => {
 
     const rewardCoins = dailyRewardCoinsForDay(todayDay);
 
-    await pool.query(
-      `
-      UPDATE public.users
-      SET
-        coins = coins + $2,
-        daily_streak = $3,
-        last_daily_claim_date = CURRENT_DATE
-      WHERE uid = $1
-      `,
-      [uid, rewardCoins, todayDay]
-    );
+    if (todayDay === 7) {
+      const missedCheckRes = await pool.query(
+        `SELECT 1
+         FROM daily_reward_missed_days
+         WHERE uid = $1
+         LIMIT 1`,
+        [uid]
+      );
+
+      const perfectCycle = missedCheckRes.rowCount === 0;
+
+      if (perfectCycle) {
+        await pool.query(
+          `
+          UPDATE public.users
+          SET
+            coins = coins + $2,
+            daily_streak = 7,
+            last_daily_claim_date = CURRENT_DATE,
+            mystery_box_pending = TRUE
+          WHERE uid = $1
+          `,
+          [uid, rewardCoins]
+        );
+      } else {
+        await pool.query(
+          `
+          UPDATE public.users
+          SET
+            coins = coins + $2,
+            daily_streak = 0,
+            last_daily_claim_date = CURRENT_DATE,
+            mystery_box_pending = FALSE
+          WHERE uid = $1
+          `,
+          [uid, rewardCoins]
+        );
+
+        await pool.query(
+          `DELETE FROM daily_reward_missed_days
+           WHERE uid = $1`,
+          [uid]
+        );
+      }
+    } else {
+      await pool.query(
+        `
+        UPDATE public.users
+        SET
+          coins = coins + $2,
+          daily_streak = $3,
+          last_daily_claim_date = CURRENT_DATE,
+          mystery_box_pending = FALSE
+        WHERE uid = $1
+        `,
+        [uid, rewardCoins, todayDay]
+      );
+    }
 
     await pool.query("COMMIT");
 
