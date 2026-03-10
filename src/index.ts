@@ -593,6 +593,51 @@ app.post("/api/rewards/recover-day", async (req, res) => {
 
     await pool.query("BEGIN");
 
+    const userRes = await pool.query(
+      `SELECT uid, coins, daily_streak, last_daily_claim_date
+       FROM public.users
+       WHERE uid = $1
+       FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    const currentDay = Number(user.daily_streak ?? 0) || 0;
+
+    const lastClaim = user.last_daily_claim_date
+      ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
+      : null;
+
+    if (!lastClaim) {
+      await pool.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "no_missed_day" });
+    }
+
+    const last = new Date(user.last_daily_claim_date);
+    const now = new Date();
+
+    const diffDays = Math.floor(
+      (now.getTime() - last.getTime()) / (1000 * 60 * 60 * 24)
+    );
+
+    const todayDay = Math.min(currentDay + Math.max(diffDays, 1), 7);
+
+    const allowedMissedDays: number[] = [];
+    for (let d = currentDay + 1; d < todayDay; d++) {
+      if (d >= 1 && d <= 7) {
+        allowedMissedDays.push(d);
+      }
+    }
+
+    if (!allowedMissedDays.includes(day)) {
+      await pool.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "no_missed_day" });
+    }
+
     const missedRes = await pool.query(
       `SELECT day, is_recovered
        FROM daily_reward_missed_days
@@ -603,24 +648,27 @@ app.post("/api/rewards/recover-day", async (req, res) => {
 
     const missed = missedRes.rows[0];
 
-    if (!missed) {
-      await pool.query("ROLLBACK");
-      return res.status(400).json({ ok: false, error: "no_missed_day" });
-    }
-
-    if (missed.is_recovered) {
+    if (missed?.is_recovered) {
       await pool.query("ROLLBACK");
       return res.json({ ok: true, already: true });
     }
 
-    const coins = dailyRewardCoinsForDay(day);
+    if (!missed) {
+      await pool.query(
+        `INSERT INTO daily_reward_missed_days (uid, day, is_recovered)
+         VALUES ($1, $2, TRUE)`,
+        [uid, day]
+      );
+    } else {
+      await pool.query(
+        `UPDATE daily_reward_missed_days
+         SET is_recovered = TRUE
+         WHERE uid = $1 AND day = $2`,
+        [uid, day]
+      );
+    }
 
-    await pool.query(
-      `UPDATE daily_reward_missed_days
-       SET is_recovered = TRUE
-       WHERE uid = $1 AND day = $2`,
-      [uid, day]
-    );
+    const coins = dailyRewardCoinsForDay(day);
 
     await pool.query(
       `UPDATE public.users
