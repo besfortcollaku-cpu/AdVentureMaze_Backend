@@ -1,4 +1,4 @@
-process.on("unhandledRejection", (reason) => {
+﻿process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:", reason);
 });
 
@@ -40,7 +40,7 @@ recalcAndStoreMonthlyRate,
   adminGetStats,
   adminListOnlineUsers,
   adminResetFreeCounters,
-  // ✅ charts1
+  // âœ… charts1
   adminChartCoins,
   adminChartActiveUsers,
 } from "./db";
@@ -202,7 +202,7 @@ if (firstRecoverableMissedDay) {
             username: user.username,
             coins: user.coins,
 
-            // 🔹 paid balances (wallet)
+            // ðŸ”¹ paid balances (wallet)
             restarts_balance: user.restarts_balance ?? 0,
             skips_balance: user.skips_balance ?? 0,
             hints_balance: user.hints_balance ?? 0,
@@ -284,25 +284,6 @@ app.post("/api/progress", async (req, res) => {
   } catch (e) {
     const message = e instanceof Error ? e.message : "Unknown error";
     res.status(400).json({ ok: false, error: message });
-  }
-});
-app.patch("/api/user/username", async (req, res) => {
-  try {
-    const { uid } = await requirePiUser(req);
-    const { username } = req.body;
-
-    if (!username || username.length < 3 || username.length > 20) {
-      return res.status(400).json({ ok: false, error: "Invalid username" });
-    }
-
-    await pool.query(
-      `UPDATE public.users SET username=$1 WHERE uid=$2`,
-      [username, uid]
-    );
-
-    res.json({ ok: true });
-  } catch (e: any) {
-    res.status(401).json({ ok: false, error: e.message });
   }
 });
 /* ---------------- PROGRESS ---------------- */
@@ -678,7 +659,7 @@ app.patch("/api/user/username", async (req, res) => {
     username = username.trim();
 
     if (username.length < 3 || username.length > 20) {
-      return res.status(400).json({ ok: false, error: "Username must be 3–20 characters" });
+      return res.status(400).json({ ok: false, error: "Username must be 3â€“20 characters" });
     }
 
     // allow only letters, numbers, underscore
@@ -1320,7 +1301,7 @@ app.get("/admin/online", async (req,res)=>{
   }
 });
 
-/* ✅ NEW: admin users list + detail (Fix 2) */
+/* âœ… NEW: admin users list + detail (Fix 2) */
 app.get("/admin/users", async (req,res)=>{
   try{
     requireAdmin(req);
@@ -1345,7 +1326,7 @@ app.get("/admin/users/:uid", async (req,res)=>{
   }
 });
 
-/* ✅ NEW: charts endpoints (Step 1 – “A: last 7 days”) */
+/* âœ… NEW: charts endpoints (Step 1 â€“ â€œA: last 7 daysâ€) */
 app.get("/admin/charts/coins", async (req,res)=>{
   try{
     requireAdmin(req);
@@ -1369,7 +1350,7 @@ app.get("/admin/charts/active", async (req,res)=>{
 });
 
 
-// ✅ ADMIN: delete user completely
+// âœ… ADMIN: delete user completely
 app.delete("/admin/users/:uid", async (req, res) => {
   try {
     requireAdmin(req);

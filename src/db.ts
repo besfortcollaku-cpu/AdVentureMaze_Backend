@@ -1,4 +1,4 @@
-import { Pool } from "pg";
+﻿import { Pool } from "pg";
 console.log("Backend v2.0.1");
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -8,7 +8,7 @@ export const pool = new Pool({
 });
 
 /* =====================================================
-   INIT  (✅ Fix 1: auto-create core tables incl. sessions)
+   INIT  (âœ… Fix 1: auto-create core tables incl. sessions)
 ===================================================== */
 
 export async function useNonce(uid: string, nonce: string) {
@@ -102,6 +102,17 @@ export async function initDB() {
       ADD COLUMN IF NOT EXISTS monthly_rate_breakdown JSONB DEFAULT '{}'::jsonb,
       ADD COLUMN IF NOT EXISTS monthly_final_rate INT DEFAULT 50;
   `);
+  await pool.query(`
+    ALTER TABLE public.users
+      ADD COLUMN IF NOT EXISTS restarts_balance INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS skips_balance INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS hints_balance INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS daily_streak INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_daily_claim_date DATE,
+      ADD COLUMN IF NOT EXISTS lifetime_coins_earned INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS lifetime_coins_spent INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS lifetime_levels_completed INT DEFAULT 0;
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS progress (
@@ -123,6 +134,33 @@ await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_
       nonce TEXT,
       amount INT DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reward_nonces (
+      nonce TEXT PRIMARY KEY,
+      uid TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS daily_reward_missed_days (
+      uid TEXT NOT NULL,
+      day INT NOT NULL,
+      is_recovered BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (uid, day)
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS daily_reward_recoveries (
+      uid TEXT NOT NULL,
+      day INT NOT NULL,
+      cycle_anchor TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (uid, day, cycle_anchor)
     );
   `);
 
@@ -172,6 +210,11 @@ await pool.query(`
       ads_for_hints INT DEFAULT 0,
       PRIMARY KEY (uid, month)
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE user_ads
+    ADD COLUMN IF NOT EXISTS ads_for_restarts INT DEFAULT 0
   `);
 }
 
@@ -853,7 +896,7 @@ export async function adminListUsers({
   
 
 
-  // ✅ no search
+  // âœ… no search
   const { rows } = await pool.query(
     `
     SELECT *
@@ -971,7 +1014,7 @@ export async function adminListOnlineUsers({
 
 
 /* ============================
-   Charts (Step 1 – 7 days default)
+   Charts (Step 1 â€“ 7 days default)
 ============================ */
 export async function adminChartCoins({ days }: { days: number }) {
   const d = Math.max(1, Math.min(90, Number(days || 7)));
@@ -1083,16 +1126,16 @@ function coinRewardForAd(adsForCoinsThisMonth: number) {
   return Math.max(reward, 2);
 }
 export async function claimCoinAd(uid: string) {
-  // 1️⃣ Track ad view
+  // 1ï¸âƒ£ Track ad view
   await trackAdView(uid, "coins");
 
-  // 2️⃣ Read monthly ads
+  // 2ï¸âƒ£ Read monthly ads
   const ads = await getMonthlyAds(uid);
 
   // ads_for_coins already incremented
   const coins = coinRewardForAd(ads.ads_for_coins - 1);
 
-  // 3️⃣ Use EXISTING reward system
+  // 3ï¸âƒ£ Use EXISTING reward system
   const nonce = `coin-ad-${currentMonthKey()}-${ads.ads_for_coins}`;
 
   return await claimReward({
@@ -1277,3 +1320,6 @@ export async function claimMonthlyRewards(uid: string, opts?: { month?: string }
     client.release();
   }
 }
+
+
+
