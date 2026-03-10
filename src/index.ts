@@ -105,7 +105,7 @@ const missedRowsRes = await pool.query(
   [uid]
 );
 
-const missedDays = missedRowsRes.rows
+const persistedMissedDays = missedRowsRes.rows
   .filter((r: any) => !r.is_recovered)
   .map((r: any) => Number(r.day))
   .filter((n: number) => Number.isInteger(n));
@@ -124,6 +124,20 @@ if (user && lastClaim !== today) {
     todayDay = Math.min(currentDay + Math.max(diffDays, 1), 7);
   }
 }
+
+const derivedMissedDays: number[] = [];
+
+if (todayDay > 0) {
+  for (let day = currentDay + 1; day < todayDay; day++) {
+    if (day >= 1 && day <= 7 && !recoveredDays.includes(day)) {
+      derivedMissedDays.push(day);
+    }
+  }
+}
+
+const missedDays = Array.from(
+  new Set([...persistedMissedDays, ...derivedMissedDays])
+).filter((day) => !recoveredDays.includes(day));
 
 let dailyReward = {
   canClaim: false,
