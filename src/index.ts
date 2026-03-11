@@ -87,16 +87,7 @@ const lastClaim = user?.last_daily_claim_date
   : null;
 
 const currentDay = Number(user?.daily_streak ?? 0) || 0;
-
-let diffDays = 0;
-if (user?.last_daily_claim_date) {
-  const last = new Date(user.last_daily_claim_date);
-  const now = new Date();
-
-  diffDays = Math.floor(
-    (now.getTime() - last.getTime()) / (1000 * 60 * 60 * 24)
-  );
-}
+const claimPlan = user ? buildDailyClaimPlan(user) : null;
 
 const missedRowsRes = await pool.query(
   `SELECT day, is_recovered
@@ -115,25 +106,11 @@ const recoveredDays = missedRowsRes.rows
   .map((r: any) => Number(r.day))
   .filter((n: number) => Number.isInteger(n));
 
-let todayDay = 0;
-
-if (user && lastClaim !== today) {
-  if (!lastClaim) {
-    todayDay = Math.min(currentDay + 1, 7);
-  } else {
-    todayDay = Math.min(currentDay + Math.max(diffDays, 1), 7);
-  }
-}
+const todayDay =
+  user && claimPlan && !claimPlan.already ? claimPlan.nextDay : 0;
 
 const derivedMissedDays: number[] = [];
 
-if (todayDay > 0) {
-  for (let day = currentDay + 1; day < todayDay; day++) {
-    if (day >= 1 && day <= 7 && !recoveredDays.includes(day)) {
-      derivedMissedDays.push(day);
-    }
-  }
-}
 
 const missedDays = Array.from(
   new Set([...persistedMissedDays, ...derivedMissedDays])
@@ -295,6 +272,43 @@ function rewardForDay(day:number){
   return DAILY_REWARDS[Math.min(day-1, DAILY_REWARDS.length-1)];
 }
 
+function isoDateUTC(input: Date | string) {
+  return new Date(input).toISOString().slice(0, 10);
+}
+
+function dayDiffFromIsoDate(lastIsoDate: string, now = new Date()) {
+  const last = new Date(`${lastIsoDate}T00:00:00.000Z`);
+  const today = new Date(`${isoDateUTC(now)}T00:00:00.000Z`);
+  return Math.floor((today.getTime() - last.getTime()) / 86400000);
+}
+
+function buildDailyClaimPlan(user: any, now = new Date()) {
+  const currentStreak = Number(user?.daily_streak ?? 0) || 0;
+  const lastClaimIso = user?.last_daily_claim_date
+    ? isoDateUTC(user.last_daily_claim_date)
+    : null;
+
+  if (!lastClaimIso) {
+    return { already: false, nextDay: 1, resetCycle: false };
+  }
+
+  const diffDays = dayDiffFromIsoDate(lastClaimIso, now);
+
+  if (diffDays <= 0) {
+    return { already: true, nextDay: 0, resetCycle: false };
+  }
+
+  if (diffDays === 1) {
+    return {
+      already: false,
+      nextDay: Math.min(currentStreak + 1, 7),
+      resetCycle: false,
+    };
+  }
+
+  return { already: false, nextDay: 1, resetCycle: true };
+}
+
 app.post("/api/rewards/mystery-chest", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
@@ -357,62 +371,38 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
 
     await pool.query("BEGIN");
 
+    // lock user row while updating coins
     const userRes = await pool.query(
-      `SELECT uid, coins, daily_streak, last_daily_claim_date
-       FROM public.users
-       WHERE uid = $1
-       FOR UPDATE`,
+      `SELECT uid, coins FROM public.users WHERE uid = $1 FOR UPDATE`,
       [uid]
     );
-
-    const user = userRes.rows[0];
-    if (!user) {
+    if (!userRes.rows[0]) {
       throw new Error("User not found");
     }
 
-    if (!user.last_daily_claim_date) {
-      await pool.query("ROLLBACK");
-      return res.status(400).json({ ok: false, error: "no_missed_day" });
-    }
-
-    const last = new Date(user.last_daily_claim_date);
-    const now = new Date();
-
-    const diffDays = Math.floor(
-      (now.getTime() - last.getTime()) / (1000 * 60 * 60 * 24)
-    );
-
-    if (diffDays <= 1) {
-      await pool.query("ROLLBACK");
-      return res.status(400).json({ ok: false, error: "no_missed_day" });
-    }
-
-    const currentStreak = Number(user.daily_streak ?? 0) || 0;
-    const missedDay = Math.min(currentStreak + 1, 7);
-    const rewardCoins = dailyRewardCoinsForDay(missedDay);
-
-    const cycleAnchor = new Date(user.last_daily_claim_date)
-      .toISOString()
-      .slice(0, 10);
-
-    const existingRecovery = await pool.query(
-      `SELECT 1
-       FROM daily_reward_recoveries
-       WHERE uid = $1 AND day = $2 AND cycle_anchor = $3
+    const missedRes = await pool.query(
+      `SELECT day
+       FROM daily_reward_missed_days
+       WHERE uid = $1 AND is_recovered = FALSE
+       ORDER BY day ASC
        LIMIT 1`,
-      [uid, missedDay, cycleAnchor]
+      [uid]
     );
 
-    if (existingRecovery.rowCount) {
+    const missedDay = Number(missedRes.rows[0]?.day ?? 0);
+    if (!Number.isInteger(missedDay) || missedDay < 1 || missedDay > 7) {
       await pool.query("ROLLBACK");
-      return res.json({ ok: true, already: true });
+      return res.status(400).json({ ok: false, error: "no_missed_day" });
     }
 
     await pool.query(
-      `INSERT INTO daily_reward_recoveries (uid, day, cycle_anchor)
-       VALUES ($1, $2, $3)`,
-      [uid, missedDay, cycleAnchor]
+      `UPDATE daily_reward_missed_days
+       SET is_recovered = TRUE
+       WHERE uid = $1 AND day = $2`,
+      [uid, missedDay]
     );
+
+    const rewardCoins = dailyRewardCoinsForDay(missedDay);
 
     await pool.query(
       `UPDATE public.users
@@ -458,109 +448,42 @@ app.post("/api/daily-reward/claim", async (req, res) => {
       throw new Error("User not found");
     }
 
-    const today = new Date().toISOString().slice(0, 10);
+    const plan = buildDailyClaimPlan(user);
 
-    const lastClaim = user.last_daily_claim_date
-      ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
-      : null;
-
-    if (lastClaim === today) {
+    if (plan.already) {
       await pool.query("ROLLBACK");
       return res.json({ ok: true, already: true });
     }
 
-    const currentDay = Number(user.daily_streak ?? 0) || 0;
-
-    let diffDays = 0;
-    if (user.last_daily_claim_date) {
-      const last = new Date(user.last_daily_claim_date);
-      const now = new Date();
-
-      diffDays = Math.floor(
-        (now.getTime() - last.getTime()) / (1000 * 60 * 60 * 24)
-      );
-    }
-
-    let todayDay = 0;
-
-    if (!lastClaim) {
-      todayDay = Math.min(currentDay + 1, 7);
-    } else {
-      todayDay = Math.min(currentDay + Math.max(diffDays, 1), 7);
-    }
-
-    const missedCount = Math.max(diffDays - 1, 0);
-
-    for (let i = 1; i <= missedCount; i++) {
-      const missed = currentDay + i;
-      if (missed >= 1 && missed < todayDay && missed <= 7) {
-        await pool.query(
-          `INSERT INTO daily_reward_missed_days (uid, day, is_recovered)
-           VALUES ($1, $2, FALSE)
-           ON CONFLICT (uid, day) DO NOTHING`,
-          [uid, missed]
-        );
-      }
-    }
-
-    const rewardCoins = dailyRewardCoinsForDay(todayDay);
-
-    if (todayDay === 7) {
-      const missedCheckRes = await pool.query(
-        `SELECT 1
-         FROM daily_reward_missed_days
-         WHERE uid = $1
-         LIMIT 1`,
+    if (plan.resetCycle) {
+      await pool.query(
+        `DELETE FROM daily_reward_missed_days
+         WHERE uid = $1`,
         [uid]
       );
+    }
 
-      const perfectCycle = missedCheckRes.rowCount === 0;
+    const rewardCoins = dailyRewardCoinsForDay(plan.nextDay);
 
-      if (perfectCycle) {
-        await pool.query(
-          `
-          UPDATE public.users
-          SET
-            coins = coins + $2,
-            daily_streak = 7,
-            last_daily_claim_date = CURRENT_DATE,
-            mystery_box_pending = TRUE
-          WHERE uid = $1
-          `,
-          [uid, rewardCoins]
-        );
-      } else {
-        await pool.query(
-          `
-          UPDATE public.users
-          SET
-            coins = coins + $2,
-            daily_streak = 0,
-            last_daily_claim_date = CURRENT_DATE,
-            mystery_box_pending = FALSE
-          WHERE uid = $1
-          `,
-          [uid, rewardCoins]
-        );
-
-        await pool.query(
-          `DELETE FROM daily_reward_missed_days
-           WHERE uid = $1`,
-          [uid]
-        );
-      }
+    if (plan.nextDay === 7) {
+      await pool.query(
+        `UPDATE public.users
+         SET coins = coins + $2,
+             daily_streak = 7,
+             last_daily_claim_date = CURRENT_DATE,
+             mystery_box_pending = TRUE
+         WHERE uid = $1`,
+        [uid, rewardCoins]
+      );
     } else {
       await pool.query(
-        `
-        UPDATE public.users
-        SET
-          coins = coins + $2,
-          daily_streak = $3,
-          last_daily_claim_date = CURRENT_DATE,
-          mystery_box_pending = FALSE
-        WHERE uid = $1
-        `,
-        [uid, rewardCoins, todayDay]
+        `UPDATE public.users
+         SET coins = coins + $2,
+             daily_streak = $3,
+             last_daily_claim_date = CURRENT_DATE,
+             mystery_box_pending = FALSE
+         WHERE uid = $1`,
+        [uid, rewardCoins, plan.nextDay]
       );
     }
 
@@ -573,7 +496,7 @@ app.post("/api/daily-reward/claim", async (req, res) => {
 
     return res.json({
       ok: true,
-      day: todayDay,
+      day: plan.nextDay,
       coinsAwarded: rewardCoins,
       user: updatedRes.rows[0],
     });
@@ -594,7 +517,7 @@ app.post("/api/rewards/recover-day", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT uid, coins, daily_streak, last_daily_claim_date
+      `SELECT uid, coins
        FROM public.users
        WHERE uid = $1
        FOR UPDATE`,
@@ -604,38 +527,6 @@ app.post("/api/rewards/recover-day", async (req, res) => {
     const user = userRes.rows[0];
     if (!user) {
       throw new Error("User not found");
-    }
-
-    const currentDay = Number(user.daily_streak ?? 0) || 0;
-
-    const lastClaim = user.last_daily_claim_date
-      ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
-      : null;
-
-    if (!lastClaim) {
-      await pool.query("ROLLBACK");
-      return res.status(400).json({ ok: false, error: "no_missed_day" });
-    }
-
-    const last = new Date(user.last_daily_claim_date);
-    const now = new Date();
-
-    const diffDays = Math.floor(
-      (now.getTime() - last.getTime()) / (1000 * 60 * 60 * 24)
-    );
-
-    const todayDay = Math.min(currentDay + Math.max(diffDays, 1), 7);
-
-    const allowedMissedDays: number[] = [];
-    for (let d = currentDay + 1; d < todayDay; d++) {
-      if (d >= 1 && d <= 7) {
-        allowedMissedDays.push(d);
-      }
-    }
-
-    if (!allowedMissedDays.includes(day)) {
-      await pool.query("ROLLBACK");
-      return res.status(400).json({ ok: false, error: "no_missed_day" });
     }
 
     const missedRes = await pool.query(
@@ -654,19 +545,16 @@ app.post("/api/rewards/recover-day", async (req, res) => {
     }
 
     if (!missed) {
-      await pool.query(
-        `INSERT INTO daily_reward_missed_days (uid, day, is_recovered)
-         VALUES ($1, $2, TRUE)`,
-        [uid, day]
-      );
-    } else {
-      await pool.query(
-        `UPDATE daily_reward_missed_days
-         SET is_recovered = TRUE
-         WHERE uid = $1 AND day = $2`,
-        [uid, day]
-      );
+      await pool.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "no_missed_day" });
     }
+
+    await pool.query(
+      `UPDATE daily_reward_missed_days
+       SET is_recovered = TRUE
+       WHERE uid = $1 AND day = $2`,
+      [uid, day]
+    );
 
     const coins = dailyRewardCoinsForDay(day);
 
@@ -1042,46 +930,48 @@ app.post("/api/rewards/daily-claim", async (req, res) => {
 
     await pool.query("BEGIN");
 
-const userRes = await pool.query(
-  `SELECT coins, daily_streak, last_daily_claim_date
-   FROM public.users
-   WHERE uid=$1
-   FOR UPDATE`,
-  [uid]
-);
+    const userRes = await pool.query(
+      `SELECT uid, coins, daily_streak, last_daily_claim_date, mystery_box_pending
+       FROM public.users
+       WHERE uid = $1
+       FOR UPDATE`,
+      [uid]
+    );
 
     const user = userRes.rows[0];
-
     if (!user) {
       throw new Error("user_not_found");
     }
 
-    const today = new Date().toISOString().slice(0,10);
+    const plan = buildDailyClaimPlan(user);
 
-const lastClaim = user.last_daily_claim_date
-  ? new Date(user.last_daily_claim_date).toISOString().slice(0,10)
-  : null;
+    if (plan.already) {
+      await pool.query("ROLLBACK");
+      return res.json({ ok: true, already: true });
+    }
 
-if (lastClaim === today) {
-  return res.json({
-    ok: true,
-    already: true,
-  });
-}
-    const nextDay = Math.min((user.daily_streak ?? 0) + 1, 7);
-    const reward = dailyRewardCoinsForDay(nextDay);
+    if (plan.resetCycle) {
+      await pool.query(
+        `DELETE FROM daily_reward_missed_days
+         WHERE uid = $1`,
+        [uid]
+      );
+    }
+
+    const reward = dailyRewardCoinsForDay(plan.nextDay);
 
     await pool.query(
       `UPDATE public.users
        SET coins = coins + $1,
            daily_streak = $2,
-           last_daily_claim_date = $3
-       WHERE uid = $4`,
-      [reward, nextDay, today, uid]
+           last_daily_claim_date = CURRENT_DATE,
+           mystery_box_pending = CASE WHEN $2 = 7 THEN TRUE ELSE FALSE END
+       WHERE uid = $3`,
+      [reward, plan.nextDay, uid]
     );
 
     const updated = await pool.query(
-      `SELECT coins, daily_streak
+      `SELECT coins, daily_streak, mystery_box_pending
        FROM public.users
        WHERE uid=$1`,
       [uid]
@@ -1089,17 +979,16 @@ if (lastClaim === today) {
 
     await pool.query("COMMIT");
 
-res.json({
-  ok: true,
-  day: nextDay,
-  coins: reward,
-  user: updated.rows[0],
-});
-
-} catch (e: any) {
-  await pool.query("ROLLBACK");
-  res.status(400).json({ ok: false, error: e.message });
-}
+    res.json({
+      ok: true,
+      day: plan.nextDay,
+      coins: reward,
+      user: updated.rows[0],
+    });
+  } catch (e: any) {
+    await pool.query("ROLLBACK");
+    res.status(400).json({ ok: false, error: e.message });
+  }
 });
 
 app.post("/api/skip", async (req, res) => {
@@ -1433,3 +1322,4 @@ async function start() {
 }
 
 start();
+
