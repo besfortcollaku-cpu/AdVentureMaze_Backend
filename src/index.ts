@@ -107,8 +107,14 @@ const recoveredDays = missedRowsRes.rows
   .map((r: any) => Number(r.day))
   .filter((n: number) => Number.isInteger(n));
 
-const todayDay =
-  user && claimPlan && !claimPlan.already ? claimPlan.nextDay : 0;
+const testTodayDay =
+  ALLOW_INFERRED_MISSED_FOR_TEST && user
+    ? inferTodayDayFromLastClaim(user)
+    : 0;
+
+const todayDay = user && claimPlan && !claimPlan.already
+  ? Math.max(claimPlan.nextDay, testTodayDay)
+  : 0;
 
 const derivedMissedDays: number[] =
   ALLOW_INFERRED_MISSED_FOR_TEST && user
@@ -307,6 +313,20 @@ function inferMissedDaysFromLastClaim(user: any, now = new Date()) {
   }
 
   return out;
+}
+
+function inferTodayDayFromLastClaim(user: any, now = new Date()) {
+  const currentDay = Number(user?.daily_streak ?? 0) || 0;
+  const lastClaimIso = user?.last_daily_claim_date
+    ? isoDateUTC(user.last_daily_claim_date)
+    : null;
+
+  if (!lastClaimIso) return 0;
+
+  const diffDays = dayDiffFromIsoDate(lastClaimIso, now);
+  if (diffDays <= 0) return 0;
+
+  return Math.min(currentDay + Math.max(diffDays, 1), 7);
 }
 
 function buildDailyClaimPlan(user: any, now = new Date()) {
