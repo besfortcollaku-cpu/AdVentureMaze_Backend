@@ -47,8 +47,7 @@ recalcAndStoreMonthlyRate,
 
 
 const app = express();
-const ALLOW_INFERRED_MISSED_FOR_TEST =
-  process.env.ALLOW_INFERRED_MISSED_FOR_TEST === "true";
+const ALLOW_INFERRED_MISSED_FOR_TEST = true;
 
 /* ---------------- CORS ---------------- */
 app.use(cors({
@@ -1385,4 +1384,5 @@ async function start() {
 }
 
 start();
+
 
