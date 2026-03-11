@@ -47,6 +47,8 @@ recalcAndStoreMonthlyRate,
 
 
 const app = express();
+const ALLOW_INFERRED_MISSED_FOR_TEST =
+  process.env.ALLOW_INFERRED_MISSED_FOR_TEST === "true";
 
 /* ---------------- CORS ---------------- */
 app.use(cors({
@@ -109,7 +111,12 @@ const recoveredDays = missedRowsRes.rows
 const todayDay =
   user && claimPlan && !claimPlan.already ? claimPlan.nextDay : 0;
 
-const derivedMissedDays: number[] = [];
+const derivedMissedDays: number[] =
+  ALLOW_INFERRED_MISSED_FOR_TEST && user
+    ? inferMissedDaysFromLastClaim(user).filter(
+        (day) => !recoveredDays.includes(day)
+      )
+    : [];
 
 
 const missedDays = Array.from(
@@ -282,6 +289,27 @@ function dayDiffFromIsoDate(lastIsoDate: string, now = new Date()) {
   return Math.floor((today.getTime() - last.getTime()) / 86400000);
 }
 
+function inferMissedDaysFromLastClaim(user: any, now = new Date()) {
+  const currentDay = Number(user?.daily_streak ?? 0) || 0;
+  const lastClaimIso = user?.last_daily_claim_date
+    ? isoDateUTC(user.last_daily_claim_date)
+    : null;
+
+  if (!lastClaimIso) return [] as number[];
+
+  const diffDays = dayDiffFromIsoDate(lastClaimIso, now);
+  if (diffDays <= 1) return [] as number[];
+
+  const todayDayLegacy = Math.min(currentDay + Math.max(diffDays, 1), 7);
+  const out: number[] = [];
+
+  for (let d = currentDay + 1; d < todayDayLegacy; d++) {
+    if (d >= 1 && d <= 7) out.push(d);
+  }
+
+  return out;
+}
+
 function buildDailyClaimPlan(user: any, now = new Date()) {
   const currentStreak = Number(user?.daily_streak ?? 0) || 0;
   const lastClaimIso = user?.last_daily_claim_date
@@ -373,10 +401,14 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
 
     // lock user row while updating coins
     const userRes = await pool.query(
-      `SELECT uid, coins FROM public.users WHERE uid = $1 FOR UPDATE`,
+      `SELECT uid, coins, daily_streak, last_daily_claim_date
+       FROM public.users
+       WHERE uid = $1
+       FOR UPDATE`,
       [uid]
     );
-    if (!userRes.rows[0]) {
+    const user = userRes.rows[0];
+    if (!user) {
       throw new Error("User not found");
     }
 
@@ -389,18 +421,34 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
       [uid]
     );
 
-    const missedDay = Number(missedRes.rows[0]?.day ?? 0);
+    let missedDay = Number(missedRes.rows[0]?.day ?? 0);
+    if (
+      (!Number.isInteger(missedDay) || missedDay < 1 || missedDay > 7) &&
+      ALLOW_INFERRED_MISSED_FOR_TEST
+    ) {
+      missedDay = inferMissedDaysFromLastClaim(user)[0] ?? 0;
+    }
+
     if (!Number.isInteger(missedDay) || missedDay < 1 || missedDay > 7) {
       await pool.query("ROLLBACK");
       return res.status(400).json({ ok: false, error: "no_missed_day" });
     }
 
-    await pool.query(
-      `UPDATE daily_reward_missed_days
-       SET is_recovered = TRUE
-       WHERE uid = $1 AND day = $2`,
-      [uid, missedDay]
-    );
+    if (missedRes.rowCount && Number(missedRes.rows[0]?.day) === missedDay) {
+      await pool.query(
+        `UPDATE daily_reward_missed_days
+         SET is_recovered = TRUE
+         WHERE uid = $1 AND day = $2`,
+        [uid, missedDay]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO daily_reward_missed_days (uid, day, is_recovered)
+         VALUES ($1, $2, TRUE)
+         ON CONFLICT (uid, day) DO UPDATE SET is_recovered = TRUE`,
+        [uid, missedDay]
+      );
+    }
 
     const rewardCoins = dailyRewardCoinsForDay(missedDay);
 
@@ -517,7 +565,7 @@ app.post("/api/rewards/recover-day", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT uid, coins
+      `SELECT uid, coins, daily_streak, last_daily_claim_date
        FROM public.users
        WHERE uid = $1
        FOR UPDATE`,
@@ -545,16 +593,31 @@ app.post("/api/rewards/recover-day", async (req, res) => {
     }
 
     if (!missed) {
-      await pool.query("ROLLBACK");
-      return res.status(400).json({ ok: false, error: "no_missed_day" });
-    }
+      if (!ALLOW_INFERRED_MISSED_FOR_TEST) {
+        await pool.query("ROLLBACK");
+        return res.status(400).json({ ok: false, error: "no_missed_day" });
+      }
 
-    await pool.query(
-      `UPDATE daily_reward_missed_days
-       SET is_recovered = TRUE
-       WHERE uid = $1 AND day = $2`,
-      [uid, day]
-    );
+      const inferredDays = inferMissedDaysFromLastClaim(user);
+      if (!inferredDays.includes(day)) {
+        await pool.query("ROLLBACK");
+        return res.status(400).json({ ok: false, error: "no_missed_day" });
+      }
+
+      await pool.query(
+        `INSERT INTO daily_reward_missed_days (uid, day, is_recovered)
+         VALUES ($1, $2, TRUE)
+         ON CONFLICT (uid, day) DO UPDATE SET is_recovered = TRUE`,
+        [uid, day]
+      );
+    } else {
+      await pool.query(
+        `UPDATE daily_reward_missed_days
+         SET is_recovered = TRUE
+         WHERE uid = $1 AND day = $2`,
+        [uid, day]
+      );
+    }
 
     const coins = dailyRewardCoinsForDay(day);
 
