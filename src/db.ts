@@ -1,4 +1,4 @@
-﻿import { Pool } from "pg";
+import { Pool } from "pg";
 console.log("Backend v2.0.1");
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -8,7 +8,7 @@ export const pool = new Pool({
 });
 
 /* =====================================================
-   INIT  (âœ… Fix 1: auto-create core tables incl. sessions)
+   INIT  (✅ Fix 1: auto-create core tables incl. sessions)
 ===================================================== */
 
 export async function useNonce(uid: string, nonce: string) {
@@ -72,7 +72,10 @@ export async function initDB() {
       monthly_hints_used INT DEFAULT 0,
       monthly_restarts_used INT DEFAULT 0,
       monthly_ads_watched INT DEFAULT 0,
+      monthly_surprise_boxes_opened INT DEFAULT 0,
+      monthly_mystery_boxes_opened INT DEFAULT 0,
       monthly_valid_invites INT DEFAULT 0,
+      lifetime_valid_invites INT DEFAULT 0,
       monthly_max_win_streak INT DEFAULT 0,
       monthly_rate_breakdown JSONB DEFAULT '{}'::jsonb,
       monthly_final_rate INT DEFAULT 50,
@@ -86,6 +89,34 @@ export async function initDB() {
     ADD COLUMN IF NOT EXISTS last_daily_login DATE
   `);
 
+  // invite/referral tracking
+  await pool.query(`
+    ALTER TABLE public.users
+      ADD COLUMN IF NOT EXISTS invite_code TEXT,
+      ADD COLUMN IF NOT EXISTS invited_by_uid TEXT,
+      ADD COLUMN IF NOT EXISTS invited_at TIMESTAMP
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_invite_code_unique
+    ON public.users (invite_code)
+    WHERE invite_code IS NOT NULL
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.user_invites (
+      invitee_uid TEXT PRIMARY KEY,
+      inviter_uid TEXT NOT NULL,
+      invite_code TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS user_invites_inviter_idx
+    ON public.user_invites (inviter_uid)
+  `);
+
   // --- upgrades for existing DBs (safe to run every boot) ---
   await pool.query(`
     ALTER TABLE public.users
@@ -97,7 +128,10 @@ export async function initDB() {
       ADD COLUMN IF NOT EXISTS monthly_hints_used INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS monthly_restarts_used INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS monthly_ads_watched INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS monthly_surprise_boxes_opened INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS monthly_mystery_boxes_opened INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS monthly_valid_invites INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS lifetime_valid_invites INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS monthly_max_win_streak INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS monthly_rate_breakdown JSONB DEFAULT '{}'::jsonb,
       ADD COLUMN IF NOT EXISTS monthly_final_rate INT DEFAULT 50;
@@ -281,6 +315,8 @@ export async function ensureMonthlyKey(uid: string) {
            monthly_hints_used=0,
            monthly_restarts_used=0,
            monthly_ads_watched=0,
+           monthly_surprise_boxes_opened=0,
+           monthly_mystery_boxes_opened=0,
            monthly_valid_invites=0,
            monthly_max_win_streak=0,
            monthly_rate_breakdown='{}'::jsonb,
@@ -547,7 +583,8 @@ export async function claimReward({
   if (type === "ad_50" || type === "ad") {
     await pool.query(
       `UPDATE public.users
-       SET monthly_ads_watched = COALESCE(monthly_ads_watched,0) + 1
+       SET monthly_ads_watched = COALESCE(monthly_ads_watched,0) + 1,
+           monthly_surprise_boxes_opened = COALESCE(monthly_surprise_boxes_opened,0) + 1
        WHERE uid=$1`,
       [uid]
     );
@@ -896,7 +933,7 @@ export async function adminListUsers({
   
 
 
-  // âœ… no search
+  // ✅ no search
   const { rows } = await pool.query(
     `
     SELECT *
@@ -1014,7 +1051,7 @@ export async function adminListOnlineUsers({
 
 
 /* ============================
-   Charts (Step 1 â€“ 7 days default)
+   Charts (Step 1 – 7 days default)
 ============================ */
 export async function adminChartCoins({ days }: { days: number }) {
   const d = Math.max(1, Math.min(90, Number(days || 7)));
@@ -1126,16 +1163,16 @@ function coinRewardForAd(adsForCoinsThisMonth: number) {
   return Math.max(reward, 2);
 }
 export async function claimCoinAd(uid: string) {
-  // 1ï¸âƒ£ Track ad view
+  // 1️⃣ Track ad view
   await trackAdView(uid, "coins");
 
-  // 2ï¸âƒ£ Read monthly ads
+  // 2️⃣ Read monthly ads
   const ads = await getMonthlyAds(uid);
 
   // ads_for_coins already incremented
   const coins = coinRewardForAd(ads.ads_for_coins - 1);
 
-  // 3ï¸âƒ£ Use EXISTING reward system
+  // 3️⃣ Use EXISTING reward system
   const nonce = `coin-ad-${currentMonthKey()}-${ads.ads_for_coins}`;
 
   return await claimReward({
@@ -1165,65 +1202,55 @@ function prevMonthKey() {
 
 
 export function calcMonthlyRate(u: any) {
+  const invitesCount = Number(u?.lifetime_valid_invites ?? u?.monthly_valid_invites ?? 0);
+  const loginDays = Number(u?.monthly_login_days || 0);
+  const levelsCompleted = Number(u?.monthly_levels_completed || 0);
+  const surpriseBoxesOpened = Number(u?.monthly_surprise_boxes_opened || 0);
+  const mysteryBoxesOpened = Number(u?.monthly_mystery_boxes_opened || 0);
+  const skipsUsed = Number(u?.monthly_skips_used || 0);
+  const hintsUsed = Number(u?.monthly_hints_used || 0);
+  const restartsUsed = Number(u?.monthly_restarts_used || 0);
+
+  const base = 50;
+  const invitesPersistent = Math.min(10, Math.max(0, invitesCount) * 2); // +2% per invite, max +10%
+  const loginMonthly = Math.min(10, Math.floor(Math.max(0, loginDays) / 2)); // 20 days => +10%
+  const usageMonthly =
+    (skipsUsed > 0 ? 1 : 0) +
+    (hintsUsed > 0 ? 1 : 0) +
+    (restartsUsed > 0 ? 1 : 0); // +1% each type, max +3%
+  // Levels bonus is monthly-capped at +10%, reaching cap at 200 completed levels.
+  const levelsMonthly = Math.min(10, Math.floor(Math.max(0, levelsCompleted) / 20)); // +1% per 20 levels
+  const surpriseMonthly = Math.min(10, Math.floor(Math.max(0, surpriseBoxesOpened) / 20)); // 200/month => +10%
+  const mysteryMonthly = mysteryBoxesOpened >= 1 ? 5 : 0; // 1/month => +5%
+
   const breakdown: Record<string, number> = {
-    daily: 0,
-    levels: 0,
-    invites: 0,
-    skill: 0,
+    base,
+    invites_persistent: invitesPersistent,
+    login_monthly: loginMonthly,
+    usage_monthly: usageMonthly,
+    levels_monthly: levelsMonthly,
+    surprise_monthly: surpriseMonthly,
+    mystery_monthly: mysteryMonthly,
+
+    // Legacy keys kept for compatibility with existing UI/consumers.
+    daily: loginMonthly,
+    levels: levelsMonthly,
+    invites: invitesPersistent,
+    skill: usageMonthly,
     engagement: 0,
     streak: 0,
   };
 
-  // BASE
-  let rate = 50;
-
-  // DAILY (max +10)
-  const days = Number(u?.monthly_login_days || 0);
-  if (days >= 20) breakdown.daily = 10;
-  else if (days >= 15) breakdown.daily = 7;
-  else if (days >= 7) breakdown.daily = 3;
-
-  // LEVELS (max +15)
-  const lv = Number(u?.monthly_levels_completed || 0);
-  if (lv >= 120) breakdown.levels = 15;
-  else if (lv >= 60) breakdown.levels = 10;
-  else if (lv >= 20) breakdown.levels = 5;
-
-  // INVITES (max +10)
-  const inv = Number(u?.monthly_valid_invites || 0);
-  if (inv >= 10) breakdown.invites = 10;
-  else if (inv >= 6) breakdown.invites = 6;
-  else if (inv >= 3) breakdown.invites = 3;
-
-  // SKILL (encourage usage) (max +5)
-  const skips = Number(u?.monthly_skips_used || 0);
-  const hints = Number(u?.monthly_hints_used || 0);
-  const restarts = Number(u?.monthly_restarts_used || 0);
-  let skill = 0;
-  if (skips >= 3) skill += 2;
-  if (hints >= 3) skill += 2;
-  if (restarts >= 1) skill += 1;
-  breakdown.skill = Math.min(5, skill);
-
-  // ADS (max +5)
-  const ads = Number(u?.monthly_ads_watched || 0);
-  if (ads >= 15) breakdown.engagement = 5;
-  else if (ads >= 5) breakdown.engagement = 2;
-
-  // STREAK (max +3 here)
-  const streak = Number(u?.monthly_max_win_streak || 0);
-  if (streak >= 7) breakdown.streak = 3;
-  else if (streak >= 3) breakdown.streak = 2;
-
-  rate +=
-    breakdown.daily +
-    breakdown.levels +
-    breakdown.invites +
-    breakdown.skill +
-    breakdown.engagement +
-    breakdown.streak;
-
-  if (rate > 100) rate = 100;
+  const rate = Math.min(
+    100,
+    base +
+      invitesPersistent +
+      loginMonthly +
+      usageMonthly +
+      levelsMonthly +
+      surpriseMonthly +
+      mysteryMonthly
+  );
 
   return { rate, breakdown };
 }
@@ -1294,6 +1321,8 @@ export async function claimMonthlyRewards(uid: string, opts?: { month?: string }
         monthly_hints_used = 0,
         monthly_restarts_used = 0,
         monthly_ads_watched = 0,
+        monthly_surprise_boxes_opened = 0,
+        monthly_mystery_boxes_opened = 0,
         monthly_valid_invites = 0,
         monthly_max_win_streak = 0,
         monthly_rate_breakdown = '{}'::jsonb,
@@ -1323,3 +1352,167 @@ export async function claimMonthlyRewards(uid: string, opts?: { month?: string }
 
 
 
+
+function normalizeInviteCode(input: string) {
+  return String(input || "").trim().toUpperCase();
+}
+
+function makeInviteCode() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < 8; i++) {
+    out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return out;
+}
+
+export async function ensureInviteCode(uid: string) {
+  const existing = await pool.query(
+    `SELECT invite_code FROM public.users WHERE uid=$1 LIMIT 1`,
+    [uid]
+  );
+
+  const current = String(existing.rows[0]?.invite_code || "").trim();
+  if (current) return current;
+
+  for (let i = 0; i < 10; i++) {
+    const code = makeInviteCode();
+    try {
+      const updated = await pool.query(
+        `
+        UPDATE public.users
+        SET invite_code = $2,
+            updated_at = NOW()
+        WHERE uid = $1
+          AND (invite_code IS NULL OR invite_code = '')
+        RETURNING invite_code
+        `,
+        [uid, code]
+      );
+
+      const got = String(updated.rows[0]?.invite_code || "").trim();
+      if (got) return got;
+
+      const recheck = await pool.query(
+        `SELECT invite_code FROM public.users WHERE uid=$1 LIMIT 1`,
+        [uid]
+      );
+      const maybe = String(recheck.rows[0]?.invite_code || "").trim();
+      if (maybe) return maybe;
+    } catch (e: any) {
+      if (e?.code !== "23505") throw e;
+    }
+  }
+
+  throw new Error("invite_code_generation_failed");
+}
+
+export async function getInviteSummary(uid: string) {
+  const code = await ensureInviteCode(uid);
+
+  const me = await pool.query(
+    `SELECT invited_by_uid FROM public.users WHERE uid=$1 LIMIT 1`,
+    [uid]
+  );
+
+  const countRes = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM public.user_invites WHERE inviter_uid=$1`,
+    [uid]
+  );
+
+  const listRes = await pool.query(
+    `
+    SELECT ui.invitee_uid, u.username, ui.created_at
+    FROM public.user_invites ui
+    LEFT JOIN public.users u ON u.uid = ui.invitee_uid
+    WHERE ui.inviter_uid = $1
+    ORDER BY ui.created_at DESC
+    LIMIT 200
+    `,
+    [uid]
+  );
+
+  return {
+    invite_code: code,
+    invited_by_uid: me.rows[0]?.invited_by_uid || null,
+    invited_count: Number(countRes.rows[0]?.count || 0),
+    invited_users: listRes.rows,
+  };
+}
+
+export async function claimInviteCode(inviteeUid: string, rawCode: string) {
+  const inviteCode = normalizeInviteCode(rawCode);
+  if (!inviteCode) throw new Error("invite_code_required");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const inviteeRes = await client.query(
+      `SELECT uid, invited_by_uid FROM public.users WHERE uid=$1 FOR UPDATE`,
+      [inviteeUid]
+    );
+    const invitee = inviteeRes.rows[0];
+    if (!invitee) throw new Error("invitee_not_found");
+
+    if (invitee.invited_by_uid) {
+      throw new Error("invite_already_claimed");
+    }
+
+    const inviterRes = await client.query(
+      `SELECT uid FROM public.users WHERE invite_code=$1 LIMIT 1`,
+      [inviteCode]
+    );
+    const inviterUid = String(inviterRes.rows[0]?.uid || "");
+    if (!inviterUid) throw new Error("invite_code_invalid");
+
+    if (inviterUid === inviteeUid) {
+      throw new Error("cannot_invite_self");
+    }
+
+    await client.query(
+      `
+      INSERT INTO public.user_invites (invitee_uid, inviter_uid, invite_code, created_at)
+      VALUES ($1,$2,$3,NOW())
+      `,
+      [inviteeUid, inviterUid, inviteCode]
+    );
+
+    await client.query(
+      `
+      UPDATE public.users
+      SET invited_by_uid = $2,
+          invited_at = NOW(),
+          updated_at = NOW()
+      WHERE uid = $1
+      `,
+      [inviteeUid, inviterUid]
+    );
+
+    await client.query(
+      `
+      UPDATE public.users
+      SET monthly_valid_invites = COALESCE(monthly_valid_invites,0) + 1,
+          lifetime_valid_invites = COALESCE(lifetime_valid_invites,0) + 1,
+          updated_at = NOW()
+      WHERE uid = $1
+      `,
+      [inviterUid]
+    );
+
+    await client.query("COMMIT");
+
+    await recalcAndStoreMonthlyRate(inviterUid);
+
+    return {
+      ok: true,
+      inviter_uid: inviterUid,
+      invite_code: inviteCode,
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}

@@ -1,4 +1,4 @@
-﻿process.on("unhandledRejection", (reason) => {
+process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:", reason);
 });
 
@@ -28,6 +28,9 @@ import {
   ensureMonthlyKey,
 claimMonthlyRewards,
 recalcAndStoreMonthlyRate,
+  ensureInviteCode,
+  getInviteSummary,
+  claimInviteCode,
 
   // sessions / admin
   adminListUsers,
@@ -40,7 +43,7 @@ recalcAndStoreMonthlyRate,
   adminGetStats,
   adminListOnlineUsers,
   adminResetFreeCounters,
-  // âœ… charts1
+  // ✅ charts1
   adminChartCoins,
   adminChartActiveUsers,
 } from "./db";
@@ -191,7 +194,7 @@ if (firstRecoverableMissedDay) {
             username: user.username,
             coins: user.coins,
 
-            // ðŸ”¹ paid balances (wallet)
+            // 🔹 paid balances (wallet)
             restarts_balance: user.restarts_balance ?? 0,
             skips_balance: user.skips_balance ?? 0,
             hints_balance: user.hints_balance ?? 0,
@@ -204,7 +207,11 @@ if (firstRecoverableMissedDay) {
             monthly_hints_used: user.monthly_hints_used ?? 0,
             monthly_restarts_used: user.monthly_restarts_used ?? 0,
             monthly_ads_watched: user.monthly_ads_watched ?? 0,
+            monthly_surprise_boxes_opened: user.monthly_surprise_boxes_opened ?? 0,
+            monthly_mystery_boxes_opened: user.monthly_mystery_boxes_opened ?? 0,
             monthly_valid_invites: user.monthly_valid_invites ?? 0,
+            lifetime_valid_invites: user.lifetime_valid_invites ?? 0,
+            invite_code: user.invite_code ?? null,
           }
         : null,
 
@@ -226,6 +233,38 @@ if (firstRecoverableMissedDay) {
     });
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
+  }
+});
+app.get("/api/invite/me", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const out = await getInviteSummary(uid);
+
+    res.json({
+      ok: true,
+      ...out,
+      invite_link: `https://pi-maze.com/?invite=${encodeURIComponent(out.invite_code)}`
+    });
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/invite/claim", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const code = String(req.body?.code || "");
+    const out = await claimInviteCode(uid, code);
+
+    res.json(out);
+  } catch (e: any) {
+    const msg = String(e?.message || "unknown_error");
+    const status =
+      msg === "invite_code_invalid" ? 404 :
+      msg === "invite_already_claimed" ? 409 :
+      msg === "cannot_invite_self" ? 400 : 400;
+
+    res.status(status).json({ ok: false, error: msg });
   }
 });
 app.post("/api/progress", async (req, res) => {
@@ -385,6 +424,7 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
          coins = coins + $1,
          daily_streak = 0,
          mystery_box_pending = FALSE,
+         monthly_mystery_boxes_opened = COALESCE(monthly_mystery_boxes_opened,0) + 1,
          last_daily_claim_date = CURRENT_DATE
        WHERE uid = $2`,
       [reward, uid]
@@ -397,6 +437,7 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
     );
 
     await pool.query("COMMIT");
+    try { await recalcAndStoreMonthlyRate(uid); } catch {}
 
     const updated = await pool.query(
       `SELECT * FROM public.users WHERE uid = $1`,
@@ -704,6 +745,7 @@ app.post("/api/rewards/recover-day", async (req, res) => {
     }
 
     await pool.query("COMMIT");
+    try { await recalcAndStoreMonthlyRate(uid); } catch {}
 
     const updated = await pool.query(
       `SELECT * FROM public.users WHERE uid = $1`,
@@ -743,6 +785,7 @@ app.post("/api/daily-reward/ignore-missed", async (req, res) => {
     );
 
     await pool.query("COMMIT");
+    try { await recalcAndStoreMonthlyRate(uid); } catch {}
 
     const updated = await pool.query(
       `SELECT * FROM public.users WHERE uid = $1`,
@@ -767,7 +810,7 @@ app.patch("/api/user/username", async (req, res) => {
     username = username.trim();
 
     if (username.length < 3 || username.length > 20) {
-      return res.status(400).json({ ok: false, error: "Username must be 3â€“20 characters" });
+      return res.status(400).json({ ok: false, error: "Username must be 3–20 characters" });
     }
 
     // allow only letters, numbers, underscore
@@ -925,7 +968,7 @@ app.post("/api/monthly/claim", async (req, res) => {
     const month = req.body?.month ? String(req.body.month) : undefined;
 
     // recalc before snapshot
-    await recalcAndStoreMonthlyRate(uid);
+    try { await recalcAndStoreMonthlyRate(uid); } catch {}
 
     const out = await claimMonthlyRewards(uid, { month });
 res.json(out);
@@ -1410,7 +1453,7 @@ app.get("/admin/online", async (req,res)=>{
   }
 });
 
-/* âœ… NEW: admin users list + detail (Fix 2) */
+/* ✅ NEW: admin users list + detail (Fix 2) */
 app.get("/admin/users", async (req,res)=>{
   try{
     requireAdmin(req);
@@ -1435,7 +1478,7 @@ app.get("/admin/users/:uid", async (req,res)=>{
   }
 });
 
-/* âœ… NEW: charts endpoints (Step 1 â€“ â€œA: last 7 daysâ€) */
+/* ✅ NEW: charts endpoints (Step 1 – “A: last 7 days”) */
 app.get("/admin/charts/coins", async (req,res)=>{
   try{
     requireAdmin(req);
@@ -1459,7 +1502,7 @@ app.get("/admin/charts/active", async (req,res)=>{
 });
 
 
-// âœ… ADMIN: delete user completely
+// ✅ ADMIN: delete user completely
 app.delete("/admin/users/:uid", async (req, res) => {
   try {
     requireAdmin(req);
@@ -1494,5 +1537,7 @@ async function start() {
 }
 
 start();
+
+
 
 
