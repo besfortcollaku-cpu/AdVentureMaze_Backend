@@ -366,6 +366,10 @@ app.post("/api/daily-reward/recover", async (req, res) => {
        SET coins = coins + $2
        WHERE uid = $1`, [uid, rewardCoins]);
         await db_1.pool.query("COMMIT");
+        try {
+            await (0, db_1.recalcAndStoreMonthlyRate)(uid);
+        }
+        catch { }
         const updatedRes = await db_1.pool.query(`SELECT * FROM public.users WHERE uid = $1`, [uid]);
         return res.json({
             ok: true,
@@ -425,10 +429,15 @@ app.post("/api/daily-reward/claim", async (req, res) => {
         await db_1.pool.query(`UPDATE public.users
        SET coins = coins + $2,
            daily_streak = $3,
+           monthly_login_days = COALESCE(monthly_login_days,0) + 1,
            last_daily_claim_date = CURRENT_DATE,
            mystery_box_pending = $4
        WHERE uid = $1`, [uid, rewardCoins, targetDay, mysteryChestReady]);
         await db_1.pool.query("COMMIT");
+        try {
+            await (0, db_1.recalcAndStoreMonthlyRate)(uid);
+        }
+        catch { }
         const updatedRes = await db_1.pool.query(`SELECT * FROM public.users WHERE uid = $1`, [uid]);
         return res.json({
             ok: true,
@@ -801,7 +810,14 @@ app.post("/api/restart", async (req, res) => {
         else {
             throw new Error("No restarts available");
         }
+        await db_1.pool.query(`UPDATE public.users
+       SET monthly_restarts_used = COALESCE(monthly_restarts_used,0) + 1
+       WHERE uid=$1`, [uid]);
         await db_1.pool.query("COMMIT");
+        try {
+            await (0, db_1.recalcAndStoreMonthlyRate)(uid);
+        }
+        catch { }
         const updatedUser = await db_1.pool.query(`SELECT restarts_balance, coins FROM public.users WHERE uid=$1`, [uid]);
         const updatedProgress = await db_1.pool.query(`SELECT free_restarts_used FROM progress WHERE uid=$1`, [uid]);
         res.json({
@@ -842,6 +858,7 @@ app.post("/api/rewards/daily-claim", async (req, res) => {
         await db_1.pool.query(`UPDATE public.users
        SET coins = coins + $1,
            daily_streak = $2,
+           monthly_login_days = COALESCE(monthly_login_days,0) + 1,
            last_daily_claim_date = CURRENT_DATE,
            mystery_box_pending = CASE WHEN $2 = 7 THEN TRUE ELSE FALSE END
        WHERE uid = $3`, [reward, plan.nextDay, uid]);
@@ -849,6 +866,10 @@ app.post("/api/rewards/daily-claim", async (req, res) => {
        FROM public.users
        WHERE uid=$1`, [uid]);
         await db_1.pool.query("COMMIT");
+        try {
+            await (0, db_1.recalcAndStoreMonthlyRate)(uid);
+        }
+        catch { }
         res.json({
             ok: true,
             day: plan.nextDay,
@@ -914,7 +935,14 @@ app.post("/api/skip", async (req, res) => {
         else {
             throw new Error("No skips available");
         }
+        await db_1.pool.query(`UPDATE public.users
+       SET monthly_skips_used = COALESCE(monthly_skips_used,0) + 1
+       WHERE uid=$1`, [uid]);
         await db_1.pool.query("COMMIT");
+        try {
+            await (0, db_1.recalcAndStoreMonthlyRate)(uid);
+        }
+        catch { }
         const updatedUser = await db_1.pool.query(`SELECT skips_balance, coins FROM public.users WHERE uid=$1`, [uid]);
         const updatedProgress = await db_1.pool.query(`SELECT free_skips_used FROM progress WHERE uid=$1`, [uid]);
         res.json({
@@ -983,7 +1011,14 @@ app.post("/api/hint", async (req, res) => {
         else {
             throw new Error("No hints available");
         }
+        await db_1.pool.query(`UPDATE public.users
+       SET monthly_hints_used = COALESCE(monthly_hints_used,0) + 1
+       WHERE uid=$1`, [uid]);
         await db_1.pool.query("COMMIT");
+        try {
+            await (0, db_1.recalcAndStoreMonthlyRate)(uid);
+        }
+        catch { }
         const updatedUser = await db_1.pool.query(`SELECT hints_balance, coins FROM public.users WHERE uid=$1`, [uid]);
         const updatedProgress = await db_1.pool.query(`SELECT free_hints_used FROM progress WHERE uid=$1`, [uid]);
         res.json({
