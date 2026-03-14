@@ -909,9 +909,9 @@ function calcMonthlyRate(u) {
     const base = 50;
     const invitesPersistent = Math.min(10, Math.max(0, invitesCount) * 2); // +2% per invite, max +10%
     const loginMonthly = Math.min(10, Math.floor(Math.max(0, loginDays) / 2)); // 20 days => +10%
-    const usageMonthly = (skipsUsed > 0 ? 1 : 0) +
-        (hintsUsed > 0 ? 1 : 0) +
-        (restartsUsed > 0 ? 1 : 0); // +1% each type, max +3%
+    const usageMonthly = (skipsUsed >= 5 ? 1 : 0) +
+        (hintsUsed >= 5 ? 1 : 0) +
+        (restartsUsed >= 5 ? 1 : 0); // +1% each type after 5 monthly uses, max +3%
     // Levels bonus is monthly-capped at +10%, reaching cap at 200 completed levels.
     const levelsMonthly = Math.min(10, Math.floor(Math.max(0, levelsCompleted) / 20)); // +1% per 20 levels
     const surpriseMonthly = Math.min(10, Math.floor(Math.max(0, surpriseBoxesOpened) / 20)); // 200/month => +10%
