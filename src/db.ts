@@ -770,22 +770,23 @@ export async function adminListPayoutJobs(opts?: {
 
   if (opts?.cycleId) {
     values.push(opts.cycleId);
-    where.push(`j.cycle_id = ${values.length}`);
+    where.push(`j.cycle_id = $${values.length}`);
   }
 
   if (opts?.monthKey) {
     values.push(normalizeMonthKey(opts.monthKey));
-    where.push(`c.month_key = ${values.length}`);
+    where.push(`c.month_key = $${values.length}`);
   }
 
-  if (opts?.status) {
-    values.push(assertJobStatus(opts.status));
-    where.push(`j.status = ${values.length}`);
+  const rawStatus = String(opts?.status || "").trim().toLowerCase();
+  if (rawStatus && rawStatus !== "all") {
+    values.push(assertJobStatus(rawStatus));
+    where.push(`j.status = $${values.length}`);
   }
 
   if (opts?.uidSearch) {
     values.push(String(opts.uidSearch).trim());
-    where.push(`j.uid ILIKE '%' || ${values.length} || '%'`);
+    where.push(`j.uid ILIKE '%' || $${values.length} || '%'`);
   }
 
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
@@ -821,7 +822,7 @@ export async function adminListPayoutJobs(opts?: {
      JOIN public.monthly_payout_cycles c ON c.id = j.cycle_id
      ${whereSql}
      ORDER BY j.created_at DESC, j.id DESC
-     LIMIT ${limitIndex} OFFSET ${offsetIndex}`,
+     LIMIT $${limitIndex} OFFSET $${offsetIndex}`,
     values
   );
 
@@ -911,12 +912,12 @@ export async function adminListPayoutSnapshots(opts?: {
 
   if (opts?.cycleId) {
     values.push(opts.cycleId);
-    where.push(`s.cycle_id = ${values.length}`);
+    where.push(`s.cycle_id = $${values.length}`);
   }
 
   if (opts?.monthKey) {
     values.push(normalizeMonthKey(opts.monthKey));
-    where.push(`c.month_key = ${values.length}`);
+    where.push(`c.month_key = $${values.length}`);
   }
 
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
@@ -947,7 +948,7 @@ export async function adminListPayoutSnapshots(opts?: {
      JOIN public.monthly_payout_cycles c ON c.id = s.cycle_id
      ${whereSql}
      ORDER BY s.created_at DESC, s.id DESC
-     LIMIT ${limitIndex} OFFSET ${offsetIndex}`,
+     LIMIT $${limitIndex} OFFSET $${offsetIndex}`,
     values
   );
 
@@ -2325,6 +2326,11 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
+
+
+
+
+
 
 
 
