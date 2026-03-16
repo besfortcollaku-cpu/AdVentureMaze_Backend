@@ -889,6 +889,7 @@ async function requirePiUser(req: express.Request) {
 await upsertUser({ uid, username });
 
 await ensureMonthlyKey(uid);
+await ensureInviteCode(uid);
 
 // mark user online on ANY request
 await touchUserOnline(uid);
@@ -1566,6 +1567,8 @@ async function start() {
 }
 
 start();
+
+
 
 
 

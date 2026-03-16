@@ -1445,6 +1445,9 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
   if (!inviteCode) throw new Error("invite_code_required");
 
   const client = await pool.connect();
+  let committed = false;
+  let inviterUid = "";
+
   try {
     await client.query("BEGIN");
 
@@ -1463,7 +1466,7 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
       `SELECT uid FROM public.users WHERE invite_code=$1 LIMIT 1`,
       [inviteCode]
     );
-    const inviterUid = String(inviterRes.rows[0]?.uid || "");
+    inviterUid = String(inviterRes.rows[0]?.uid || "");
     if (!inviterUid) throw new Error("invite_code_invalid");
 
     if (inviterUid === inviteeUid) {
@@ -1501,6 +1504,7 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     );
 
     await client.query("COMMIT");
+    committed = true;
 
     await recalcAndStoreMonthlyRate(inviterUid);
 
@@ -1510,9 +1514,15 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
       invite_code: inviteCode,
     };
   } catch (e) {
-    await client.query("ROLLBACK");
+    if (!committed) {
+      await client.query("ROLLBACK");
+    }
     throw e;
   } finally {
     client.release();
   }
 }
+
+
+
+
