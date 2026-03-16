@@ -759,6 +759,7 @@ export async function adminListPayoutJobs(opts?: {
   cycleId?: number;
   monthKey?: string;
   status?: PiPayoutJobStatus;
+  uidSearch?: string;
   limit?: number;
   offset?: number;
 }) {
@@ -769,20 +770,34 @@ export async function adminListPayoutJobs(opts?: {
 
   if (opts?.cycleId) {
     values.push(opts.cycleId);
-    where.push(`j.cycle_id = $${values.length}`);
+    where.push(`j.cycle_id = ${values.length}`);
   }
 
   if (opts?.monthKey) {
     values.push(normalizeMonthKey(opts.monthKey));
-    where.push(`c.month_key = $${values.length}`);
+    where.push(`c.month_key = ${values.length}`);
   }
 
   if (opts?.status) {
     values.push(assertJobStatus(opts.status));
-    where.push(`j.status = $${values.length}`);
+    where.push(`j.status = ${values.length}`);
+  }
+
+  if (opts?.uidSearch) {
+    values.push(String(opts.uidSearch).trim());
+    where.push(`j.uid ILIKE '%' || ${values.length} || '%'`);
   }
 
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const countRes = await pool.query(
+    `SELECT COUNT(*)::int AS c
+     FROM public.pi_payout_jobs j
+     JOIN public.monthly_payout_cycles c ON c.id = j.cycle_id
+     ${whereSql}`,
+    values
+  );
+
   values.push(limit);
   const limitIndex = values.length;
   values.push(offset);
@@ -805,14 +820,15 @@ export async function adminListPayoutJobs(opts?: {
      FROM public.pi_payout_jobs j
      JOIN public.monthly_payout_cycles c ON c.id = j.cycle_id
      ${whereSql}
-     ORDER BY j.created_at ASC
-     LIMIT $${limitIndex} OFFSET $${offsetIndex}`,
+     ORDER BY j.created_at DESC, j.id DESC
+     LIMIT ${limitIndex} OFFSET ${offsetIndex}`,
     values
   );
 
   return {
     ok: true,
     rows: out.rows,
+    count: Number(countRes.rows[0]?.c || 0),
   };
 }
 
@@ -820,9 +836,20 @@ export async function adminListPayoutJobs(opts?: {
 export async function adminListPayoutCycles(opts?: { limit?: number }) {
   const limit = Math.max(1, Math.min(24, toNonNegativeInt(opts?.limit, 6)));
   const out = await pool.query(
-    `SELECT id, month_key, conversion_rate_locked, min_payout_threshold_pi, status, created_at, closed_at
-     FROM public.monthly_payout_cycles
-     ORDER BY created_at DESC
+    `SELECT
+       c.id,
+       c.month_key,
+       c.conversion_rate_locked,
+       c.min_payout_threshold_pi,
+       c.status,
+       c.created_at,
+       c.closed_at,
+       COALESCE(COUNT(s.id), 0)::int AS total_users,
+       COALESCE(SUM(s.payout_pi_amount), 0)::numeric(20,8) AS total_payout_pi
+     FROM public.monthly_payout_cycles c
+     LEFT JOIN public.monthly_payout_snapshots s ON s.cycle_id = c.id
+     GROUP BY c.id, c.month_key, c.conversion_rate_locked, c.min_payout_threshold_pi, c.status, c.created_at, c.closed_at
+     ORDER BY c.created_at DESC
      LIMIT $1`,
     [limit]
   );
@@ -869,6 +896,112 @@ export async function adminGetPayoutRuntimeConfig() {
     ok: true,
     simulation_mode: process.env.PAYOUT_SIMULATE_SUCCESS === "true",
   };
+}
+
+export async function adminListPayoutSnapshots(opts?: {
+  cycleId?: number;
+  monthKey?: string;
+  limit?: number;
+  offset?: number;
+}) {
+  const limit = Math.max(1, Math.min(500, toNonNegativeInt(opts?.limit, 100)));
+  const offset = Math.max(0, toNonNegativeInt(opts?.offset, 0));
+  const values: any[] = [];
+  const where: string[] = [];
+
+  if (opts?.cycleId) {
+    values.push(opts.cycleId);
+    where.push(`s.cycle_id = ${values.length}`);
+  }
+
+  if (opts?.monthKey) {
+    values.push(normalizeMonthKey(opts.monthKey));
+    where.push(`c.month_key = ${values.length}`);
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const summaryRes = await pool.query(
+    `SELECT
+       COALESCE(COUNT(*), 0)::int AS total_users_snapshotted,
+       COALESCE(SUM(CASE WHEN s.status = 'eligible' THEN 1 ELSE 0 END), 0)::int AS eligible_count,
+       COALESCE(SUM(CASE WHEN s.status = 'below_threshold' THEN 1 ELSE 0 END), 0)::int AS below_threshold_count,
+       COALESCE(SUM(CASE WHEN s.status = 'queued' THEN 1 ELSE 0 END), 0)::int AS queued_count,
+       COALESCE(SUM(CASE WHEN s.status = 'paid' THEN 1 ELSE 0 END), 0)::int AS paid_count,
+       COALESCE(SUM(CASE WHEN s.status = 'failed' THEN 1 ELSE 0 END), 0)::int AS failed_count,
+       COALESCE(SUM(s.payout_pi_amount), 0)::numeric(20,8) AS total_payout_pi_amount
+     FROM public.monthly_payout_snapshots s
+     JOIN public.monthly_payout_cycles c ON c.id = s.cycle_id
+     ${whereSql}`,
+    values
+  );
+
+  values.push(limit);
+  const limitIndex = values.length;
+  values.push(offset);
+  const offsetIndex = values.length;
+
+  const out = await pool.query(
+    `SELECT s.*, c.month_key
+     FROM public.monthly_payout_snapshots s
+     JOIN public.monthly_payout_cycles c ON c.id = s.cycle_id
+     ${whereSql}
+     ORDER BY s.created_at DESC, s.id DESC
+     LIMIT ${limitIndex} OFFSET ${offsetIndex}`,
+    values
+  );
+
+  return { ok: true, rows: out.rows, summary: summaryRes.rows[0] || null };
+}
+
+export async function adminRetryFailedPayouts(opts?: { monthKey?: string }) {
+  const values: any[] = [];
+  let where = `j.status = 'failed'`;
+
+  if (opts?.monthKey) {
+    values.push(normalizeMonthKey(opts.monthKey));
+    where += ` AND c.month_key = $${values.length}`;
+  }
+
+  const out = await pool.query(
+    `UPDATE public.pi_payout_jobs j
+        SET status = 'queued',
+            error_message = NULL,
+            updated_at = NOW()
+       FROM public.monthly_payout_cycles c
+      WHERE j.cycle_id = c.id
+        AND ${where}
+      RETURNING j.id, j.uid, j.cycle_id`,
+    values
+  );
+
+  if (out.rows.length > 0) {
+    const pairs = out.rows.map((r: any) => [Number(r.cycle_id), String(r.uid)]);
+    for (const p of pairs) {
+      await pool.query(
+        `UPDATE public.monthly_payout_snapshots
+            SET status = 'queued'
+          WHERE cycle_id = $1 AND uid = $2`,
+        [p[0], p[1]]
+      );
+    }
+  }
+
+  return { ok: true, retried: out.rows.length };
+}
+
+export async function adminResolvePayoutJob(jobId: number) {
+  const out = await pool.query(
+    `UPDATE public.pi_payout_jobs
+        SET error_message = NULL,
+            updated_at = NOW()
+      WHERE id = $1
+      RETURNING *`,
+    [jobId]
+  );
+
+  if (!out.rows.length) throw new Error("payout_job_not_found");
+  return { ok: true, row: out.rows[0] };
 }
 export async function adminUpdatePayoutJobStatus(opts: {
   jobId: number;
@@ -2192,5 +2325,9 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
+
+
+
+
 
 
