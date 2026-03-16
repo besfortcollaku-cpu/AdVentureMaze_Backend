@@ -28,6 +28,9 @@ import {
   closeMonthlyPayoutCycle,
   generatePayoutJobs,
   adminListPayoutJobs,
+  adminListPayoutCycles,
+  adminGetPayoutSnapshotSummary,
+  adminGetPayoutRuntimeConfig,
   adminUpdatePayoutJobStatus,
   adminRequeueFailedPayoutJob,
   runPayoutWorkerBatch,
@@ -1539,6 +1542,39 @@ app.get("/admin/payouts/jobs", async (req,res)=>{
   }
 });
 
+
+app.get("/admin/payouts/cycles", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const limit = req.query.limit ? Number(req.query.limit) : undefined;
+    const out = await adminListPayoutCycles({ limit });
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.get("/admin/payouts/summary", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const cycleId = req.query.cycle_id ? Number(req.query.cycle_id) : undefined;
+    const monthKey = req.query.month_key ? String(req.query.month_key) : undefined;
+    const out = await adminGetPayoutSnapshotSummary({ cycleId, monthKey });
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.get("/admin/payouts/config", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const out = await adminGetPayoutRuntimeConfig();
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
 app.post("/admin/payouts/jobs/:id/status", async (req,res)=>{
   try{
     requireAdmin(req);
@@ -1690,4 +1726,6 @@ async function start() {
 }
 
 start();
+
+
 

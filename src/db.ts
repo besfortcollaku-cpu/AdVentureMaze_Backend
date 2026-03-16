@@ -816,6 +816,60 @@ export async function adminListPayoutJobs(opts?: {
   };
 }
 
+
+export async function adminListPayoutCycles(opts?: { limit?: number }) {
+  const limit = Math.max(1, Math.min(24, toNonNegativeInt(opts?.limit, 6)));
+  const out = await pool.query(
+    `SELECT id, month_key, conversion_rate_locked, min_payout_threshold_pi, status, created_at, closed_at
+     FROM public.monthly_payout_cycles
+     ORDER BY created_at DESC
+     LIMIT $1`,
+    [limit]
+  );
+
+  return { ok: true, rows: out.rows };
+}
+
+export async function adminGetPayoutSnapshotSummary(opts?: { cycleId?: number; monthKey?: string }) {
+  const values: any[] = [];
+  const where: string[] = [];
+
+  if (opts?.cycleId) {
+    values.push(opts.cycleId);
+    where.push(`s.cycle_id = $${values.length}`);
+  }
+
+  if (opts?.monthKey) {
+    values.push(normalizeMonthKey(opts.monthKey));
+    where.push(`c.month_key = $${values.length}`);
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const out = await pool.query(
+    `SELECT
+       COALESCE(COUNT(*), 0)::int AS total_users_snapshotted,
+       COALESCE(SUM(CASE WHEN s.status = 'eligible' THEN 1 ELSE 0 END), 0)::int AS eligible_count,
+       COALESCE(SUM(CASE WHEN s.status = 'below_threshold' THEN 1 ELSE 0 END), 0)::int AS below_threshold_count,
+       COALESCE(SUM(CASE WHEN s.status = 'queued' THEN 1 ELSE 0 END), 0)::int AS queued_count,
+       COALESCE(SUM(CASE WHEN s.status = 'paid' THEN 1 ELSE 0 END), 0)::int AS paid_count,
+       COALESCE(SUM(CASE WHEN s.status = 'failed' THEN 1 ELSE 0 END), 0)::int AS failed_count,
+       COALESCE(SUM(s.payout_pi_amount), 0)::numeric(20,8) AS total_payout_pi_amount
+     FROM public.monthly_payout_snapshots s
+     JOIN public.monthly_payout_cycles c ON c.id = s.cycle_id
+     ${whereSql}`,
+    values
+  );
+
+  return { ok: true, summary: out.rows[0] || null };
+}
+
+export async function adminGetPayoutRuntimeConfig() {
+  return {
+    ok: true,
+    simulation_mode: process.env.PAYOUT_SIMULATE_SUCCESS === "true",
+  };
+}
 export async function adminUpdatePayoutJobStatus(opts: {
   jobId: number;
   status: PiPayoutJobStatus;
@@ -2138,4 +2192,5 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
+
 
