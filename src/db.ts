@@ -145,7 +145,9 @@ export async function initDB() {
       ADD COLUMN IF NOT EXISTS last_daily_claim_date DATE,
       ADD COLUMN IF NOT EXISTS lifetime_coins_earned INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS lifetime_coins_spent INT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS lifetime_levels_completed INT DEFAULT 0;
+      ADD COLUMN IF NOT EXISTS lifetime_levels_completed INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS payout_carry_coins BIGINT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS pi_wallet_identifier TEXT;
   `);
 
   await pool.query(`
@@ -210,6 +212,7 @@ await pool.query(`
   CREATE UNIQUE INDEX IF NOT EXISTS level_rewards_uid_level_unique
   ON public.level_rewards (uid, level)
 `);
+  
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       uid TEXT PRIMARY KEY,
@@ -236,6 +239,61 @@ await pool.query(`
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.monthly_payout_cycles (
+      id BIGSERIAL PRIMARY KEY,
+      month_key TEXT NOT NULL UNIQUE,
+      conversion_rate_locked NUMERIC(20,8) NOT NULL,
+      min_payout_threshold_pi NUMERIC(20,8) NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'open',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      closed_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.monthly_payout_snapshots (
+      id BIGSERIAL PRIMARY KEY,
+      cycle_id BIGINT NOT NULL REFERENCES public.monthly_payout_cycles(id) ON DELETE CASCADE,
+      uid TEXT NOT NULL,
+      coins_earned BIGINT NOT NULL,
+      carry_in_coins BIGINT NOT NULL DEFAULT 0,
+      total_coins_for_settlement BIGINT NOT NULL,
+      payout_pi_amount NUMERIC(20,8) NOT NULL,
+      carry_out_coins BIGINT NOT NULL DEFAULT 0,
+      status TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (cycle_id, uid)
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.pi_payout_jobs (
+      id BIGSERIAL PRIMARY KEY,
+      cycle_id BIGINT NOT NULL REFERENCES public.monthly_payout_cycles(id) ON DELETE CASCADE,
+      uid TEXT NOT NULL,
+      payout_pi_amount NUMERIC(20,8) NOT NULL,
+      wallet_identifier TEXT,
+      status TEXT NOT NULL DEFAULT 'queued',
+      txid TEXT,
+      error_message TEXT,
+      attempts INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (cycle_id, uid)
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS monthly_payout_snapshots_cycle_status_idx
+      ON public.monthly_payout_snapshots (cycle_id, status);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS pi_payout_jobs_status_cycle_idx
+      ON public.pi_payout_jobs (status, cycle_id, created_at);
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS user_ads (
       uid TEXT NOT NULL,
       month TEXT NOT NULL,
@@ -245,7 +303,6 @@ await pool.query(`
       PRIMARY KEY (uid, month)
     );
   `);
-
   await pool.query(`
     ALTER TABLE user_ads
     ADD COLUMN IF NOT EXISTS ads_for_restarts INT DEFAULT 0
@@ -395,6 +452,565 @@ export async function closeMonthAndResetCoins(opts?: { month?: string }) {
   }
 }
 
+
+type MonthlyPayoutCycleStatus = "open" | "closed" | "payouts_generated" | "processing" | "completed";
+type MonthlyPayoutSnapshotStatus = "eligible" | "below_threshold" | "queued" | "paid" | "failed";
+type PiPayoutJobStatus = "queued" | "processing" | "paid" | "failed";
+
+type PayoutJobRecord = {
+  id: number;
+  cycle_id: number;
+  uid: string;
+  payout_pi_amount: string;
+  wallet_identifier: string | null;
+  status: PiPayoutJobStatus;
+  txid: string | null;
+  error_message: string | null;
+  attempts: number;
+};
+
+const MONTH_KEY_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+function normalizeMonthKey(input?: string) {
+  const key = String(input || currentMonthKey()).trim();
+  if (!MONTH_KEY_RE.test(key)) throw new Error("invalid_month_key");
+  return key;
+}
+
+function toPositiveNumber(value: unknown, fieldName: string) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`invalid_${fieldName}`);
+  return n;
+}
+
+function toNonNegativeInt(value: unknown, fallback: number) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.floor(n));
+}
+
+function assertCycleStatus(status: string): MonthlyPayoutCycleStatus {
+  const allowed: MonthlyPayoutCycleStatus[] = ["open", "closed", "payouts_generated", "processing", "completed"];
+  if (!allowed.includes(status as MonthlyPayoutCycleStatus)) throw new Error("invalid_cycle_status");
+  return status as MonthlyPayoutCycleStatus;
+}
+
+function assertJobStatus(status: string): PiPayoutJobStatus {
+  const allowed: PiPayoutJobStatus[] = ["queued", "processing", "paid", "failed"];
+  if (!allowed.includes(status as PiPayoutJobStatus)) throw new Error("invalid_job_status");
+  return status as PiPayoutJobStatus;
+}
+
+async function resolveCycleForUpdate(
+  client: { query: (q: string, values?: any[]) => Promise<{ rows: any[] }> },
+  opts: { cycleId?: number; monthKey?: string }
+) {
+  if (opts.cycleId) {
+    const out = await client.query(
+      `SELECT * FROM public.monthly_payout_cycles WHERE id = $1 FOR UPDATE`,
+      [opts.cycleId]
+    );
+    return out.rows[0] || null;
+  }
+
+  if (opts.monthKey) {
+    const out = await client.query(
+      `SELECT * FROM public.monthly_payout_cycles WHERE month_key = $1 FOR UPDATE`,
+      [opts.monthKey]
+    );
+    return out.rows[0] || null;
+  }
+
+  throw new Error("cycle_reference_required");
+}
+
+export async function closeMonthlyPayoutCycle(opts: {
+  monthKey?: string;
+  conversionRateLocked: number;
+  minPayoutThresholdPi: number;
+}) {
+  const monthKey = normalizeMonthKey(opts.monthKey);
+  const conversionRateLocked = toPositiveNumber(opts.conversionRateLocked, "conversion_rate_locked");
+  const minPayoutThresholdPi = toPositiveNumber(opts.minPayoutThresholdPi, "min_payout_threshold_pi");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    await client.query(
+      `INSERT INTO public.monthly_payout_cycles (
+         month_key,
+         conversion_rate_locked,
+         min_payout_threshold_pi,
+         status,
+         created_at
+       )
+       VALUES ($1, $2, $3, 'open', NOW())
+       ON CONFLICT (month_key) DO NOTHING`,
+      [monthKey, conversionRateLocked, minPayoutThresholdPi]
+    );
+
+    const cycleRes = await client.query(
+      `SELECT *
+         FROM public.monthly_payout_cycles
+        WHERE month_key = $1
+        FOR UPDATE`,
+      [monthKey]
+    );
+    const cycle = cycleRes.rows[0];
+    if (!cycle) throw new Error("cycle_not_found");
+
+    const existingStatus = assertCycleStatus(String(cycle.status || "open"));
+    if (existingStatus !== "open") {
+      const snapCount = await client.query(
+        `SELECT COUNT(*)::int AS c FROM public.monthly_payout_snapshots WHERE cycle_id = $1`,
+        [cycle.id]
+      );
+      await client.query("COMMIT");
+      return {
+        ok: true,
+        cycle_id: Number(cycle.id),
+        month_key: String(cycle.month_key),
+        status: existingStatus,
+        snapshots_count: Number(snapCount.rows[0]?.c || 0),
+        idempotent: true,
+      };
+    }
+
+    await client.query(
+      `UPDATE public.monthly_payout_cycles
+          SET conversion_rate_locked = $2,
+              min_payout_threshold_pi = $3,
+              status = 'closed',
+              closed_at = NOW()
+        WHERE id = $1`,
+      [cycle.id, conversionRateLocked, minPayoutThresholdPi]
+    );
+
+    await client.query(
+      `INSERT INTO public.monthly_payout_snapshots (
+         cycle_id,
+         uid,
+         coins_earned,
+         carry_in_coins,
+         total_coins_for_settlement,
+         payout_pi_amount,
+         carry_out_coins,
+         status,
+         created_at
+       )
+       SELECT
+         $1 AS cycle_id,
+         u.uid,
+         COALESCE(u.coins, 0)::bigint AS coins_earned,
+         COALESCE(u.payout_carry_coins, 0)::bigint AS carry_in_coins,
+         (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint) AS total_coins_for_settlement,
+         CASE
+           WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric THEN 0::numeric(20,8)
+           ELSE ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric)::numeric(20,8)
+         END AS payout_pi_amount,
+         CASE
+           WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
+             THEN (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint)
+           ELSE 0::bigint
+         END AS carry_out_coins,
+         CASE
+           WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
+             THEN 'below_threshold'
+           ELSE 'eligible'
+         END AS status,
+         NOW()
+       FROM public.users u
+       WHERE (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint) > 0
+       ON CONFLICT (cycle_id, uid) DO NOTHING`,
+      [cycle.id, conversionRateLocked, minPayoutThresholdPi]
+    );
+
+    await client.query(
+      `UPDATE public.users u
+          SET coins = 0,
+              payout_carry_coins = s.carry_out_coins,
+              updated_at = NOW()
+         FROM public.monthly_payout_snapshots s
+        WHERE s.cycle_id = $1
+          AND s.uid = u.uid`,
+      [cycle.id]
+    );
+
+    const countRes = await client.query(
+      `SELECT
+         COUNT(*)::int AS snapshots_count,
+         COALESCE(SUM(CASE WHEN status = 'eligible' THEN 1 ELSE 0 END), 0)::int AS eligible_count,
+         COALESCE(SUM(CASE WHEN status = 'below_threshold' THEN 1 ELSE 0 END), 0)::int AS below_threshold_count
+       FROM public.monthly_payout_snapshots
+       WHERE cycle_id = $1`,
+      [cycle.id]
+    );
+
+    await client.query("COMMIT");
+
+    return {
+      ok: true,
+      cycle_id: Number(cycle.id),
+      month_key: monthKey,
+      status: "closed" as MonthlyPayoutCycleStatus,
+      snapshots_count: Number(countRes.rows[0]?.snapshots_count || 0),
+      eligible_count: Number(countRes.rows[0]?.eligible_count || 0),
+      below_threshold_count: Number(countRes.rows[0]?.below_threshold_count || 0),
+      idempotent: false,
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function generatePayoutJobs(opts: { cycleId?: number; monthKey?: string }) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const monthKey = opts.monthKey ? normalizeMonthKey(opts.monthKey) : undefined;
+    const cycle = await resolveCycleForUpdate(client, {
+      cycleId: opts.cycleId,
+      monthKey,
+    });
+    if (!cycle) throw new Error("cycle_not_found");
+
+    const cycleStatus = assertCycleStatus(String(cycle.status || "open"));
+    if (cycleStatus === "open") throw new Error("cycle_not_closed");
+
+    const inserted = await client.query(
+      `INSERT INTO public.pi_payout_jobs (
+         cycle_id,
+         uid,
+         payout_pi_amount,
+         wallet_identifier,
+         status,
+         created_at,
+         updated_at
+       )
+       SELECT
+         s.cycle_id,
+         s.uid,
+         s.payout_pi_amount,
+         u.pi_wallet_identifier,
+         'queued',
+         NOW(),
+         NOW()
+       FROM public.monthly_payout_snapshots s
+       LEFT JOIN public.users u ON u.uid = s.uid
+       WHERE s.cycle_id = $1
+         AND s.status = 'eligible'
+         AND s.payout_pi_amount > 0
+       ON CONFLICT (cycle_id, uid) DO NOTHING
+       RETURNING id`,
+      [cycle.id]
+    );
+
+    await client.query(
+      `UPDATE public.monthly_payout_snapshots s
+          SET status = 'queued'
+         WHERE s.cycle_id = $1
+           AND s.status = 'eligible'
+           AND EXISTS (
+             SELECT 1
+             FROM public.pi_payout_jobs j
+             WHERE j.cycle_id = s.cycle_id
+               AND j.uid = s.uid
+           )`,
+      [cycle.id]
+    );
+
+    await client.query(
+      `UPDATE public.monthly_payout_cycles
+          SET status = CASE WHEN status = 'closed' THEN 'payouts_generated' ELSE status END
+        WHERE id = $1`,
+      [cycle.id]
+    );
+
+    const totals = await client.query(
+      `SELECT COUNT(*)::int AS total_jobs
+       FROM public.pi_payout_jobs
+       WHERE cycle_id = $1`,
+      [cycle.id]
+    );
+
+    await client.query("COMMIT");
+
+    return {
+      ok: true,
+      cycle_id: Number(cycle.id),
+      month_key: String(cycle.month_key),
+      inserted_jobs: inserted.rowCount || 0,
+      total_jobs: Number(totals.rows[0]?.total_jobs || 0),
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function adminListPayoutJobs(opts?: {
+  cycleId?: number;
+  monthKey?: string;
+  status?: PiPayoutJobStatus;
+  limit?: number;
+  offset?: number;
+}) {
+  const limit = Math.max(1, Math.min(500, toNonNegativeInt(opts?.limit, 100)));
+  const offset = Math.max(0, toNonNegativeInt(opts?.offset, 0));
+  const values: any[] = [];
+  const where: string[] = [];
+
+  if (opts?.cycleId) {
+    values.push(opts.cycleId);
+    where.push(`j.cycle_id = $${values.length}`);
+  }
+
+  if (opts?.monthKey) {
+    values.push(normalizeMonthKey(opts.monthKey));
+    where.push(`c.month_key = $${values.length}`);
+  }
+
+  if (opts?.status) {
+    values.push(assertJobStatus(opts.status));
+    where.push(`j.status = $${values.length}`);
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  values.push(limit);
+  const limitIndex = values.length;
+  values.push(offset);
+  const offsetIndex = values.length;
+
+  const out = await pool.query(
+    `SELECT
+       j.id,
+       j.cycle_id,
+       c.month_key,
+       j.uid,
+       j.payout_pi_amount,
+       j.wallet_identifier,
+       j.status,
+       j.txid,
+       j.error_message,
+       j.attempts,
+       j.created_at,
+       j.updated_at
+     FROM public.pi_payout_jobs j
+     JOIN public.monthly_payout_cycles c ON c.id = j.cycle_id
+     ${whereSql}
+     ORDER BY j.created_at ASC
+     LIMIT $${limitIndex} OFFSET $${offsetIndex}`,
+    values
+  );
+
+  return {
+    ok: true,
+    rows: out.rows,
+  };
+}
+
+export async function adminUpdatePayoutJobStatus(opts: {
+  jobId: number;
+  status: PiPayoutJobStatus;
+  txid?: string | null;
+  errorMessage?: string | null;
+}) {
+  const status = assertJobStatus(opts.status);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const lock = await client.query(
+      `SELECT * FROM public.pi_payout_jobs WHERE id = $1 FOR UPDATE`,
+      [opts.jobId]
+    );
+    const job = lock.rows[0];
+    if (!job) throw new Error("payout_job_not_found");
+
+    const updated = await client.query(
+      `UPDATE public.pi_payout_jobs
+          SET status = $2,
+              txid = CASE WHEN $2 = 'paid' THEN NULLIF($3, '') ELSE txid END,
+              error_message = CASE
+                WHEN $2 = 'failed' THEN NULLIF($4, '')
+                WHEN $2 = 'paid' THEN NULL
+                ELSE error_message
+              END,
+              updated_at = NOW()
+        WHERE id = $1
+        RETURNING *`,
+      [opts.jobId, status, opts.txid || null, opts.errorMessage || null]
+    );
+
+    let snapshotStatus: MonthlyPayoutSnapshotStatus | null = null;
+    if (status === "paid") snapshotStatus = "paid";
+    if (status === "failed") snapshotStatus = "failed";
+    if (status === "queued" || status === "processing") snapshotStatus = "queued";
+
+    if (snapshotStatus) {
+      await client.query(
+        `UPDATE public.monthly_payout_snapshots
+            SET status = $3
+          WHERE cycle_id = $1 AND uid = $2`,
+        [updated.rows[0].cycle_id, updated.rows[0].uid, snapshotStatus]
+      );
+    }
+
+    const cycleAgg = await client.query(
+      `SELECT
+         COUNT(*)::int AS total_jobs,
+         COALESCE(SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END), 0)::int AS paid_jobs
+       FROM public.pi_payout_jobs
+       WHERE cycle_id = $1`,
+      [updated.rows[0].cycle_id]
+    );
+
+    const totalJobs = Number(cycleAgg.rows[0]?.total_jobs || 0);
+    const paidJobs = Number(cycleAgg.rows[0]?.paid_jobs || 0);
+
+    await client.query(
+      `UPDATE public.monthly_payout_cycles
+          SET status = CASE
+            WHEN $2 > 0 AND $2 = $3 THEN 'completed'
+            ELSE 'processing'
+          END
+        WHERE id = $1
+          AND status <> 'open'`,
+      [updated.rows[0].cycle_id, totalJobs, paidJobs]
+    );
+
+    await client.query("COMMIT");
+    return { ok: true, row: updated.rows[0] };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function adminRequeueFailedPayoutJob(jobId: number) {
+  const out = await pool.query(
+    `UPDATE public.pi_payout_jobs
+        SET status = 'queued',
+            error_message = NULL,
+            updated_at = NOW()
+      WHERE id = $1
+        AND status = 'failed'
+      RETURNING *`,
+    [jobId]
+  );
+
+  if (!out.rows.length) throw new Error("payout_job_not_failed_or_not_found");
+
+  await pool.query(
+    `UPDATE public.monthly_payout_snapshots
+        SET status = 'queued'
+      WHERE cycle_id = $1
+        AND uid = $2`,
+    [out.rows[0].cycle_id, out.rows[0].uid]
+  );
+
+  return { ok: true, row: out.rows[0] };
+}
+
+async function claimQueuedPayoutJobs(limit: number) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const out = await client.query(
+      `WITH picked AS (
+         SELECT id
+         FROM public.pi_payout_jobs
+         WHERE status = 'queued'
+         ORDER BY created_at ASC
+         FOR UPDATE SKIP LOCKED
+         LIMIT $1
+       )
+       UPDATE public.pi_payout_jobs j
+          SET status = 'processing',
+              attempts = attempts + 1,
+              updated_at = NOW()
+         FROM picked
+        WHERE j.id = picked.id
+       RETURNING j.*`,
+      [Math.max(1, Math.min(100, limit))]
+    );
+
+    if ((out.rowCount || 0) > 0) {
+      const cycleIds = Array.from(
+        new Set(out.rows.map((r: any) => Number(r.cycle_id)).filter((n: number) => Number.isFinite(n)))
+      );
+
+      if (cycleIds.length > 0) {
+        await client.query(
+          `UPDATE public.monthly_payout_cycles
+              SET status = 'processing'
+            WHERE id = ANY($1::bigint[])
+              AND status IN ('closed', 'payouts_generated')`,
+          [cycleIds]
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+    return out.rows as PayoutJobRecord[];
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function sendPiPayout(job: PayoutJobRecord): Promise<{ txid: string }> {
+  if (process.env.PAYOUT_SIMULATE_SUCCESS === "true") {
+    return { txid: `sim-${job.id}-${Date.now()}` };
+  }
+
+  throw new Error("sendPiPayout_not_implemented");
+}
+
+export async function runPayoutWorkerBatch(opts?: { limit?: number }) {
+  const limit = Math.max(1, Math.min(100, Number(opts?.limit || 10)));
+  const jobs = await claimQueuedPayoutJobs(limit);
+
+  let paid = 0;
+  let failed = 0;
+
+  for (const job of jobs) {
+    try {
+      const tx = await sendPiPayout(job);
+      await adminUpdatePayoutJobStatus({
+        jobId: Number(job.id),
+        status: "paid",
+        txid: tx.txid,
+      });
+      paid += 1;
+    } catch (e: any) {
+      await adminUpdatePayoutJobStatus({
+        jobId: Number(job.id),
+        status: "failed",
+        errorMessage: String(e?.message || "payout_failed"),
+      });
+      failed += 1;
+    }
+  }
+
+  return {
+    ok: true,
+    claimed: jobs.length,
+    paid,
+    failed,
+  };
+}
 export async function ensureUserAdsRow(uid: string) {
   const month = currentMonthKey();
 
@@ -1522,7 +2138,4 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
-
-
-
 

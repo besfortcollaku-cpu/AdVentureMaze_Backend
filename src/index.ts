@@ -25,9 +25,15 @@ import {
   getFreeSkipsLeft,
   getFreeHintsLeft,
   closeMonthAndResetCoins,
+  closeMonthlyPayoutCycle,
+  generatePayoutJobs,
+  adminListPayoutJobs,
+  adminUpdatePayoutJobStatus,
+  adminRequeueFailedPayoutJob,
+  runPayoutWorkerBatch,
   ensureMonthlyKey,
-claimMonthlyRewards,
-recalcAndStoreMonthlyRate,
+  claimMonthlyRewards,
+  recalcAndStoreMonthlyRate,
   ensureInviteCode,
   getInviteSummary,
   claimInviteCode,
@@ -83,6 +89,26 @@ app.get("/api/me", async (req, res) => {
     );
 const user = userRes.rows[0] ?? null;
 const progress = await getProgressByUid(uid);
+
+const invitedUsersRes = await pool.query(
+  `SELECT COALESCE(u.username, ui.invitee_uid) AS label
+   FROM public.user_invites ui
+   LEFT JOIN public.users u ON u.uid = ui.invitee_uid
+   WHERE ui.inviter_uid = $1
+   ORDER BY ui.created_at DESC
+   LIMIT 200`,
+  [uid]
+);
+const invitedUsernames = invitedUsersRes.rows
+  .map((r: any) => String(r.label || "").trim())
+  .filter(Boolean);
+
+const invitedByNameRes = user?.invited_by_uid
+  ? await pool.query(`SELECT username FROM public.users WHERE uid = $1 LIMIT 1`, [user.invited_by_uid])
+  : { rows: [] as any[] };
+const invitedByName = String(invitedByNameRes.rows?.[0]?.username || user?.invited_by_uid || "").trim() || null;
+
+
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -213,6 +239,8 @@ if (firstRecoverableMissedDay) {
             lifetime_valid_invites: user.lifetime_valid_invites ?? 0,
             invite_code: user.invite_code ?? null,
             invited_by_uid: user.invited_by_uid ?? null,
+            invited_by_name: invitedByName,
+            invited_usernames: invitedUsernames,
           }
         : null,
 
@@ -1450,6 +1478,25 @@ app.post("/api/skip", async (req, res) => {
 app.post("/admin/month-close", async (req,res)=>{
   try{
     requireAdmin(req);
+    const monthKey = req.body?.month_key ? String(req.body.month_key) : undefined;
+    const conversionRateLocked = Number(req.body?.conversion_rate_locked);
+    const minPayoutThresholdPi = Number(req.body?.min_payout_threshold_pi ?? 0);
+
+    const out = await closeMonthlyPayoutCycle({
+      monthKey,
+      conversionRateLocked,
+      minPayoutThresholdPi,
+    });
+
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
+  }
+});
+
+app.post("/admin/month-close-legacy", async (req,res)=>{
+  try{
+    requireAdmin(req);
     const month = req.body?.month ? String(req.body.month) : undefined;
     res.json(await closeMonthAndResetCoins({ month }));
   }catch(e:any){
@@ -1457,8 +1504,83 @@ app.post("/admin/month-close", async (req,res)=>{
   }
 });
 
+app.post("/admin/payouts/generate", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const cycleId = req.body?.cycle_id ? Number(req.body.cycle_id) : undefined;
+    const monthKey = req.body?.month_key ? String(req.body.month_key) : undefined;
+    const out = await generatePayoutJobs({ cycleId, monthKey });
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
 
+app.get("/admin/payouts/jobs", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const cycleId = req.query.cycle_id ? Number(req.query.cycle_id) : undefined;
+    const monthKey = req.query.month_key ? String(req.query.month_key) : undefined;
+    const status = req.query.status ? String(req.query.status) : undefined;
+    const limit = req.query.limit ? Number(req.query.limit) : undefined;
+    const offset = req.query.offset ? Number(req.query.offset) : undefined;
 
+    const out = await adminListPayoutJobs({
+      cycleId,
+      monthKey,
+      status: status as any,
+      limit,
+      offset,
+    });
+
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/payouts/jobs/:id/status", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const jobId = Number(req.params.id);
+    const status = String(req.body?.status || "");
+    const txid = req.body?.txid ? String(req.body.txid) : undefined;
+    const errorMessage = req.body?.error_message ? String(req.body.error_message) : undefined;
+
+    const out = await adminUpdatePayoutJobStatus({
+      jobId,
+      status: status as any,
+      txid,
+      errorMessage,
+    });
+
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/payouts/jobs/:id/requeue", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const jobId = Number(req.params.id);
+    const out = await adminRequeueFailedPayoutJob(jobId);
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/payouts/worker/run", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const limit = req.body?.limit ? Number(req.body.limit) : undefined;
+    const out = await runPayoutWorkerBatch({ limit });
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
 
 /* ---------------- ADMIN: stats/online/users ---------------- */
 app.get("/admin/stats", async (req,res)=>{
@@ -1568,9 +1690,4 @@ async function start() {
 }
 
 start();
-
-
-
-
-
 
