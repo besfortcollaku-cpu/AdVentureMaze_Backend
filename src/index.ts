@@ -212,6 +212,7 @@ if (firstRecoverableMissedDay) {
             monthly_valid_invites: user.monthly_valid_invites ?? 0,
             lifetime_valid_invites: user.lifetime_valid_invites ?? 0,
             invite_code: user.invite_code ?? null,
+            invited_by_uid: user.invited_by_uid ?? null,
           }
         : null,
 
