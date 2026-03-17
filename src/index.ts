@@ -31,6 +31,7 @@ import {
   adminListPayoutCycles,
   adminGetPayoutSnapshotSummary,
   adminGetPayoutRuntimeConfig,
+  adminSetPayoutSimulationMode,
   adminListPayoutSnapshots,
   adminListPayoutTransferLogs,
   adminRetryFailedPayouts,
@@ -1784,6 +1785,17 @@ app.get("/admin/payouts/config", async (req,res)=>{
     res.json(out);
   }catch(e:any){
     res.status(400).json({ ok:false, error:e.message });
+
+app.post("/admin/payouts/config/simulation", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const enabled = String(req.body?.enabled || "").toLowerCase();
+    const out = await adminSetPayoutSimulationMode(enabled === "true" || enabled === "1");
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
   }
 });
 

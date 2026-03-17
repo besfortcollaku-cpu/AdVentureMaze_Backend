@@ -620,6 +620,18 @@ const SUSPICIOUS_MONTHLY_COINS = envNumber("SUSPICIOUS_MONTHLY_COINS", 10000);
 const PAYOUT_FAIL_REVIEW_COUNT = envNumber("PAYOUT_FAIL_REVIEW_COUNT", 3);
 const PAYOUT_MAX_ATTEMPTS = Math.max(1, Math.floor(envNumber("PAYOUT_MAX_ATTEMPTS", 3)));
 const SENDING_WALLET_MIN_REQUIRED_PI = envNumber("SENDING_WALLET_MIN_REQUIRED_PI", 0);
+let runtimePayoutSimulationMode: boolean | null = null;
+
+function isPayoutSimulationMode() {
+  if (typeof runtimePayoutSimulationMode === "boolean") return runtimePayoutSimulationMode;
+  return process.env.PAYOUT_SIMULATE_SUCCESS === "true";
+}
+
+export async function adminSetPayoutSimulationMode(enabled: boolean) {
+  runtimePayoutSimulationMode = Boolean(enabled);
+  process.env.PAYOUT_SIMULATE_SUCCESS = runtimePayoutSimulationMode ? "true" : "false";
+  return { ok: true, simulation_mode: runtimePayoutSimulationMode };
+}
 
 type PayoutRiskEvaluation = {
   allowed: boolean;
@@ -1454,7 +1466,7 @@ export async function adminGetPayoutSnapshotSummary(opts?: { cycleId?: number; m
 export async function adminGetPayoutRuntimeConfig() {
   return {
     ok: true,
-    simulation_mode: process.env.PAYOUT_SIMULATE_SUCCESS === "true",
+    simulation_mode: isPayoutSimulationMode(),
     payout_max_attempts: PAYOUT_MAX_ATTEMPTS,
     pi_payout_adapter_enabled: process.env.PI_PAYOUT_ADAPTER_ENABLED === "true",
     max_user_monthly_pi: MAX_USER_MONTHLY_PI,
