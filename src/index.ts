@@ -276,16 +276,50 @@ if (firstRecoverableMissedDay) {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
+function validatePiWalletInput(raw: unknown): { ok: true; wallet: string } | { ok: false; error: string } {
+  const compact = String(raw || "").replace(/[\r\n]+/g, " ").trim();
+
+  if (!compact) return { ok: false, error: "invalid_wallet_required" };
+
+  const words = compact.split(/\s+/).filter(Boolean);
+  if (words.length >= 12) return { ok: false, error: "invalid_wallet_secret_like" };
+
+  if (compact.includes(" ")) return { ok: false, error: "invalid_wallet_format" };
+
+  const upper = compact.toUpperCase();
+
+  const hasSecretKeywords = /(seed|mnemonic|private|secret|phrase)/i.test(compact);
+  const alpha = compact.replace(/[^a-zA-Z]/g, "");
+  const lower = compact.replace(/[^a-z]/g, "");
+  const lowerHeavy = alpha.length >= 20 && (lower.length / alpha.length) >= 0.75;
+  const randomLongNoPrefix = upper.length >= 40 && !upper.startsWith("G");
+  if (hasSecretKeywords || lowerHeavy || randomLongNoPrefix) {
+    return { ok: false, error: "invalid_wallet_secret_like" };
+  }
+
+  if (upper.length < 20 || upper.length > 100) {
+    return { ok: false, error: "invalid_wallet_format" };
+  }
+
+  if (!/^[A-Z0-9]+$/.test(upper)) {
+    return { ok: false, error: "invalid_wallet_format" };
+  }
+
+  if (!upper.startsWith("G")) {
+    return { ok: false, error: "invalid_wallet_prefix" };
+  }
+
+  return { ok: true, wallet: upper };
+}
 app.post("/api/user/set-wallet", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
 
-    const rawWallet = String(req.body?.wallet || "");
-    const wallet = rawWallet.trim().toLowerCase();
-
-    if (wallet.length < 20 || wallet.length > 100 || !/^[a-z0-9]+$/.test(wallet)) {
-      return res.status(400).json({ ok: false, error: "invalid_wallet" });
+    const walletCheck = validatePiWalletInput(req.body?.wallet);
+    if (!walletCheck.ok) {
+      return res.status(400).json({ ok: false, error: walletCheck.error });
     }
+    const wallet = walletCheck.wallet;
 
     const duplicateRes = await pool.query(
       `SELECT uid FROM public.users
