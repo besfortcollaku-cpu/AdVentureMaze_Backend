@@ -40,6 +40,8 @@ import {
   ensureMonthlyKey,
   claimMonthlyRewards,
   recalcAndStoreMonthlyRate,
+  trackRewardedAdActivity,
+  resetDailyAdCounters,
   ensureInviteCode,
   getInviteSummary,
   claimInviteCode,
@@ -488,7 +490,8 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
     await pool.query("ROLLBACK");
     res.status(400).json({ ok: false, error: e.message });
   }
-});app.post("/api/daily-reward/recover", async (req, res) => {
+});
+app.post("/api/daily-reward/recover", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
 
@@ -980,6 +983,47 @@ function requireAdmin(req: express.Request) {
   if (secret !== process.env.ADMIN_SECRET) throw new Error("Unauthorized");
 }
 
+
+function requestIp(req: express.Request) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  const realIp = String(req.headers["x-real-ip"] || "").trim();
+  const candidate = forwarded || realIp || req.ip || "";
+  return candidate.replace(/^::ffff:/, "");
+}
+
+function headerValue(req: express.Request, key: string): string | null {
+  const v = req.headers[key.toLowerCase() as keyof typeof req.headers] as any;
+  if (Array.isArray(v)) return String(v[0] || "").trim() || null;
+  const s = String(v || "").trim();
+  return s || null;
+}
+
+function boolHeader(req: express.Request, key: string): boolean {
+  const v = (headerValue(req, key) || "").toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
+function getAdRequestMeta(req: express.Request) {
+  return {
+    ip: requestIp(req) || null,
+    country: headerValue(req, "cf-ipcountry") || headerValue(req, "x-country") || null,
+    asn: headerValue(req, "x-asn") || null,
+    isp: headerValue(req, "x-isp") || null,
+    is_vpn: boolHeader(req, "x-vpn") || boolHeader(req, "x-ip-vpn"),
+  };
+}
+
+function getAdRewardCoins(adsWatchedToday: number) {
+  if (adsWatchedToday < 10) {
+    return 50;
+  }
+
+  const extra = adsWatchedToday - 10;
+  const reward = 50 - (extra * 5);
+
+  return Math.max(reward, 5);
+}
+
 /* ---------------- PI VERIFY ---------------- */
 app.post("/api/pi/verify", async (req, res) => {
   try {
@@ -1023,15 +1067,33 @@ app.post("/api/rewards/ad-50", async (req,res)=>{
     const nonce = String(req.body?.nonce||"");
     if(!nonce) return res.status(400).json({ok:false});
 
+    const levelRes = await pool.query(`SELECT level FROM public.progress WHERE uid = $1 LIMIT 1`, [uid]);
+    const levelBefore = Number(levelRes.rows[0]?.level || 1);
+    const adStateRes = await pool.query(`SELECT ads_watched_today FROM public.users WHERE uid = $1 LIMIT 1`, [uid]);
+    const adsWatchedToday = Number(adStateRes.rows[0]?.ads_watched_today || 0);
+    const rewardCoins = getAdRewardCoins(adsWatchedToday);
+
     const out = await claimReward({
       uid,
       type:"ad_50",
       nonce,
-      amount:50,
+      amount:rewardCoins,
       cooldownSeconds:180,
     });
 
-    res.json({ ok:true, already:!!out?.already, user:out?.user });
+    if (!out?.already) {
+      try {
+        await trackRewardedAdActivity({
+          uid,
+          ...getAdRequestMeta(req),
+          ad_type: "ad_50",
+          level_before: levelBefore,
+          level_after: levelBefore,
+        });
+      } catch {}
+    }
+
+    res.json({ ok:true, already:!!out?.already, rewardCoins, user:out?.user });
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
   }
@@ -1081,12 +1143,12 @@ app.post("/api/restart", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT restarts_balance, coins FROM public.users WHERE uid=$1 FOR UPDATE`,
+      `SELECT restarts_balance, coins, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
 
     const progressRes = await pool.query(
-      `SELECT free_restarts_used FROM progress WHERE uid=$1 FOR UPDATE`,
+      `SELECT free_restarts_used, level FROM progress WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
 
@@ -1101,6 +1163,9 @@ app.post("/api/restart", async (req, res) => {
     const RESTART_PRICE = 50;
 
     let usedFree = false;
+    let usedAd = false;
+    const adLevelBefore = Number(progress?.level ?? 1);
+    const rewardCoins = getAdRewardCoins(Number(user?.ads_watched_today || 0));
 
     if ((progress.free_restarts_used ?? 0) < FREE_RESTART_LIMIT) {
       await pool.query(
@@ -1141,13 +1206,14 @@ app.post("/api/restart", async (req, res) => {
         uid,
         type: "restart_ad",
         nonce,
-        amount: 1,
+        amount: rewardCoins,
         cooldownSeconds: 30,
       });
 
       if (reward?.already) {
         throw new Error("Ad already claimed");
       }
+      usedAd = true;
 
     } else {
       throw new Error("No restarts available");
@@ -1162,6 +1228,17 @@ app.post("/api/restart", async (req, res) => {
 
     await pool.query("COMMIT");
     try { await recalcAndStoreMonthlyRate(uid); } catch {}
+    if (usedAd) {
+      try {
+        await trackRewardedAdActivity({
+          uid,
+          ...getAdRequestMeta(req),
+          ad_type: "restart_ad",
+          level_before: adLevelBefore,
+          level_after: adLevelBefore,
+        });
+      } catch {}
+    }
 
     const updatedUser = await pool.query(
       `SELECT restarts_balance, coins FROM public.users WHERE uid=$1`,
@@ -1186,6 +1263,7 @@ app.post("/api/restart", async (req, res) => {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
+
 app.post("/api/rewards/daily-claim", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
@@ -1264,11 +1342,11 @@ app.post("/api/skip", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT skips_balance, coins FROM public.users WHERE uid=$1 FOR UPDATE`,
+      `SELECT skips_balance, coins, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
     const progressRes = await pool.query(
-      `SELECT free_skips_used FROM progress WHERE uid=$1 FOR UPDATE`,
+      `SELECT free_skips_used, level FROM progress WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
 
@@ -1283,6 +1361,9 @@ app.post("/api/skip", async (req, res) => {
     const SKIP_PRICE = 50;
 
     let usedFree = false;
+    let usedAd = false;
+    const adLevelBefore = Number(progress?.level ?? 1);
+    const rewardCoins = getAdRewardCoins(Number(user?.ads_watched_today || 0));
 
     if ((progress.free_skips_used ?? 0) < FREE_SKIP_LIMIT) {
       await pool.query(
@@ -1323,13 +1404,14 @@ app.post("/api/skip", async (req, res) => {
         uid,
         type: "skip_ad",
         nonce,
-        amount: 1,
+        amount: rewardCoins,
         cooldownSeconds: 30,
       });
 
       if (reward?.already) {
         throw new Error("Ad already claimed");
       }
+      usedAd = true;
 
     } else {
       throw new Error("No skips available");
@@ -1344,6 +1426,17 @@ app.post("/api/skip", async (req, res) => {
 
     await pool.query("COMMIT");
     try { await recalcAndStoreMonthlyRate(uid); } catch {}
+    if (usedAd) {
+      try {
+        await trackRewardedAdActivity({
+          uid,
+          ...getAdRequestMeta(req),
+          ad_type: "skip_ad",
+          level_before: adLevelBefore,
+          level_after: adLevelBefore,
+        });
+      } catch {}
+    }
 
     const updatedUser = await pool.query(
       `SELECT skips_balance, coins FROM public.users WHERE uid=$1`,
@@ -1366,7 +1459,9 @@ app.post("/api/skip", async (req, res) => {
     await pool.query("ROLLBACK");
     res.status(400).json({ ok: false, error: e.message });
   }
-});app.post("/api/hint", async (req, res) => {
+});
+
+app.post("/api/hint", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const nonce = String(req.body?.nonce || "");
@@ -1375,12 +1470,12 @@ app.post("/api/skip", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT hints_balance, coins FROM public.users WHERE uid=$1 FOR UPDATE`,
+      `SELECT hints_balance, coins, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
 
     const progressRes = await pool.query(
-      `SELECT free_hints_used FROM progress WHERE uid=$1 FOR UPDATE`,
+      `SELECT free_hints_used, level FROM progress WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
 
@@ -1395,6 +1490,9 @@ app.post("/api/skip", async (req, res) => {
     const HINT_PRICE = 50;
 
     let usedFree = false;
+    let usedAd = false;
+    const adLevelBefore = Number(progress?.level ?? 1);
+    const rewardCoins = getAdRewardCoins(Number(user?.ads_watched_today || 0));
 
     if ((progress.free_hints_used ?? 0) < FREE_HINT_LIMIT) {
       await pool.query(
@@ -1435,13 +1533,14 @@ app.post("/api/skip", async (req, res) => {
         uid,
         type: "hint_ad",
         nonce,
-        amount: 1,
+        amount: rewardCoins,
         cooldownSeconds: 30,
       });
 
       if (reward?.already) {
         throw new Error("Ad already claimed");
       }
+      usedAd = true;
 
     } else {
       throw new Error("No hints available");
@@ -1456,6 +1555,17 @@ app.post("/api/skip", async (req, res) => {
 
     await pool.query("COMMIT");
     try { await recalcAndStoreMonthlyRate(uid); } catch {}
+    if (usedAd) {
+      try {
+        await trackRewardedAdActivity({
+          uid,
+          ...getAdRequestMeta(req),
+          ad_type: "hint_ad",
+          level_before: adLevelBefore,
+          level_after: adLevelBefore,
+        });
+      } catch {}
+    }
 
     const updatedUser = await pool.query(
       `SELECT hints_balance, coins FROM public.users WHERE uid=$1`,
@@ -1480,6 +1590,7 @@ app.post("/api/skip", async (req, res) => {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
+
 /* ---------------- ADMIN: month close ---------------- */
 app.post("/admin/month-close", async (req,res)=>{
   try{
@@ -1702,7 +1813,8 @@ app.get("/admin/users", async (req,res)=>{
     const limit  = Math.max(1, Math.min(200, Number(req.query.limit || 25)));
     const offset = Math.max(0, Number(req.query.offset || 0));
     const order  = String(req.query.order || "updated_at_desc");
-    const out = await adminListUsers({ search, limit, offset });
+    const suspiciousOnly = String(req.query.suspicious || "") === "1";
+    const out = await adminListUsers({ search, limit, offset, suspiciousOnly });
     res.json(out);
   }catch(e:any){
     res.status(401).json({ ok:false, error:e.message });
@@ -1759,14 +1871,30 @@ app.delete("/admin/users/:uid", async (req, res) => {
 });
 
 /* ---------------- START ---------------- */
+let lastAdResetDate = "";
+
+async function maybeRunDailyAdReset() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today === lastAdResetDate) return;
+
+  try {
+    await resetDailyAdCounters();
+    lastAdResetDate = today;
+  } catch (e) {
+    console.error("daily_ad_reset_failed", e);
+  }
+}
 const PORT = Number(process.env.PORT) || 8080;
 
 async function start() {
   try {
     await initDB();
+    await maybeRunDailyAdReset();
     const info = await pool.query(`
       SELECT current_database(), inet_server_addr(), inet_server_port()
     `);
+    setInterval(() => { void maybeRunDailyAdReset(); }, 60 * 60 * 1000);
+
     app.listen(PORT, "0.0.0.0", () => {
      
     });
@@ -1778,6 +1906,23 @@ async function start() {
 }
 
 start();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

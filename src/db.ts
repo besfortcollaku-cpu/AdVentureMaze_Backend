@@ -174,6 +174,36 @@ export async function initDB() {
 await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_pending BOOLEAN NOT NULL DEFAULT FALSE`);
 
   await pool.query(`
+    ALTER TABLE public.users
+      ADD COLUMN IF NOT EXISTS fraud_score INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS vpn_flag BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS suspicious BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS ads_watched_today INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_ad_at TIMESTAMP;
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.user_ad_activity (
+      id SERIAL PRIMARY KEY,
+      uid TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      ip TEXT,
+      country TEXT,
+      asn TEXT,
+      isp TEXT,
+      is_vpn BOOLEAN DEFAULT FALSE,
+      ad_type TEXT,
+      level_before INTEGER,
+      level_after INTEGER
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS user_ad_activity_uid_created_idx
+      ON public.user_ad_activity (uid, created_at DESC);
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS reward_claims (
       uid TEXT NOT NULL,
       type TEXT NOT NULL,
@@ -684,6 +714,105 @@ async function treasuryAllowsPayout(payoutPi: number): Promise<boolean> {
   return available - paid - payoutPi >= TREASURY_RESERVE_PI;
 }
 
+
+export function calculateFraudScore(user: any, sessionData: {
+  is_vpn?: boolean;
+  level_before?: number | null;
+  level_after?: number | null;
+}) {
+  let score = 0;
+
+  if (sessionData?.is_vpn) score += 2;
+  if (Number(user?.ads_watched_today || 0) > 10) score += 2;
+
+  const lastAd = user?.last_ad_at ? new Date(user.last_ad_at).getTime() : 0;
+  if (lastAd && (Date.now() - lastAd < 120000)) score += 2;
+
+  if (sessionData?.level_after === sessionData?.level_before) score += 2;
+
+  return score;
+}
+
+export async function trackRewardedAdActivity(opts: {
+  uid: string;
+  ip?: string | null;
+  country?: string | null;
+  asn?: string | null;
+  isp?: string | null;
+  is_vpn?: boolean;
+  ad_type: string;
+  level_before?: number | null;
+  level_after?: number | null;
+}) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const lock = await client.query(
+      `SELECT uid, fraud_score, vpn_flag, suspicious, ads_watched_today, last_ad_at
+         FROM public.users
+        WHERE uid = $1
+        FOR UPDATE`,
+      [opts.uid]
+    );
+    const user = lock.rows[0];
+    if (!user) throw new Error("user_not_found");
+
+    const scoreAdd = calculateFraudScore(user, {
+      is_vpn: Boolean(opts.is_vpn),
+      level_before: opts.level_before ?? null,
+      level_after: opts.level_after ?? null,
+    });
+
+    await client.query(
+      `INSERT INTO public.user_ad_activity (
+         uid, ip, country, asn, isp, is_vpn, ad_type, level_before, level_after, created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+      [
+        opts.uid,
+        opts.ip || null,
+        opts.country || null,
+        opts.asn || null,
+        opts.isp || null,
+        Boolean(opts.is_vpn),
+        opts.ad_type,
+        opts.level_before ?? null,
+        opts.level_after ?? null,
+      ]
+    );
+
+    const updated = await client.query(
+      `UPDATE public.users
+          SET fraud_score = COALESCE(fraud_score, 0) + $2,
+              vpn_flag = CASE WHEN $3 THEN TRUE ELSE COALESCE(vpn_flag, FALSE) END,
+              ads_watched_today = COALESCE(ads_watched_today, 0) + 1,
+              last_ad_at = NOW(),
+              suspicious = CASE WHEN (COALESCE(fraud_score, 0) + $2) >= 6 THEN TRUE ELSE COALESCE(suspicious, FALSE) END,
+              updated_at = NOW()
+        WHERE uid = $1
+        RETURNING *`,
+      [opts.uid, scoreAdd, Boolean(opts.is_vpn)]
+    );
+
+    await client.query("COMMIT");
+    return { ok: true, score_added: scoreAdd, user: updated.rows[0] || null };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function resetDailyAdCounters() {
+  const out = await pool.query(
+    `UPDATE public.users
+        SET ads_watched_today = 0
+      WHERE COALESCE(ads_watched_today, 0) <> 0`
+  );
+  return { ok: true, reset_users: Number(out.rowCount || 0) };
+}
+
 function assertCycleStatus(status: string): MonthlyPayoutCycleStatus {
   const allowed: MonthlyPayoutCycleStatus[] = ["open", "closed", "payouts_generated", "processing", "completed"];
   if (!allowed.includes(status as MonthlyPayoutCycleStatus)) throw new Error("invalid_cycle_status");
@@ -814,20 +943,26 @@ export async function closeMonthlyPayoutCycle(opts: {
          COALESCE(u.coins, 0)::bigint AS coins_earned,
          COALESCE(u.payout_carry_coins, 0)::bigint AS carry_in_coins,
          (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint) AS total_coins_for_settlement,
-         CASE
-           WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric THEN 0::numeric(20,8)
-           ELSE ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric)::numeric(20,8)
-         END AS payout_pi_amount,
-         CASE
-           WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
-             THEN (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint)
-           ELSE 0::bigint
-         END AS carry_out_coins,
-         CASE
-           WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
-             THEN 'below_threshold'
-           ELSE 'eligible'
-         END AS status,
+          CASE
+            WHEN (COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= 6)
+              THEN 0::numeric(20,8)
+            WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric THEN 0::numeric(20,8)
+            ELSE ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric)::numeric(20,8)
+          END AS payout_pi_amount,
+          CASE
+            WHEN (COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= 6)
+              THEN 0::bigint
+            WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
+              THEN (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint)
+            ELSE 0::bigint
+          END AS carry_out_coins,
+          CASE
+            WHEN (COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= 6)
+              THEN 'blocked'
+            WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
+              THEN 'below_threshold'
+            ELSE 'eligible'
+          END AS status,
          NOW()
        FROM public.users u
        WHERE (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint) > 0
@@ -850,7 +985,8 @@ export async function closeMonthlyPayoutCycle(opts: {
       `SELECT
          COUNT(*)::int AS snapshots_count,
          COALESCE(SUM(CASE WHEN status = 'eligible' THEN 1 ELSE 0 END), 0)::int AS eligible_count,
-         COALESCE(SUM(CASE WHEN status = 'below_threshold' THEN 1 ELSE 0 END), 0)::int AS below_threshold_count
+         COALESCE(SUM(CASE WHEN status = 'below_threshold' THEN 1 ELSE 0 END), 0)::int AS below_threshold_count,
+         COALESCE(SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END), 0)::int AS blocked_count
        FROM public.monthly_payout_snapshots
        WHERE cycle_id = $1`,
       [cycle.id]
@@ -866,6 +1002,7 @@ export async function closeMonthlyPayoutCycle(opts: {
       snapshots_count: Number(countRes.rows[0]?.snapshots_count || 0),
       eligible_count: Number(countRes.rows[0]?.eligible_count || 0),
       below_threshold_count: Number(countRes.rows[0]?.below_threshold_count || 0),
+      blocked_count: Number(countRes.rows[0]?.blocked_count || 0),
       idempotent: false,
     };
   } catch (e) {
@@ -892,7 +1029,7 @@ export async function generatePayoutJobs(opts: { cycleId?: number; monthKey?: st
     if (cycleStatus === "open") throw new Error("cycle_not_closed");
 
     const candidates = await client.query(
-      `SELECT s.*, u.pi_wallet_identifier, u.payout_locked, u.manual_review_required, u.payout_fail_count,
+      `SELECT s.*, u.pi_wallet_identifier, u.payout_locked, u.manual_review_required, u.payout_fail_count, u.suspicious, u.vpn_flag, u.fraud_score,
               u.account_created_at, p.level
          FROM public.monthly_payout_snapshots s
          LEFT JOIN public.users u ON u.uid = s.uid
@@ -2086,51 +2223,49 @@ export async function adminListUsers({
   search,
   limit,
   offset,
+  suspiciousOnly,
 }: {
   search?: string;
   limit: number;
   offset: number;
+  suspiciousOnly?: boolean;
 }) {
+  const values: any[] = [];
+  const where: string[] = [];
+
   if (search) {
-    const { rows } = await pool.query(
-      `
-      SELECT *
-      FROM public.users
-      WHERE username ILIKE '%' || $1 || '%'
-         OR uid ILIKE '%' || $1 || '%'
-      ORDER BY updated_at DESC
-      LIMIT $2 OFFSET $3
-    `,
-      [search, limit, offset]
-    );
-
-    const { rows: c } = await pool.query(
-      `
-      SELECT COUNT(*)
-      FROM public.users
-      WHERE username ILIKE '%' || $1 || '%'
-         OR uid ILIKE '%' || $1 || '%'
-    `,
-      [search]
-    );
-
-    return { rows, count: Number(c[0].count) };
+    values.push(search);
+    where.push(`(username ILIKE '%' || $${values.length} || '%' OR uid ILIKE '%' || $${values.length} || '%')`);
   }
-  
 
+  if (suspiciousOnly) {
+    where.push(`(COALESCE(suspicious, FALSE) = TRUE OR COALESCE(vpn_flag, FALSE) = TRUE OR COALESCE(fraud_score, 0) >= 6)`);
+  }
 
-  // ✅ no search
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  values.push(limit);
+  const limitIdx = values.length;
+  values.push(offset);
+  const offsetIdx = values.length;
+
   const { rows } = await pool.query(
     `
     SELECT *
     FROM public.users
+    ${whereSql}
     ORDER BY updated_at DESC
-    LIMIT $1 OFFSET $2
+    LIMIT $${limitIdx} OFFSET $${offsetIdx}
   `,
-    [limit, offset]
+    values
   );
 
-  const { rows: c } = await pool.query(`SELECT COUNT(*) FROM public.users`);
+  const countValues = values.slice(0, values.length - 2);
+  const { rows: c } = await pool.query(
+    `SELECT COUNT(*) FROM public.users ${whereSql}`,
+    countValues
+  );
+
   return { rows, count: Number(c[0].count) };
 }
 
@@ -2708,6 +2843,12 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
+
+
+
+
+
+
 
 
 
