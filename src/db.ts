@@ -149,6 +149,16 @@ export async function initDB() {
       ADD COLUMN IF NOT EXISTS payout_carry_coins BIGINT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS pi_wallet_identifier TEXT;
   `);
+  await pool.query(`
+    ALTER TABLE public.users
+      ADD COLUMN IF NOT EXISTS payout_locked BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS manual_review_required BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS risk_flags JSONB NOT NULL DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS trust_score INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS account_created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS payout_fail_count INTEGER NOT NULL DEFAULT 0;
+  `);
+
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS progress (
@@ -178,6 +188,26 @@ await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_
       uid TEXT NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     );
+  `);
+
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.reward_event_audit (
+      id BIGSERIAL PRIMARY KEY,
+      uid TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      event_key TEXT NOT NULL,
+      amount_coins INT NOT NULL DEFAULT 0,
+      amount_pi NUMERIC(20,8),
+      accepted BOOLEAN NOT NULL,
+      reject_reason TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS reward_event_audit_uid_event_idx
+      ON public.reward_event_audit (uid, event_type, event_key, created_at DESC);
   `);
 
   await pool.query(`
@@ -281,6 +311,22 @@ await pool.query(`
       updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
       UNIQUE (cycle_id, uid)
     );
+  `);
+
+
+  await pool.query(`
+    ALTER TABLE public.monthly_payout_cycles
+      ADD COLUMN IF NOT EXISTS total_payout_pi NUMERIC(20,8) NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS capped_total_payout_pi NUMERIC(20,8) NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS manual_review_required BOOLEAN NOT NULL DEFAULT FALSE;
+  `);
+
+  await pool.query(`
+    ALTER TABLE public.pi_payout_jobs
+      ADD COLUMN IF NOT EXISTS risk_reason TEXT,
+      ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'auto',
+      ADD COLUMN IF NOT EXISTS approved_by_admin TEXT,
+      ADD COLUMN IF NOT EXISTS treasury_blocked BOOLEAN NOT NULL DEFAULT FALSE;
   `);
 
   await pool.query(`
@@ -454,8 +500,8 @@ export async function closeMonthAndResetCoins(opts?: { month?: string }) {
 
 
 type MonthlyPayoutCycleStatus = "open" | "closed" | "payouts_generated" | "processing" | "completed";
-type MonthlyPayoutSnapshotStatus = "eligible" | "below_threshold" | "queued" | "paid" | "failed";
-type PiPayoutJobStatus = "queued" | "processing" | "paid" | "failed";
+type MonthlyPayoutSnapshotStatus = "eligible" | "below_threshold" | "manual_review" | "blocked" | "queued" | "paid" | "failed";
+type PiPayoutJobStatus = "queued" | "processing" | "paid" | "failed" | "blocked" | "manual_review";
 
 type PayoutJobRecord = {
   id: number;
@@ -489,6 +535,155 @@ function toNonNegativeInt(value: unknown, fallback: number) {
   return Math.max(0, Math.floor(n));
 }
 
+function envNumber(name: string, fallback: number) {
+  const raw = process.env[name];
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+const MAX_USER_MONTHLY_PI = envNumber("MAX_USER_MONTHLY_PI", 100);
+const MAX_GLOBAL_MONTHLY_PI = envNumber("MAX_GLOBAL_MONTHLY_PI", 100000);
+const MIN_ACCOUNT_AGE_DAYS = envNumber("MIN_ACCOUNT_AGE_DAYS", 7);
+const MIN_LEVEL_FOR_PAYOUT = envNumber("MIN_LEVEL_FOR_PAYOUT", 3);
+const TREASURY_RESERVE_PI = envNumber("TREASURY_RESERVE_PI", 0);
+const SUSPICIOUS_MONTHLY_COINS = envNumber("SUSPICIOUS_MONTHLY_COINS", 10000);
+const PAYOUT_FAIL_REVIEW_COUNT = envNumber("PAYOUT_FAIL_REVIEW_COUNT", 3);
+
+type PayoutRiskEvaluation = {
+  allowed: boolean;
+  manualReview: boolean;
+  trustScore: number;
+  reasons: string[];
+  riskFlags: string[];
+};
+
+function parseTsMs(v: any): number | null {
+  if (!v) return null;
+  const d = new Date(v);
+  const ms = d.getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export function evaluateUserPayoutRisk(user: any, stats: { monthlyCoins: number }): PayoutRiskEvaluation {
+  const now = Date.now();
+  const accountTs = parseTsMs(user?.account_created_at || user?.updated_at);
+  const accountAgeDays = accountTs ? Math.max(0, Math.floor((now - accountTs) / 86400000)) : 0;
+  const level = Number(user?.level ?? 1);
+  const failCount = Number(user?.payout_fail_count || 0);
+  const wallet = String(user?.pi_wallet_identifier || "").trim();
+
+  const reasons: string[] = [];
+  const riskFlags: string[] = [];
+  let trustScore = 100;
+  let allowed = true;
+  let manualReview = false;
+
+  if (!wallet) {
+    allowed = false;
+    reasons.push("missing_wallet_identifier");
+    riskFlags.push("wallet_missing");
+    trustScore -= 40;
+  }
+  if (Boolean(user?.payout_locked)) {
+    allowed = false;
+    reasons.push("payout_locked");
+    riskFlags.push("payout_locked");
+    trustScore -= 40;
+  }
+  if (Boolean(user?.manual_review_required)) {
+    allowed = false;
+    manualReview = true;
+    reasons.push("manual_review_required");
+    riskFlags.push("manual_review_required");
+    trustScore -= 25;
+  }
+  if (accountAgeDays < MIN_ACCOUNT_AGE_DAYS) {
+    allowed = false;
+    reasons.push("account_too_new");
+    riskFlags.push("new_account");
+    trustScore -= 30;
+  }
+  if (!Number.isFinite(level) || level < MIN_LEVEL_FOR_PAYOUT) {
+    allowed = false;
+    reasons.push("level_below_minimum");
+    riskFlags.push("low_level");
+    trustScore -= 25;
+  }
+  if (Number(stats?.monthlyCoins || 0) >= SUSPICIOUS_MONTHLY_COINS) {
+    allowed = false;
+    manualReview = true;
+    reasons.push("suspicious_monthly_coin_volume");
+    riskFlags.push("coin_spike");
+    trustScore -= 20;
+  }
+  if (failCount >= PAYOUT_FAIL_REVIEW_COUNT) {
+    allowed = false;
+    manualReview = true;
+    reasons.push("repeated_payout_failures");
+    riskFlags.push("payout_failures");
+    trustScore -= 20;
+  }
+
+  trustScore = Math.max(0, Math.min(100, trustScore));
+  return { allowed, manualReview, trustScore, reasons, riskFlags };
+}
+
+async function writeUserRiskState(client: any, uid: string, risk: PayoutRiskEvaluation) {
+  const flags = JSON.stringify(Array.from(new Set(risk.riskFlags)));
+  await client.query(
+    `UPDATE public.users
+        SET trust_score = $2,
+            risk_flags = $3::jsonb,
+            manual_review_required = $4,
+            updated_at = NOW()
+      WHERE uid = $1`,
+    [uid, risk.trustScore, flags, risk.manualReview]
+  );
+}
+
+async function auditRewardEvent(opts: {
+  uid: string;
+  eventType: string;
+  eventKey: string;
+  amountCoins?: number;
+  amountPi?: number | null;
+  accepted: boolean;
+  rejectReason?: string | null;
+}) {
+  await pool.query(
+    `INSERT INTO public.reward_event_audit (
+       uid, event_type, event_key, amount_coins, amount_pi, accepted, reject_reason, created_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+    [
+      opts.uid,
+      opts.eventType,
+      opts.eventKey,
+      Number(opts.amountCoins || 0),
+      opts.amountPi ?? null,
+      opts.accepted,
+      opts.rejectReason || null,
+    ]
+  );
+}
+
+async function getTotalPaidPi(): Promise<number> {
+  const out = await pool.query(
+    `SELECT COALESCE(SUM(payout_pi_amount), 0)::numeric AS total
+       FROM public.pi_payout_jobs
+      WHERE status = 'paid'`
+  );
+  return Number(out.rows[0]?.total || 0);
+}
+
+async function treasuryAllowsPayout(payoutPi: number): Promise<boolean> {
+  const configuredTreasury = process.env.PAYOUT_TREASURY_AVAILABLE_PI;
+  if (!configuredTreasury) return true;
+  const available = Number(configuredTreasury);
+  if (!Number.isFinite(available)) return true;
+  const paid = await getTotalPaidPi();
+  return available - paid - payoutPi >= TREASURY_RESERVE_PI;
+}
+
 function assertCycleStatus(status: string): MonthlyPayoutCycleStatus {
   const allowed: MonthlyPayoutCycleStatus[] = ["open", "closed", "payouts_generated", "processing", "completed"];
   if (!allowed.includes(status as MonthlyPayoutCycleStatus)) throw new Error("invalid_cycle_status");
@@ -496,9 +691,23 @@ function assertCycleStatus(status: string): MonthlyPayoutCycleStatus {
 }
 
 function assertJobStatus(status: string): PiPayoutJobStatus {
-  const allowed: PiPayoutJobStatus[] = ["queued", "processing", "paid", "failed"];
+  const allowed: PiPayoutJobStatus[] = ["queued", "processing", "paid", "failed", "blocked", "manual_review"];
   if (!allowed.includes(status as PiPayoutJobStatus)) throw new Error("invalid_job_status");
   return status as PiPayoutJobStatus;
+}
+
+function assertSnapshotStatus(status: string): MonthlyPayoutSnapshotStatus {
+  const allowed: MonthlyPayoutSnapshotStatus[] = [
+    "eligible",
+    "below_threshold",
+    "manual_review",
+    "blocked",
+    "queued",
+    "paid",
+    "failed",
+  ];
+  if (!allowed.includes(status as MonthlyPayoutSnapshotStatus)) throw new Error("invalid_snapshot_status");
+  return status as MonthlyPayoutSnapshotStatus;
 }
 
 async function resolveCycleForUpdate(
@@ -682,53 +891,131 @@ export async function generatePayoutJobs(opts: { cycleId?: number; monthKey?: st
     const cycleStatus = assertCycleStatus(String(cycle.status || "open"));
     if (cycleStatus === "open") throw new Error("cycle_not_closed");
 
-    const inserted = await client.query(
-      `INSERT INTO public.pi_payout_jobs (
-         cycle_id,
-         uid,
-         payout_pi_amount,
-         wallet_identifier,
-         status,
-         created_at,
-         updated_at
-       )
-       SELECT
-         s.cycle_id,
-         s.uid,
-         s.payout_pi_amount,
-         u.pi_wallet_identifier,
-         'queued',
-         NOW(),
-         NOW()
-       FROM public.monthly_payout_snapshots s
-       LEFT JOIN public.users u ON u.uid = s.uid
-       WHERE s.cycle_id = $1
-         AND s.status = 'eligible'
-         AND s.payout_pi_amount > 0
-       ON CONFLICT (cycle_id, uid) DO NOTHING
-       RETURNING id`,
+    const candidates = await client.query(
+      `SELECT s.*, u.pi_wallet_identifier, u.payout_locked, u.manual_review_required, u.payout_fail_count,
+              u.account_created_at, p.level
+         FROM public.monthly_payout_snapshots s
+         LEFT JOIN public.users u ON u.uid = s.uid
+         LEFT JOIN public.progress p ON p.uid = s.uid
+        WHERE s.cycle_id = $1
+          AND s.status = 'eligible'
+          AND s.payout_pi_amount > 0
+        ORDER BY s.id ASC`,
       [cycle.id]
     );
 
-    await client.query(
-      `UPDATE public.monthly_payout_snapshots s
-          SET status = 'queued'
-         WHERE s.cycle_id = $1
-           AND s.status = 'eligible'
-           AND EXISTS (
-             SELECT 1
-             FROM public.pi_payout_jobs j
-             WHERE j.cycle_id = s.cycle_id
-               AND j.uid = s.uid
-           )`,
-      [cycle.id]
-    );
+    let insertedJobs = 0;
+    let totalPayoutPi = 0;
+    let cappedTotalPi = 0;
+    let globalCapHit = false;
+
+    for (const row of candidates.rows) {
+      if (globalCapHit) {
+        await client.query(
+          `UPDATE public.monthly_payout_snapshots
+              SET status = 'manual_review'
+            WHERE cycle_id = $1 AND uid = $2 AND status = 'eligible'`,
+          [cycle.id, row.uid]
+        );
+        continue;
+      }
+
+      const payoutOriginal = Number(row.payout_pi_amount || 0);
+      const payoutCapped = Math.min(payoutOriginal, MAX_USER_MONTHLY_PI);
+      totalPayoutPi += payoutOriginal;
+      cappedTotalPi += payoutCapped;
+
+      const risk = evaluateUserPayoutRisk(
+        {
+          ...row,
+          level: Number(row.level || 1),
+          pi_wallet_identifier: row.pi_wallet_identifier,
+          payout_fail_count: Number(row.payout_fail_count || 0),
+        },
+        { monthlyCoins: Number(row.total_coins_for_settlement || 0) }
+      );
+
+      await writeUserRiskState(client, String(row.uid), risk);
+
+      if (!risk.allowed) {
+        const nextStatus: MonthlyPayoutSnapshotStatus = risk.manualReview ? "manual_review" : "blocked";
+        await client.query(
+          `UPDATE public.monthly_payout_snapshots
+              SET status = $3
+            WHERE cycle_id = $1 AND uid = $2`,
+          [cycle.id, row.uid, nextStatus]
+        );
+        continue;
+      }
+
+      if (cappedTotalPi > MAX_GLOBAL_MONTHLY_PI) {
+        globalCapHit = true;
+        await client.query(
+          `UPDATE public.monthly_payout_cycles
+              SET manual_review_required = TRUE
+            WHERE id = $1`,
+          [cycle.id]
+        );
+        await client.query(
+          `UPDATE public.monthly_payout_snapshots
+              SET status = 'manual_review'
+            WHERE cycle_id = $1 AND uid = $2`,
+          [cycle.id, row.uid]
+        );
+        continue;
+      }
+
+      if (!Number.isFinite(payoutCapped) || payoutCapped <= 0) {
+        await client.query(
+          `UPDATE public.monthly_payout_snapshots
+              SET status = 'below_threshold'
+            WHERE cycle_id = $1 AND uid = $2`,
+          [cycle.id, row.uid]
+        );
+        continue;
+      }
+
+      const ins = await client.query(
+        `INSERT INTO public.pi_payout_jobs (
+           cycle_id,
+           uid,
+           payout_pi_amount,
+           wallet_identifier,
+           status,
+           risk_reason,
+           review_status,
+           created_at,
+           updated_at
+         ) VALUES ($1, $2, $3, $4, 'queued', $5, 'auto', NOW(), NOW())
+         ON CONFLICT (cycle_id, uid) DO NOTHING
+         RETURNING id`,
+        [
+          cycle.id,
+          row.uid,
+          payoutCapped,
+          row.pi_wallet_identifier || null,
+          payoutOriginal > payoutCapped ? "user_cap_applied" : null,
+        ]
+      );
+
+      if ((ins.rowCount || 0) > 0) {
+        insertedJobs += 1;
+        await client.query(
+          `UPDATE public.monthly_payout_snapshots
+              SET status = 'queued'
+            WHERE cycle_id = $1 AND uid = $2`,
+          [cycle.id, row.uid]
+        );
+      }
+    }
 
     await client.query(
       `UPDATE public.monthly_payout_cycles
-          SET status = CASE WHEN status = 'closed' THEN 'payouts_generated' ELSE status END
+          SET status = CASE WHEN status = 'closed' THEN 'payouts_generated' ELSE status END,
+              total_payout_pi = $2,
+              capped_total_payout_pi = $3
         WHERE id = $1`,
-      [cycle.id]
+      [cycle.id, totalPayoutPi, cappedTotalPi]
     );
 
     const totals = await client.query(
@@ -744,8 +1031,11 @@ export async function generatePayoutJobs(opts: { cycleId?: number; monthKey?: st
       ok: true,
       cycle_id: Number(cycle.id),
       month_key: String(cycle.month_key),
-      inserted_jobs: inserted.rowCount || 0,
+      inserted_jobs: insertedJobs,
       total_jobs: Number(totals.rows[0]?.total_jobs || 0),
+      global_cap_hit: globalCapHit,
+      total_payout_pi: totalPayoutPi,
+      capped_total_payout_pi: cappedTotalPi,
     };
   } catch (e) {
     await client.query("ROLLBACK");
@@ -879,6 +1169,8 @@ export async function adminGetPayoutSnapshotSummary(opts?: { cycleId?: number; m
        COALESCE(COUNT(*), 0)::int AS total_users_snapshotted,
        COALESCE(SUM(CASE WHEN s.status = 'eligible' THEN 1 ELSE 0 END), 0)::int AS eligible_count,
        COALESCE(SUM(CASE WHEN s.status = 'below_threshold' THEN 1 ELSE 0 END), 0)::int AS below_threshold_count,
+       COALESCE(SUM(CASE WHEN s.status = 'manual_review' THEN 1 ELSE 0 END), 0)::int AS manual_review_count,
+       COALESCE(SUM(CASE WHEN s.status = 'blocked' THEN 1 ELSE 0 END), 0)::int AS blocked_count,
        COALESCE(SUM(CASE WHEN s.status = 'queued' THEN 1 ELSE 0 END), 0)::int AS queued_count,
        COALESCE(SUM(CASE WHEN s.status = 'paid' THEN 1 ELSE 0 END), 0)::int AS paid_count,
        COALESCE(SUM(CASE WHEN s.status = 'failed' THEN 1 ELSE 0 END), 0)::int AS failed_count,
@@ -896,6 +1188,11 @@ export async function adminGetPayoutRuntimeConfig() {
   return {
     ok: true,
     simulation_mode: process.env.PAYOUT_SIMULATE_SUCCESS === "true",
+    max_user_monthly_pi: MAX_USER_MONTHLY_PI,
+    max_global_monthly_pi: MAX_GLOBAL_MONTHLY_PI,
+    min_account_age_days: MIN_ACCOUNT_AGE_DAYS,
+    min_level_for_payout: MIN_LEVEL_FOR_PAYOUT,
+    treasury_reserve_pi: TREASURY_RESERVE_PI,
   };
 }
 
@@ -927,6 +1224,8 @@ export async function adminListPayoutSnapshots(opts?: {
        COALESCE(COUNT(*), 0)::int AS total_users_snapshotted,
        COALESCE(SUM(CASE WHEN s.status = 'eligible' THEN 1 ELSE 0 END), 0)::int AS eligible_count,
        COALESCE(SUM(CASE WHEN s.status = 'below_threshold' THEN 1 ELSE 0 END), 0)::int AS below_threshold_count,
+       COALESCE(SUM(CASE WHEN s.status = 'manual_review' THEN 1 ELSE 0 END), 0)::int AS manual_review_count,
+       COALESCE(SUM(CASE WHEN s.status = 'blocked' THEN 1 ELSE 0 END), 0)::int AS blocked_count,
        COALESCE(SUM(CASE WHEN s.status = 'queued' THEN 1 ELSE 0 END), 0)::int AS queued_count,
        COALESCE(SUM(CASE WHEN s.status = 'paid' THEN 1 ELSE 0 END), 0)::int AS paid_count,
        COALESCE(SUM(CASE WHEN s.status = 'failed' THEN 1 ELSE 0 END), 0)::int AS failed_count,
@@ -1027,7 +1326,7 @@ export async function adminUpdatePayoutJobStatus(opts: {
           SET status = $2,
               txid = CASE WHEN $2 = 'paid' THEN NULLIF($3, '') ELSE txid END,
               error_message = CASE
-                WHEN $2 = 'failed' THEN NULLIF($4, '')
+                WHEN $2 IN ('failed', 'blocked') THEN NULLIF($4, '')
                 WHEN $2 = 'paid' THEN NULL
                 ELSE error_message
               END,
@@ -1040,6 +1339,8 @@ export async function adminUpdatePayoutJobStatus(opts: {
     let snapshotStatus: MonthlyPayoutSnapshotStatus | null = null;
     if (status === "paid") snapshotStatus = "paid";
     if (status === "failed") snapshotStatus = "failed";
+    if (status === "blocked") snapshotStatus = "blocked";
+    if (status === "manual_review") snapshotStatus = "manual_review";
     if (status === "queued" || status === "processing") snapshotStatus = "queued";
 
     if (snapshotStatus) {
@@ -1118,6 +1419,7 @@ async function claimQueuedPayoutJobs(limit: number) {
          SELECT id
          FROM public.pi_payout_jobs
          WHERE status = 'queued'
+           AND COALESCE(review_status, 'auto') IN ('auto', 'approved')
          ORDER BY created_at ASC
          FOR UPDATE SKIP LOCKED
          LIMIT $1
@@ -1172,8 +1474,70 @@ export async function runPayoutWorkerBatch(opts?: { limit?: number }) {
 
   let paid = 0;
   let failed = 0;
+  let blocked = 0;
+  let manualReview = 0;
 
   for (const job of jobs) {
+    const uid = String(job.uid);
+    const payoutPi = Number(job.payout_pi_amount || 0);
+
+    const userRes = await pool.query(
+      `SELECT u.uid, u.pi_wallet_identifier, u.payout_locked, u.manual_review_required,
+              u.payout_fail_count, u.account_created_at, p.level
+         FROM public.users u
+         LEFT JOIN public.progress p ON p.uid = u.uid
+        WHERE u.uid = $1`,
+      [uid]
+    );
+    const user = userRes.rows[0] || null;
+
+    if (!user || !String(user.pi_wallet_identifier || "").trim()) {
+      await pool.query(
+        `UPDATE public.pi_payout_jobs
+            SET status = 'blocked',
+                treasury_blocked = FALSE,
+                error_message = 'missing_wallet_identifier',
+                risk_reason = COALESCE(risk_reason, 'wallet_missing'),
+                updated_at = NOW()
+          WHERE id = $1`,
+        [job.id]
+      );
+      await adminUpdatePayoutJobStatus({ jobId: Number(job.id), status: "blocked", errorMessage: "missing_wallet_identifier" });
+      blocked += 1;
+      continue;
+    }
+
+    const risk = evaluateUserPayoutRisk(user, { monthlyCoins: Number(user?.monthly_coins_earned || 0) });
+    if (risk.manualReview) {
+      await writeUserRiskState(pool, uid, risk);
+      await pool.query(
+        `UPDATE public.pi_payout_jobs
+            SET status = 'manual_review',
+                risk_reason = COALESCE(risk_reason, $2),
+                updated_at = NOW()
+          WHERE id = $1`,
+        [job.id, risk.reasons.join(',') || 'manual_review_required']
+      );
+      await adminUpdatePayoutJobStatus({ jobId: Number(job.id), status: "manual_review", errorMessage: risk.reasons.join(",") || "manual_review_required" });
+      manualReview += 1;
+      continue;
+    }
+
+    if (!(await treasuryAllowsPayout(payoutPi))) {
+      await pool.query(
+        `UPDATE public.pi_payout_jobs
+            SET status = 'blocked',
+                treasury_blocked = TRUE,
+                error_message = 'failed_treasury_guard',
+                updated_at = NOW()
+          WHERE id = $1`,
+        [job.id]
+      );
+      await adminUpdatePayoutJobStatus({ jobId: Number(job.id), status: "blocked", errorMessage: "failed_treasury_guard" });
+      blocked += 1;
+      continue;
+    }
+
     try {
       const tx = await sendPiPayout(job);
       await adminUpdatePayoutJobStatus({
@@ -1183,6 +1547,13 @@ export async function runPayoutWorkerBatch(opts?: { limit?: number }) {
       });
       paid += 1;
     } catch (e: any) {
+      await pool.query(
+        `UPDATE public.users
+            SET payout_fail_count = COALESCE(payout_fail_count, 0) + 1,
+                updated_at = NOW()
+          WHERE uid = $1`,
+        [uid]
+      );
       await adminUpdatePayoutJobStatus({
         jobId: Number(job.id),
         status: "failed",
@@ -1197,8 +1568,11 @@ export async function runPayoutWorkerBatch(opts?: { limit?: number }) {
     claimed: jobs.length,
     paid,
     failed,
+    blocked,
+    manual_review: manualReview,
   };
 }
+
 export async function ensureUserAdsRow(uid: string) {
   const month = currentMonthKey();
 
@@ -1341,19 +1715,19 @@ export async function claimReward({
   cooldownSeconds: number;
 }) {
   if (!nonce) {
+    await auditRewardEvent({ uid, eventType: type, eventKey: "missing_nonce", amountCoins: amount, accepted: false, rejectReason: "missing_nonce" });
     throw new Error("missing_nonce");
   }
 
-  // 1) block exact replay of same request
   const nonceRes = await pool.query(
     `SELECT 1 FROM reward_claims WHERE uid=$1 AND nonce=$2 LIMIT 1`,
     [uid, nonce]
   );
   if ((nonceRes.rowCount ?? 0) > 0) {
+    await auditRewardEvent({ uid, eventType: type, eventKey: nonce, amountCoins: amount, accepted: false, rejectReason: "duplicate_nonce" });
     return { already: true };
   }
 
-  // 2) block same reward type inside cooldown window
   if (cooldownSeconds > 0) {
     const cooldownRes = await pool.query(
       `
@@ -1368,11 +1742,11 @@ export async function claimReward({
     );
 
     if ((cooldownRes.rowCount ?? 0) > 0) {
+      await auditRewardEvent({ uid, eventType: type, eventKey: nonce, amountCoins: amount, accepted: false, rejectReason: "cooldown_active" });
       return { already: true, cooldown: true };
     }
   }
 
-  // 3) record claim
   await pool.query(
     `
     INSERT INTO reward_claims (uid, type, nonce, amount, created_at)
@@ -1381,8 +1755,8 @@ export async function claimReward({
     [uid, type, nonce, amount]
   );
 
-  // 4) grant coins
   const user = await addCoins(uid, amount);
+  await auditRewardEvent({ uid, eventType: type, eventKey: nonce, amountCoins: amount, accepted: true });
 
   if (type === "ad_50" || type === "ad") {
     await pool.query(
@@ -1399,6 +1773,7 @@ export async function claimReward({
 }
 
 export async function claimDailyLogin(uid: string) {
+  const dayKey = new Date().toISOString().slice(0, 10);
   const { rowCount } = await pool.query(
     `
     SELECT 1 FROM reward_claims
@@ -1408,7 +1783,10 @@ export async function claimDailyLogin(uid: string) {
     [uid]
   );
 
-  if (rowCount) return { already: true };
+  if (rowCount) {
+    await auditRewardEvent({ uid, eventType: "daily_login", eventKey: dayKey, amountCoins: 5, accepted: false, rejectReason: "daily_already_claimed" });
+    return { already: true };
+  }
 
   await pool.query(
     `
@@ -1420,15 +1798,15 @@ export async function claimDailyLogin(uid: string) {
 
   const user = await addCoins(uid, 5);
   await pool.query(
-  `UPDATE public.users SET monthly_login_days = COALESCE(monthly_login_days,0) + 1 WHERE uid=$1`,
-  [uid]
-);
-await recalcAndStoreMonthlyRate(uid);
+    `UPDATE public.users SET monthly_login_days = COALESCE(monthly_login_days,0) + 1 WHERE uid=$1`,
+    [uid]
+  );
+  await recalcAndStoreMonthlyRate(uid);
+  await auditRewardEvent({ uid, eventType: "daily_login", eventKey: dayKey, amountCoins: 5, accepted: true });
   return { user };
 }
 
 export async function claimLevelComplete(uid: string, level: number) {
-
   if (!Number.isInteger(level) || level < 1) {
     throw new Error("invalid_level");
   }
@@ -1441,8 +1819,10 @@ export async function claimLevelComplete(uid: string, level: number) {
     [uid, level]
   );
 
-  // if already claimed, do not add coin
-  if ((insert.rowCount ?? 0) === 0) return { already: true };
+  if ((insert.rowCount ?? 0) === 0) {
+    await auditRewardEvent({ uid, eventType: "level_complete", eventKey: String(level), amountCoins: 1, accepted: false, rejectReason: "duplicate_level_reward" });
+    return { already: true };
+  }
 
   const user = await addCoins(uid, 1);
 
@@ -1458,12 +1838,14 @@ export async function claimLevelComplete(uid: string, level: number) {
   );
 
   await recalcAndStoreMonthlyRate(uid);
+  await auditRewardEvent({ uid, eventType: "level_complete", eventKey: String(level), amountCoins: 1, accepted: true });
   return { user };
 }
 
 /* =====================================================
   RESTARTS / SKIPS / HINTS 
 ===================================================== */
+
 export async function useRestarts(
   uid: string,
   mode: SpendMode,
@@ -2326,6 +2708,15 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
+
+
+
+
+
+
+
+
+
 
 
 
