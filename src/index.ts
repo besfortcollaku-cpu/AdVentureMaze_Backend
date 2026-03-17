@@ -249,6 +249,9 @@ if (firstRecoverableMissedDay) {
             invited_by_uid: user.invited_by_uid ?? null,
             invited_by_name: invitedByName,
             invited_usernames: invitedUsernames,
+            pi_wallet_identifier: user.pi_wallet_identifier ?? null,
+            wallet_verified: Boolean(user.wallet_verified),
+            wallet_last_updated_at: user.wallet_last_updated_at ?? null,
           }
         : null,
 
@@ -272,6 +275,63 @@ if (firstRecoverableMissedDay) {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
+app.post("/api/user/set-wallet", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+
+    const rawWallet = String(req.body?.wallet || "");
+    const wallet = rawWallet.trim().toLowerCase();
+
+    if (wallet.length < 20 || wallet.length > 100 || !/^[a-z0-9]+$/.test(wallet)) {
+      return res.status(400).json({ ok: false, error: "invalid_wallet" });
+    }
+
+    const duplicateRes = await pool.query(
+      `SELECT uid FROM public.users
+        WHERE pi_wallet_identifier = $1
+          AND uid <> $2
+        LIMIT 1`,
+      [wallet, uid]
+    );
+
+    await pool.query(
+      `UPDATE public.users
+          SET pi_wallet_identifier = $1,
+              wallet_verified = TRUE,
+              wallet_last_updated_at = NOW(),
+              updated_at = NOW()
+        WHERE uid = $2`,
+      [wallet, uid]
+    );
+
+    const sameWalletCountRes = await pool.query(
+      `SELECT COUNT(*)::int AS c
+         FROM public.users
+        WHERE pi_wallet_identifier = $1`,
+      [wallet]
+    );
+
+    const sameWalletCount = Number(sameWalletCountRes.rows[0]?.c || 0);
+    if (sameWalletCount >= 3) {
+      await pool.query(
+        `UPDATE public.users
+            SET suspicious = TRUE,
+                updated_at = NOW()
+          WHERE pi_wallet_identifier = $1`,
+        [wallet]
+      );
+    }
+
+    res.json({
+      ok: true,
+      duplicate_in_use: (duplicateRes.rowCount || 0) > 0,
+      suspicious_wallet_cluster: sameWalletCount >= 3,
+    });
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e?.message || "set_wallet_failed" });
+  }
+});
+
 app.get("/api/invite/me", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);

@@ -147,7 +147,9 @@ export async function initDB() {
       ADD COLUMN IF NOT EXISTS lifetime_coins_spent INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS lifetime_levels_completed INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS payout_carry_coins BIGINT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS pi_wallet_identifier TEXT;
+      ADD COLUMN IF NOT EXISTS pi_wallet_identifier TEXT,
+      ADD COLUMN IF NOT EXISTS wallet_verified BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS wallet_last_updated_at TIMESTAMP;
   `);
   await pool.query(`
     ALTER TABLE public.users
@@ -1027,6 +1029,16 @@ export async function generatePayoutJobs(opts: { cycleId?: number; monthKey?: st
 
     const cycleStatus = assertCycleStatus(String(cycle.status || "open"));
     if (cycleStatus === "open") throw new Error("cycle_not_closed");
+    await client.query(
+      `UPDATE public.monthly_payout_snapshots s
+          SET status = 'blocked'
+         FROM public.users u
+        WHERE s.cycle_id = $1
+          AND s.status = 'eligible'
+          AND u.uid = s.uid
+          AND NULLIF(BTRIM(COALESCE(u.pi_wallet_identifier, '')), '') IS NULL`,
+      [cycle.id]
+    );
 
     const candidates = await client.query(
       `SELECT s.*, u.pi_wallet_identifier, u.payout_locked, u.manual_review_required, u.payout_fail_count, u.suspicious, u.vpn_flag, u.fraud_score,
@@ -1037,6 +1049,7 @@ export async function generatePayoutJobs(opts: { cycleId?: number; monthKey?: st
         WHERE s.cycle_id = $1
           AND s.status = 'eligible'
           AND s.payout_pi_amount > 0
+          AND NULLIF(BTRIM(COALESCE(u.pi_wallet_identifier, '')), '') IS NOT NULL
         ORDER BY s.id ASC`,
       [cycle.id]
     );
