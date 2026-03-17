@@ -32,6 +32,7 @@ import {
   adminGetPayoutSnapshotSummary,
   adminGetPayoutRuntimeConfig,
   adminListPayoutSnapshots,
+  adminListPayoutTransferLogs,
   adminRetryFailedPayouts,
   adminResolvePayoutJob,
   adminUpdatePayoutJobStatus,
@@ -1813,6 +1814,18 @@ app.post("/admin/payouts/jobs/:id/status", async (req,res)=>{
       errorMessage,
     });
 
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.get("/admin/payouts/jobs/:id/logs", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const jobId = Number(req.params.id);
+    const limit = req.query.limit ? Number(req.query.limit) : undefined;
+    const out = await adminListPayoutTransferLogs(jobId, limit);
     res.json(out);
   }catch(e:any){
     res.status(400).json({ ok:false, error:e.message });

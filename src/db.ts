@@ -1,4 +1,5 @@
 import { Pool } from "pg";
+import { sendPiPayout as sendPiPayoutAdapter, getSendingWalletAvailableBalancePi } from "./services/piPayoutSender";
 console.log("Backend v2.0.1");
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -358,7 +359,38 @@ await pool.query(`
       ADD COLUMN IF NOT EXISTS risk_reason TEXT,
       ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'auto',
       ADD COLUMN IF NOT EXISTS approved_by_admin TEXT,
-      ADD COLUMN IF NOT EXISTS treasury_blocked BOOLEAN NOT NULL DEFAULT FALSE;
+      ADD COLUMN IF NOT EXISTS treasury_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS external_status TEXT,
+      ADD COLUMN IF NOT EXISTS sent_at TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.payout_transfer_logs (
+      id BIGSERIAL PRIMARY KEY,
+      payout_job_id BIGINT NOT NULL REFERENCES public.pi_payout_jobs(id) ON DELETE CASCADE,
+      uid TEXT NOT NULL,
+      wallet_identifier TEXT NOT NULL,
+      amount_pi NUMERIC(20,8) NOT NULL,
+      request_payload JSONB,
+      response_payload JSONB,
+      txid TEXT,
+      status TEXT NOT NULL,
+      error_message TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS payout_transfer_logs_job_idx
+      ON public.payout_transfer_logs (payout_job_id, created_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS pi_payout_jobs_idempotency_key_uniq
+      ON public.pi_payout_jobs (idempotency_key)
+      WHERE idempotency_key IS NOT NULL;
   `);
 
   await pool.query(`
@@ -533,7 +565,7 @@ export async function closeMonthAndResetCoins(opts?: { month?: string }) {
 
 type MonthlyPayoutCycleStatus = "open" | "closed" | "payouts_generated" | "processing" | "completed";
 type MonthlyPayoutSnapshotStatus = "eligible" | "below_threshold" | "manual_review" | "blocked" | "queued" | "paid" | "failed";
-type PiPayoutJobStatus = "queued" | "processing" | "paid" | "failed" | "blocked" | "manual_review";
+type PiPayoutJobStatus = "queued" | "processing" | "paid" | "failed" | "failed_permanent" | "blocked" | "manual_review";
 
 type PayoutJobRecord = {
   id: number;
@@ -543,8 +575,14 @@ type PayoutJobRecord = {
   wallet_identifier: string | null;
   status: PiPayoutJobStatus;
   txid: string | null;
+  external_status?: string | null;
+  sent_at?: string | null;
+  confirmed_at?: string | null;
   error_message: string | null;
   attempts: number;
+  idempotency_key?: string | null;
+  treasury_blocked?: boolean;
+  review_status?: string | null;
 };
 
 const MONTH_KEY_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
@@ -580,6 +618,8 @@ const MIN_LEVEL_FOR_PAYOUT = envNumber("MIN_LEVEL_FOR_PAYOUT", 3);
 const TREASURY_RESERVE_PI = envNumber("TREASURY_RESERVE_PI", 0);
 const SUSPICIOUS_MONTHLY_COINS = envNumber("SUSPICIOUS_MONTHLY_COINS", 10000);
 const PAYOUT_FAIL_REVIEW_COUNT = envNumber("PAYOUT_FAIL_REVIEW_COUNT", 3);
+const PAYOUT_MAX_ATTEMPTS = Math.max(1, Math.floor(envNumber("PAYOUT_MAX_ATTEMPTS", 3)));
+const SENDING_WALLET_MIN_REQUIRED_PI = envNumber("SENDING_WALLET_MIN_REQUIRED_PI", 0);
 
 type PayoutRiskEvaluation = {
   allowed: boolean;
@@ -707,13 +747,71 @@ async function getTotalPaidPi(): Promise<number> {
   return Number(out.rows[0]?.total || 0);
 }
 
-async function treasuryAllowsPayout(payoutPi: number): Promise<boolean> {
-  const configuredTreasury = process.env.PAYOUT_TREASURY_AVAILABLE_PI;
-  if (!configuredTreasury) return true;
-  const available = Number(configuredTreasury);
-  if (!Number.isFinite(available)) return true;
+async function assertTreasuryCanPayout(payoutPi: number): Promise<{ ok: boolean; reason?: string; availablePi?: number; paidPi?: number }> {
+  const availableFromAdapter = await getSendingWalletAvailableBalancePi();
+  const available =
+    (Number.isFinite(availableFromAdapter as number)
+      ? Number(availableFromAdapter)
+      : Number(process.env.SENDING_WALLET_AVAILABLE_PI || process.env.PAYOUT_TREASURY_AVAILABLE_PI));
+
+  if (!Number.isFinite(available)) {
+    return { ok: false, reason: 'treasury_guard' };
+  }
+
   const paid = await getTotalPaidPi();
-  return available - paid - payoutPi >= TREASURY_RESERVE_PI;
+  const remainingAfterSend = available - paid - payoutPi;
+  const walletAfterSend = available - payoutPi;
+
+  if (remainingAfterSend < TREASURY_RESERVE_PI) {
+    return { ok: false, reason: 'treasury_guard', availablePi: available, paidPi: paid };
+  }
+
+  if (walletAfterSend < SENDING_WALLET_MIN_REQUIRED_PI) {
+    return { ok: false, reason: 'treasury_guard', availablePi: available, paidPi: paid };
+  }
+
+  return { ok: true, availablePi: available, paidPi: paid };
+}
+
+function normalizePayoutErrorClass(raw: unknown): string {
+  const msg = String(raw || '').toLowerCase();
+  if (msg.includes('missing_wallet')) return 'missing_wallet';
+  if (msg.includes('treasury_guard')) return 'treasury_guard';
+  if (msg.includes('adapter_not_configured') || msg.includes('real_payout_adapter_not_configured')) return 'adapter_not_configured';
+  if (msg.includes('timeout') || msg.includes('network') || msg.includes('fetch')) return 'temporary_network_error';
+  if (msg.includes('duplicate_send_guard')) return 'duplicate_send_guard';
+  if (msg.includes('rejected') || msg.includes('invalid_wallet') || msg.includes('insufficient_funds')) return 'permanent_rejection';
+  return 'temporary_network_error';
+}
+
+async function insertPayoutTransferLog(opts: {
+  payoutJobId: number;
+  uid: string;
+  walletIdentifier: string;
+  amountPi: number;
+  requestPayload?: any;
+  responsePayload?: any;
+  txid?: string | null;
+  status: string;
+  errorMessage?: string | null;
+}) {
+  await pool.query(
+    `INSERT INTO public.payout_transfer_logs (
+       payout_job_id, uid, wallet_identifier, amount_pi,
+       request_payload, response_payload, txid, status, error_message, created_at
+     ) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9, NOW())`,
+    [
+      opts.payoutJobId,
+      opts.uid,
+      opts.walletIdentifier,
+      opts.amountPi,
+      opts.requestPayload ? JSON.stringify(opts.requestPayload) : null,
+      opts.responsePayload ? JSON.stringify(opts.responsePayload) : null,
+      opts.txid || null,
+      opts.status,
+      opts.errorMessage || null,
+    ]
+  );
 }
 
 
@@ -822,7 +920,7 @@ function assertCycleStatus(status: string): MonthlyPayoutCycleStatus {
 }
 
 function assertJobStatus(status: string): PiPayoutJobStatus {
-  const allowed: PiPayoutJobStatus[] = ["queued", "processing", "paid", "failed", "blocked", "manual_review"];
+  const allowed: PiPayoutJobStatus[] = ["queued", "processing", "paid", "failed", "failed_permanent", "blocked", "manual_review"];
   if (!allowed.includes(status as PiPayoutJobStatus)) throw new Error("invalid_job_status");
   return status as PiPayoutJobStatus;
 }
@@ -1254,8 +1352,13 @@ export async function adminListPayoutJobs(opts?: {
        j.wallet_identifier,
        j.status,
        j.txid,
+       j.external_status,
+       j.treasury_blocked,
        j.error_message,
        j.attempts,
+       j.idempotency_key,
+       j.sent_at,
+       j.confirmed_at,
        j.created_at,
        j.updated_at
      FROM public.pi_payout_jobs j
@@ -1273,6 +1376,20 @@ export async function adminListPayoutJobs(opts?: {
   };
 }
 
+
+export async function adminListPayoutTransferLogs(jobId: number, limit = 50) {
+  const out = await pool.query(
+    `SELECT id, payout_job_id, uid, wallet_identifier, amount_pi, request_payload, response_payload,
+            txid, status, error_message, created_at
+       FROM public.payout_transfer_logs
+      WHERE payout_job_id = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT $2`,
+    [jobId, Math.max(1, Math.min(500, Number(limit || 50)))]
+  );
+
+  return { ok: true, rows: out.rows };
+}
 
 export async function adminListPayoutCycles(opts?: { limit?: number }) {
   const limit = Math.max(1, Math.min(24, toNonNegativeInt(opts?.limit, 6)));
@@ -1338,11 +1455,14 @@ export async function adminGetPayoutRuntimeConfig() {
   return {
     ok: true,
     simulation_mode: process.env.PAYOUT_SIMULATE_SUCCESS === "true",
+    payout_max_attempts: PAYOUT_MAX_ATTEMPTS,
+    pi_payout_adapter_enabled: process.env.PI_PAYOUT_ADAPTER_ENABLED === "true",
     max_user_monthly_pi: MAX_USER_MONTHLY_PI,
     max_global_monthly_pi: MAX_GLOBAL_MONTHLY_PI,
     min_account_age_days: MIN_ACCOUNT_AGE_DAYS,
     min_level_for_payout: MIN_LEVEL_FOR_PAYOUT,
     treasury_reserve_pi: TREASURY_RESERVE_PI,
+    sending_wallet_min_required_pi: SENDING_WALLET_MIN_REQUIRED_PI,
   };
 }
 
@@ -1457,6 +1577,10 @@ export async function adminUpdatePayoutJobStatus(opts: {
   jobId: number;
   status: PiPayoutJobStatus;
   txid?: string | null;
+  externalStatus?: string | null;
+  treasuryBlocked?: boolean;
+  sentAt?: string | null;
+  confirmedAt?: string | null;
   errorMessage?: string | null;
 }) {
   const status = assertJobStatus(opts.status);
@@ -1475,20 +1599,33 @@ export async function adminUpdatePayoutJobStatus(opts: {
       `UPDATE public.pi_payout_jobs
           SET status = $2,
               txid = CASE WHEN $2 = 'paid' THEN NULLIF($3, '') ELSE txid END,
+              external_status = COALESCE(NULLIF($4, ''), external_status),
+              treasury_blocked = COALESCE($5, treasury_blocked),
+              sent_at = CASE WHEN $2 = 'paid' THEN COALESCE($6::timestamp, sent_at, NOW()) ELSE sent_at END,
+              confirmed_at = CASE WHEN $2 = 'paid' THEN COALESCE($7::timestamp, confirmed_at, NOW()) ELSE confirmed_at END,
               error_message = CASE
-                WHEN $2 IN ('failed', 'blocked') THEN NULLIF($4, '')
+                WHEN $2 IN ('failed', 'failed_permanent', 'blocked', 'manual_review') THEN NULLIF($8, '')
                 WHEN $2 = 'paid' THEN NULL
                 ELSE error_message
               END,
               updated_at = NOW()
         WHERE id = $1
         RETURNING *`,
-      [opts.jobId, status, opts.txid || null, opts.errorMessage || null]
+      [
+        opts.jobId,
+        status,
+        opts.txid || null,
+        opts.externalStatus || null,
+        typeof opts.treasuryBlocked === "boolean" ? opts.treasuryBlocked : null,
+        opts.sentAt || null,
+        opts.confirmedAt || null,
+        opts.errorMessage || null,
+      ]
     );
 
     let snapshotStatus: MonthlyPayoutSnapshotStatus | null = null;
     if (status === "paid") snapshotStatus = "paid";
-    if (status === "failed") snapshotStatus = "failed";
+    if (status === "failed" || status === "failed_permanent") snapshotStatus = "failed";
     if (status === "blocked") snapshotStatus = "blocked";
     if (status === "manual_review") snapshotStatus = "manual_review";
     if (status === "queued" || status === "processing") snapshotStatus = "queued";
@@ -1540,14 +1677,15 @@ export async function adminRequeueFailedPayoutJob(jobId: number) {
     `UPDATE public.pi_payout_jobs
         SET status = 'queued',
             error_message = NULL,
+            treasury_blocked = FALSE,
             updated_at = NOW()
       WHERE id = $1
-        AND status = 'failed'
+        AND status IN ('failed', 'blocked')
       RETURNING *`,
     [jobId]
   );
 
-  if (!out.rows.length) throw new Error("payout_job_not_failed_or_not_found");
+  if (!out.rows.length) throw new Error("payout_job_not_requeueable_or_not_found");
 
   await pool.query(
     `UPDATE public.monthly_payout_snapshots
@@ -1570,13 +1708,13 @@ async function claimQueuedPayoutJobs(limit: number) {
          FROM public.pi_payout_jobs
          WHERE status = 'queued'
            AND COALESCE(review_status, 'auto') IN ('auto', 'approved')
+           AND COALESCE(treasury_blocked, FALSE) = FALSE
          ORDER BY created_at ASC
          FOR UPDATE SKIP LOCKED
          LIMIT $1
        )
        UPDATE public.pi_payout_jobs j
           SET status = 'processing',
-              attempts = attempts + 1,
               updated_at = NOW()
          FROM picked
         WHERE j.id = picked.id
@@ -1610,12 +1748,20 @@ async function claimQueuedPayoutJobs(limit: number) {
   }
 }
 
-export async function sendPiPayout(job: PayoutJobRecord): Promise<{ txid: string }> {
-  if (process.env.PAYOUT_SIMULATE_SUCCESS === "true") {
-    return { txid: `sim-${job.id}-${Date.now()}` };
+export async function sendPiPayout(job: PayoutJobRecord): Promise<{ ok: boolean; txid?: string; externalStatus?: string; error?: string; raw?: any }> {
+  const normalizedWallet = String(job.wallet_identifier || "").trim().toLowerCase();
+  const idempotencyKey = String(job.idempotency_key || `payout-job-${job.id}`);
+
+  if (!normalizedWallet) {
+    return { ok: false, error: "missing_wallet" };
   }
 
-  throw new Error("sendPiPayout_not_implemented");
+  return sendPiPayoutAdapter({
+    uid: String(job.uid),
+    walletIdentifier: normalizedWallet,
+    amountPi: Number(job.payout_pi_amount || 0),
+    idempotencyKey,
+  });
 }
 
 export async function runPayoutWorkerBatch(opts?: { limit?: number }) {
@@ -1626,14 +1772,44 @@ export async function runPayoutWorkerBatch(opts?: { limit?: number }) {
   let failed = 0;
   let blocked = 0;
   let manualReview = 0;
+  let failedPermanent = 0;
 
   for (const job of jobs) {
     const uid = String(job.uid);
     const payoutPi = Number(job.payout_pi_amount || 0);
+    const currentAttempts = Number(job.attempts || 0);
+
+    if (String(job.status) === "paid" || (job.txid && String(job.txid).trim())) {
+      await adminUpdatePayoutJobStatus({
+        jobId: Number(job.id),
+        status: "failed_permanent",
+        errorMessage: "duplicate_send_guard",
+      });
+      await insertPayoutTransferLog({
+        payoutJobId: Number(job.id),
+        uid,
+        walletIdentifier: String(job.wallet_identifier || ""),
+        amountPi: payoutPi,
+        requestPayload: { reason: "already_has_txid_or_paid" },
+        status: "failed_permanent",
+        errorMessage: "duplicate_send_guard",
+      });
+      failedPermanent += 1;
+      continue;
+    }
+
+    const idempotencyKey = String(job.idempotency_key || `payout-job-${job.id}`);
+    await pool.query(
+      `UPDATE public.pi_payout_jobs
+          SET idempotency_key = COALESCE(idempotency_key, $2),
+              updated_at = NOW()
+        WHERE id = $1`,
+      [job.id, idempotencyKey]
+    );
 
     const userRes = await pool.query(
       `SELECT u.uid, u.pi_wallet_identifier, u.payout_locked, u.manual_review_required,
-              u.payout_fail_count, u.account_created_at, p.level
+              u.payout_fail_count, u.account_created_at, u.monthly_coins_earned, p.level
          FROM public.users u
          LEFT JOIN public.progress p ON p.uid = u.uid
         WHERE u.uid = $1`,
@@ -1641,18 +1817,29 @@ export async function runPayoutWorkerBatch(opts?: { limit?: number }) {
     );
     const user = userRes.rows[0] || null;
 
-    if (!user || !String(user.pi_wallet_identifier || "").trim()) {
+    const normalizedWallet = String(user?.pi_wallet_identifier || job.wallet_identifier || "").trim().toLowerCase();
+    if (!normalizedWallet) {
       await pool.query(
         `UPDATE public.pi_payout_jobs
             SET status = 'blocked',
                 treasury_blocked = FALSE,
-                error_message = 'missing_wallet_identifier',
-                risk_reason = COALESCE(risk_reason, 'wallet_missing'),
+                wallet_identifier = NULL,
+                attempts = attempts + 1,
+                error_message = 'missing_wallet',
                 updated_at = NOW()
           WHERE id = $1`,
         [job.id]
       );
-      await adminUpdatePayoutJobStatus({ jobId: Number(job.id), status: "blocked", errorMessage: "missing_wallet_identifier" });
+      await adminUpdatePayoutJobStatus({ jobId: Number(job.id), status: "blocked", errorMessage: "missing_wallet" });
+      await insertPayoutTransferLog({
+        payoutJobId: Number(job.id),
+        uid,
+        walletIdentifier: "",
+        amountPi: payoutPi,
+        requestPayload: { idempotency_key: idempotencyKey },
+        status: "blocked",
+        errorMessage: "missing_wallet",
+      });
       blocked += 1;
       continue;
     }
@@ -1660,43 +1847,146 @@ export async function runPayoutWorkerBatch(opts?: { limit?: number }) {
     const risk = evaluateUserPayoutRisk(user, { monthlyCoins: Number(user?.monthly_coins_earned || 0) });
     if (risk.manualReview) {
       await writeUserRiskState(pool, uid, risk);
-      await pool.query(
-        `UPDATE public.pi_payout_jobs
-            SET status = 'manual_review',
-                risk_reason = COALESCE(risk_reason, $2),
-                updated_at = NOW()
-          WHERE id = $1`,
-        [job.id, risk.reasons.join(',') || 'manual_review_required']
-      );
-      await adminUpdatePayoutJobStatus({ jobId: Number(job.id), status: "manual_review", errorMessage: risk.reasons.join(",") || "manual_review_required" });
+      await adminUpdatePayoutJobStatus({
+        jobId: Number(job.id),
+        status: "manual_review",
+        errorMessage: risk.reasons.join(",") || "manual_review_required",
+      });
+      await insertPayoutTransferLog({
+        payoutJobId: Number(job.id),
+        uid,
+        walletIdentifier: normalizedWallet,
+        amountPi: payoutPi,
+        requestPayload: { idempotency_key: idempotencyKey },
+        status: "manual_review",
+        errorMessage: risk.reasons.join(",") || "manual_review_required",
+      });
       manualReview += 1;
       continue;
     }
 
-    if (!(await treasuryAllowsPayout(payoutPi))) {
+    const treasury = await assertTreasuryCanPayout(payoutPi);
+    if (!treasury.ok) {
       await pool.query(
         `UPDATE public.pi_payout_jobs
             SET status = 'blocked',
                 treasury_blocked = TRUE,
-                error_message = 'failed_treasury_guard',
+                attempts = attempts + 1,
+                error_message = 'treasury_guard',
                 updated_at = NOW()
           WHERE id = $1`,
         [job.id]
       );
-      await adminUpdatePayoutJobStatus({ jobId: Number(job.id), status: "blocked", errorMessage: "failed_treasury_guard" });
+      await adminUpdatePayoutJobStatus({ jobId: Number(job.id), status: "blocked", errorMessage: "treasury_guard" });
+      await insertPayoutTransferLog({
+        payoutJobId: Number(job.id),
+        uid,
+        walletIdentifier: normalizedWallet,
+        amountPi: payoutPi,
+        requestPayload: { idempotency_key: idempotencyKey, treasury },
+        status: "blocked",
+        errorMessage: "treasury_guard",
+      });
       blocked += 1;
       continue;
     }
 
+    const requestPayload = {
+      uid,
+      wallet_identifier: normalizedWallet,
+      amount_pi: payoutPi,
+      idempotency_key: idempotencyKey,
+    };
+
     try {
-      const tx = await sendPiPayout(job);
+      const tx = await sendPiPayout({
+        ...job,
+        wallet_identifier: normalizedWallet,
+        idempotency_key: idempotencyKey,
+      });
+
+      if (!tx.ok || !String(tx.txid || "").trim()) {
+        const normalizedError = normalizePayoutErrorClass(tx.error || "payout_failed");
+        const nextAttempts = currentAttempts + 1;
+        const nextStatus: PiPayoutJobStatus =
+          normalizedError === "permanent_rejection" || normalizedError === "duplicate_send_guard" || nextAttempts >= PAYOUT_MAX_ATTEMPTS
+            ? "failed_permanent"
+            : "failed";
+
+        await pool.query(
+          `UPDATE public.pi_payout_jobs
+              SET attempts = attempts + 1,
+                  error_message = $2,
+                  external_status = COALESCE($3, external_status),
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [job.id, normalizedError, tx.externalStatus || null]
+        );
+
+        await adminUpdatePayoutJobStatus({
+          jobId: Number(job.id),
+          status: nextStatus,
+          errorMessage: normalizedError,
+        });
+
+        await insertPayoutTransferLog({
+          payoutJobId: Number(job.id),
+          uid,
+          walletIdentifier: normalizedWallet,
+          amountPi: payoutPi,
+          requestPayload,
+          responsePayload: tx.raw || tx,
+          status: nextStatus,
+          errorMessage: normalizedError,
+        });
+
+        if (nextStatus === "failed_permanent") failedPermanent += 1;
+        else failed += 1;
+        continue;
+      }
+
+      await pool.query(
+        `UPDATE public.pi_payout_jobs
+            SET wallet_identifier = $2,
+                idempotency_key = COALESCE(idempotency_key, $3),
+                external_status = $4,
+                sent_at = COALESCE(sent_at, NOW()),
+                confirmed_at = CASE
+                  WHEN $4 ILIKE '%confirmed%' OR $4 ILIKE '%complete%' OR $4 ILIKE '%simulated%' THEN COALESCE(confirmed_at, NOW())
+                  ELSE confirmed_at
+                END,
+                error_message = NULL,
+                treasury_blocked = FALSE,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [job.id, normalizedWallet, idempotencyKey, tx.externalStatus || null]
+      );
+
       await adminUpdatePayoutJobStatus({
         jobId: Number(job.id),
         status: "paid",
         txid: tx.txid,
       });
+
+      await insertPayoutTransferLog({
+        payoutJobId: Number(job.id),
+        uid,
+        walletIdentifier: normalizedWallet,
+        amountPi: payoutPi,
+        requestPayload,
+        responsePayload: tx.raw || tx,
+        txid: tx.txid,
+        status: "paid",
+      });
       paid += 1;
     } catch (e: any) {
+      const normalizedError = normalizePayoutErrorClass(e?.message || "payout_failed");
+      const nextAttempts = currentAttempts + 1;
+      const nextStatus: PiPayoutJobStatus =
+        normalizedError === "permanent_rejection" || normalizedError === "duplicate_send_guard" || nextAttempts >= PAYOUT_MAX_ATTEMPTS
+          ? "failed_permanent"
+          : "failed";
+
       await pool.query(
         `UPDATE public.users
             SET payout_fail_count = COALESCE(payout_fail_count, 0) + 1,
@@ -1704,12 +1994,35 @@ export async function runPayoutWorkerBatch(opts?: { limit?: number }) {
           WHERE uid = $1`,
         [uid]
       );
+
+      await pool.query(
+        `UPDATE public.pi_payout_jobs
+            SET attempts = attempts + 1,
+                error_message = $2,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [job.id, normalizedError]
+      );
+
       await adminUpdatePayoutJobStatus({
         jobId: Number(job.id),
-        status: "failed",
-        errorMessage: String(e?.message || "payout_failed"),
+        status: nextStatus,
+        errorMessage: normalizedError,
       });
-      failed += 1;
+
+      await insertPayoutTransferLog({
+        payoutJobId: Number(job.id),
+        uid,
+        walletIdentifier: normalizedWallet,
+        amountPi: payoutPi,
+        requestPayload,
+        responsePayload: { error: String(e?.message || "payout_failed") },
+        status: nextStatus,
+        errorMessage: normalizedError,
+      });
+
+      if (nextStatus === "failed_permanent") failedPermanent += 1;
+      else failed += 1;
     }
   }
 
@@ -1718,10 +2031,12 @@ export async function runPayoutWorkerBatch(opts?: { limit?: number }) {
     claimed: jobs.length,
     paid,
     failed,
+    failed_permanent: failedPermanent,
     blocked,
     manual_review: manualReview,
   };
 }
+
 
 export async function ensureUserAdsRow(uid: string) {
   const month = currentMonthKey();
