@@ -760,6 +760,9 @@ async function getTotalPaidPi(): Promise<number> {
 }
 
 async function assertTreasuryCanPayout(payoutPi: number): Promise<{ ok: boolean; reason?: string; availablePi?: number; paidPi?: number }> {
+  if (process.env.PAYOUT_SIMULATE_SUCCESS === "true") {
+    return { ok: true };
+  }
   const availableFromAdapter = await getSendingWalletAvailableBalancePi();
   const available =
     (Number.isFinite(availableFromAdapter as number)
