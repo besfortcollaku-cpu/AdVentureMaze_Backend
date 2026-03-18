@@ -32,6 +32,7 @@ import {
   adminGetPayoutSnapshotSummary,
   adminGetPayoutRuntimeConfig,
   adminSetPayoutSimulationMode,
+  adminSyncPayoutSimulationModeFromDb,
   adminListPayoutSnapshots,
   adminListPayoutTransferLogs,
   adminRetryFailedPayouts,
@@ -1785,6 +1786,8 @@ app.get("/admin/payouts/config", async (req,res)=>{
     res.json(out);
   }catch(e:any){
     res.status(400).json({ ok:false, error:e.message });
+  }
+});
 
 app.post("/admin/payouts/config/simulation", async (req,res)=>{
   try{
@@ -1794,8 +1797,6 @@ app.post("/admin/payouts/config/simulation", async (req,res)=>{
     res.json(out);
   }catch(e:any){
     res.status(400).json({ ok:false, error:e.message });
-  }
-});
   }
 });
 
@@ -1892,6 +1893,7 @@ app.post("/admin/payouts/jobs/:id/requeue", async (req,res)=>{
 app.post("/admin/payouts/worker/run", async (req,res)=>{
   try{
     requireAdmin(req);
+    await adminSyncPayoutSimulationModeFromDb();
     const limit = req.body?.limit ? Number(req.body.limit) : undefined;
     const out = await runPayoutWorkerBatch({ limit });
     res.json(out);

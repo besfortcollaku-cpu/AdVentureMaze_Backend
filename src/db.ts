@@ -386,6 +386,13 @@ await pool.query(`
     CREATE INDEX IF NOT EXISTS payout_transfer_logs_job_idx
       ON public.payout_transfer_logs (payout_job_id, created_at DESC);
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.admin_runtime_config (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
 
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS pi_payout_jobs_idempotency_key_uniq
@@ -620,6 +627,7 @@ const SUSPICIOUS_MONTHLY_COINS = envNumber("SUSPICIOUS_MONTHLY_COINS", 10000);
 const PAYOUT_FAIL_REVIEW_COUNT = envNumber("PAYOUT_FAIL_REVIEW_COUNT", 3);
 const PAYOUT_MAX_ATTEMPTS = Math.max(1, Math.floor(envNumber("PAYOUT_MAX_ATTEMPTS", 3)));
 const SENDING_WALLET_MIN_REQUIRED_PI = envNumber("SENDING_WALLET_MIN_REQUIRED_PI", 0);
+const PAYOUT_SIM_MODE_CONFIG_KEY = "payout_simulate_success";
 let runtimePayoutSimulationMode: boolean | null = null;
 
 function isPayoutSimulationMode() {
@@ -627,9 +635,33 @@ function isPayoutSimulationMode() {
   return process.env.PAYOUT_SIMULATE_SUCCESS === "true";
 }
 
+export async function adminSyncPayoutSimulationModeFromDb() {
+  try {
+    const out = await pool.query(
+      `SELECT value FROM public.admin_runtime_config WHERE key = $1 LIMIT 1`,
+      [PAYOUT_SIM_MODE_CONFIG_KEY]
+    );
+    const raw = String(out.rows?.[0]?.value ?? "").trim().toLowerCase();
+    if (raw === "true" || raw === "false") {
+      runtimePayoutSimulationMode = raw === "true";
+      process.env.PAYOUT_SIMULATE_SUCCESS = runtimePayoutSimulationMode ? "true" : "false";
+    }
+  } catch {
+    // keep env/default mode if config table isn't ready yet
+  }
+  return { ok: true, simulation_mode: isPayoutSimulationMode() };
+}
+
 export async function adminSetPayoutSimulationMode(enabled: boolean) {
   runtimePayoutSimulationMode = Boolean(enabled);
   process.env.PAYOUT_SIMULATE_SUCCESS = runtimePayoutSimulationMode ? "true" : "false";
+  await pool.query(
+    `INSERT INTO public.admin_runtime_config (key, value, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (key)
+     DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+    [PAYOUT_SIM_MODE_CONFIG_KEY, runtimePayoutSimulationMode ? "true" : "false"]
+  );
   return { ok: true, simulation_mode: runtimePayoutSimulationMode };
 }
 
@@ -1467,6 +1499,7 @@ export async function adminGetPayoutSnapshotSummary(opts?: { cycleId?: number; m
 }
 
 export async function adminGetPayoutRuntimeConfig() {
+  await adminSyncPayoutSimulationModeFromDb();
   return {
     ok: true,
     simulation_mode: isPayoutSimulationMode(),
