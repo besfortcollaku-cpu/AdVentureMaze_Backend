@@ -44,6 +44,10 @@ import {
   claimMonthlyRewards,
   recalcAndStoreMonthlyRate,
   trackRewardedAdActivity,
+  incrementDailyUserStats,
+  getDailyLeaderboard,
+  getDailyLeaderboardMe,
+  getDailyLeaderboardRaw,
   resetDailyAdCounters,
   ensureInviteCode,
   getInviteSummary,
@@ -60,6 +64,10 @@ import {
   adminGetStats,
   adminListOnlineUsers,
   adminResetFreeCounters,
+  adminSetUserPayoutLock,
+  adminSetUserSuspicious,
+  adminSetUserManualReview,
+  adminReevaluateUserFraud,
   // ✅ charts1
   adminChartCoins,
   adminChartActiveUsers,
@@ -571,6 +579,7 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
     );
 
     await pool.query("COMMIT");
+    try { await incrementDailyUserStats(uid, { coinsEarned: reward }); } catch {}
     try { await recalcAndStoreMonthlyRate(uid); } catch {}
 
     const updated = await pool.query(
@@ -655,6 +664,7 @@ app.post("/api/daily-reward/recover", async (req, res) => {
     );
 
     await pool.query("COMMIT");
+    try { await incrementDailyUserStats(uid, { coinsEarned: rewardCoins, adsWatched: 1 }); } catch {}
     try { await recalcAndStoreMonthlyRate(uid); } catch {}
 
     const updatedRes = await pool.query(
@@ -756,6 +766,7 @@ app.post("/api/daily-reward/claim", async (req, res) => {
     );
 
     await pool.query("COMMIT");
+    try { await incrementDailyUserStats(uid, { coinsEarned: rewardCoins }); } catch {}
     try { await recalcAndStoreMonthlyRate(uid); } catch {}
 
     const updatedRes = await pool.query(
@@ -883,6 +894,7 @@ app.post("/api/rewards/recover-day", async (req, res) => {
     }
 
     await pool.query("COMMIT");
+    try { await incrementDailyUserStats(uid, { coinsEarned: coins, adsWatched: 1 }); } catch {}
     try { await recalcAndStoreMonthlyRate(uid); } catch {}
 
     const updated = await pool.query(
@@ -1103,6 +1115,7 @@ function boolHeader(req: express.Request, key: string): boolean {
 function getAdRequestMeta(req: express.Request) {
   return {
     ip: requestIp(req) || null,
+    user_agent: headerValue(req, "user-agent") || null,
     country: headerValue(req, "cf-ipcountry") || headerValue(req, "x-country") || null,
     asn: headerValue(req, "x-asn") || null,
     isp: headerValue(req, "x-isp") || null,
@@ -1157,6 +1170,35 @@ res.json(out);
   }
 });
 
+app.get("/api/leaderboard/daily", async (req, res) => {
+  try {
+    const out = await getDailyLeaderboard(20);
+    res.json({ ok: true, rows: out.rows || [] });
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/api/leaderboard/daily/me", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const out = await getDailyLeaderboardMe(uid);
+    res.json({ ok: true, row: out.row });
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/admin/leaderboard/daily/raw", async (req, res) => {
+  try {
+    requireAdmin(req);
+    const limit = req.query.limit ? Number(req.query.limit) : 100;
+    const out = await getDailyLeaderboardRaw(limit);
+    res.json(out);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
 /* ---------------- REWARDS ---------------- */
 app.post("/api/rewards/ad-50", async (req,res)=>{
   try{
@@ -1416,6 +1458,7 @@ app.post("/api/rewards/daily-claim", async (req, res) => {
     );
 
     await pool.query("COMMIT");
+    try { await incrementDailyUserStats(uid, { coinsEarned: reward }); } catch {}
     try { await recalcAndStoreMonthlyRate(uid); } catch {}
 
     res.json({
@@ -1935,7 +1978,18 @@ app.get("/admin/users", async (req,res)=>{
     const offset = Math.max(0, Number(req.query.offset || 0));
     const order  = String(req.query.order || "updated_at_desc");
     const suspiciousOnly = String(req.query.suspicious || "") === "1";
-    const out = await adminListUsers({ search, limit, offset, suspiciousOnly });
+    const vpnOnly = String(req.query.vpn || "") === "1";
+    const manualReviewOnly = String(req.query.manual_review || "") === "1";
+    const payoutLockedOnly = String(req.query.payout_locked || "") === "1";
+    const out = await adminListUsers({
+      search,
+      limit,
+      offset,
+      suspiciousOnly,
+      vpnOnly,
+      manualReviewOnly,
+      payoutLockedOnly,
+    });
     res.json(out);
   }catch(e:any){
     res.status(401).json({ ok:false, error:e.message });
@@ -1949,6 +2003,47 @@ app.get("/admin/users/:uid", async (req,res)=>{
     res.json({ ok:true, data });
   }catch(e:any){
     res.status(401).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/users/:uid/payout-unlock", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const out = await adminSetUserPayoutLock(String(req.params.uid), false);
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/users/:uid/suspicious-clear", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const out = await adminSetUserSuspicious(String(req.params.uid), false);
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/users/:uid/manual-review", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const enabled = String(req.body?.enabled || "1") !== "0";
+    const out = await adminSetUserManualReview(String(req.params.uid), enabled);
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/users/:uid/fraud-recompute", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const out = await adminReevaluateUserFraud(String(req.params.uid));
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
   }
 });
 

@@ -1,5 +1,6 @@
 import { Pool } from "pg";
 import { sendPiPayout as sendPiPayoutAdapter, getSendingWalletAvailableBalancePi } from "./services/piPayoutSender";
+import { lookupIpRisk } from "./services/ipRisk";
 console.log("Backend v2.0.1");
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -178,11 +179,18 @@ await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_
 
   await pool.query(`
     ALTER TABLE public.users
-      ADD COLUMN IF NOT EXISTS fraud_score INTEGER DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS vpn_flag BOOLEAN DEFAULT FALSE,
-      ADD COLUMN IF NOT EXISTS suspicious BOOLEAN DEFAULT FALSE,
-      ADD COLUMN IF NOT EXISTS ads_watched_today INTEGER DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS last_ad_at TIMESTAMP;
+      ADD COLUMN IF NOT EXISTS fraud_score INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS vpn_flag BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS suspicious BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS payout_locked BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS manual_review_required BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS risk_flags JSONB NOT NULL DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS payout_fail_count INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS ads_watched_today INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_ip TEXT,
+      ADD COLUMN IF NOT EXISTS last_user_agent TEXT,
+      ADD COLUMN IF NOT EXISTS last_ad_at TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS last_ad_watch_at TIMESTAMP;
   `);
 
   await pool.query(`
@@ -205,6 +213,54 @@ await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_
     CREATE INDEX IF NOT EXISTS user_ad_activity_uid_created_idx
       ON public.user_ad_activity (uid, created_at DESC);
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.ad_watch_logs (
+      id BIGSERIAL PRIMARY KEY,
+      uid TEXT NOT NULL,
+      ad_type TEXT NOT NULL,
+      ip TEXT,
+      user_agent TEXT,
+      country TEXT,
+      isp TEXT,
+      asn TEXT,
+      is_vpn BOOLEAN NOT NULL DEFAULT FALSE,
+      eligible_for_payout BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ad_watch_logs_uid_created_idx
+      ON public.ad_watch_logs (uid, created_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ad_watch_logs_ip_created_idx
+      ON public.ad_watch_logs (ip, created_at DESC);
+  `);  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.daily_user_stats (
+      id BIGSERIAL PRIMARY KEY,
+      uid TEXT NOT NULL,
+      date_key DATE NOT NULL,
+      coins_earned INTEGER NOT NULL DEFAULT 0,
+      levels_completed INTEGER NOT NULL DEFAULT 0,
+      ads_watched INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE(uid, date_key)
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS daily_user_stats_date_key_idx
+      ON public.daily_user_stats (date_key);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS daily_user_stats_date_coins_idx
+      ON public.daily_user_stats (date_key, coins_earned DESC);
+  `);
+
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS reward_claims (
@@ -356,6 +412,7 @@ await pool.query(`
 
   await pool.query(`
     ALTER TABLE public.pi_payout_jobs
+      ADD COLUMN IF NOT EXISTS flagged BOOLEAN NOT NULL DEFAULT FALSE,
       ADD COLUMN IF NOT EXISTS risk_reason TEXT,
       ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'auto',
       ADD COLUMN IF NOT EXISTS approved_by_admin TEXT,
@@ -590,6 +647,8 @@ type PayoutJobRecord = {
   idempotency_key?: string | null;
   treasury_blocked?: boolean;
   review_status?: string | null;
+  flagged?: boolean;
+  risk_reason?: string | null;
 };
 
 const MONTH_KEY_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
@@ -627,6 +686,14 @@ const SUSPICIOUS_MONTHLY_COINS = envNumber("SUSPICIOUS_MONTHLY_COINS", 10000);
 const PAYOUT_FAIL_REVIEW_COUNT = envNumber("PAYOUT_FAIL_REVIEW_COUNT", 3);
 const PAYOUT_MAX_ATTEMPTS = Math.max(1, Math.floor(envNumber("PAYOUT_MAX_ATTEMPTS", 3)));
 const SENDING_WALLET_MIN_REQUIRED_PI = envNumber("SENDING_WALLET_MIN_REQUIRED_PI", 0);
+const FRAUD_SCORE_SUSPICIOUS_THRESHOLD = Math.max(1, Math.floor(envNumber("FRAUD_SCORE_SUSPICIOUS_THRESHOLD", 4)));
+const FRAUD_SCORE_MANUAL_REVIEW_THRESHOLD = Math.max(FRAUD_SCORE_SUSPICIOUS_THRESHOLD, Math.floor(envNumber("FRAUD_SCORE_MANUAL_REVIEW_THRESHOLD", 6)));
+const FRAUD_SCORE_PAYOUT_LOCK_THRESHOLD = Math.max(FRAUD_SCORE_MANUAL_REVIEW_THRESHOLD, Math.floor(envNumber("FRAUD_SCORE_PAYOUT_LOCK_THRESHOLD", 8)));
+const PAYOUT_ELIGIBLE_ADS_PER_DAY = Math.max(0, Math.floor(envNumber("PAYOUT_ELIGIBLE_ADS_PER_DAY", 5)));
+const FRAUD_SHARED_IP_USER_THRESHOLD = Math.max(2, Math.floor(envNumber("FRAUD_SHARED_IP_USER_THRESHOLD", 5)));
+const FRAUD_DUPLICATE_WALLET_THRESHOLD = Math.max(2, Math.floor(envNumber("FRAUD_DUPLICATE_WALLET_THRESHOLD", 3)));
+const FRAUD_MIN_SECONDS_BETWEEN_REWARDED_ADS = Math.max(30, Math.floor(envNumber("FRAUD_MIN_SECONDS_BETWEEN_REWARDED_ADS", 120)));
+const FRAUD_NEW_ACCOUNT_DAYS = Math.max(1, Math.floor(envNumber("FRAUD_NEW_ACCOUNT_DAYS", Math.max(1, MIN_ACCOUNT_AGE_DAYS))));
 const PAYOUT_SIM_MODE_CONFIG_KEY = "payout_simulate_success";
 let runtimePayoutSimulationMode: boolean | null = null;
 
@@ -711,6 +778,15 @@ export function evaluateUserPayoutRisk(user: any, stats: { monthlyCoins: number 
     manualReview = true;
     reasons.push("manual_review_required");
     riskFlags.push("manual_review_required");
+    trustScore -= 25;
+  }
+  if (Boolean(user?.suspicious) || Boolean(user?.vpn_flag) || Number(user?.fraud_score || 0) >= FRAUD_SCORE_MANUAL_REVIEW_THRESHOLD) {
+    allowed = false;
+    manualReview = true;
+    reasons.push("fraud_review_required");
+    if (Boolean(user?.suspicious)) riskFlags.push("suspicious");
+    if (Boolean(user?.vpn_flag)) riskFlags.push("vpn_detected");
+    if (Number(user?.fraud_score || 0) >= FRAUD_SCORE_MANUAL_REVIEW_THRESHOLD) riskFlags.push("fraud_score_high");
     trustScore -= 25;
   }
   if (accountAgeDays < MIN_ACCOUNT_AGE_DAYS) {
@@ -866,23 +942,165 @@ export function calculateFraudScore(user: any, sessionData: {
   is_vpn?: boolean;
   level_before?: number | null;
   level_after?: number | null;
+  rapidRepeat?: boolean;
 }) {
   let score = 0;
 
   if (sessionData?.is_vpn) score += 2;
   if (Number(user?.ads_watched_today || 0) > 10) score += 2;
-
-  const lastAd = user?.last_ad_at ? new Date(user.last_ad_at).getTime() : 0;
-  if (lastAd && (Date.now() - lastAd < 120000)) score += 2;
-
+  if (sessionData?.rapidRepeat) score += 2;
   if (sessionData?.level_after === sessionData?.level_before) score += 2;
 
   return score;
 }
 
+function isQueryClient(v: any): v is { query: (sql: string, values?: any[]) => Promise<any> } {
+  return !!v && typeof v.query === "function";
+}
+
+export async function evaluateUserFraud(uid: string, opts?: {
+  client?: { query: (sql: string, values?: any[]) => Promise<any> };
+  rapidAdRepeat?: boolean;
+  vpnDetected?: boolean;
+}) {
+  const db = isQueryClient(opts?.client) ? opts!.client : pool;
+
+  const userRes = await db.query(
+    `SELECT uid, fraud_score, suspicious, payout_locked, manual_review_required, vpn_flag,
+            ads_watched_today, payout_fail_count, monthly_coins_earned, account_created_at,
+            pi_wallet_identifier, last_ip
+       FROM public.users
+      WHERE uid = $1
+      LIMIT 1`,
+    [uid]
+  );
+  const user = userRes.rows[0];
+  if (!user) throw new Error("user_not_found");
+
+  const riskFlags: string[] = [];
+  let score = 0;
+
+  const wallet = String(user.pi_wallet_identifier || "").trim();
+  const lastIp = String(user.last_ip || "").trim();
+  const adsToday = Number(user.ads_watched_today || 0);
+  const payoutFails = Number(user.payout_fail_count || 0);
+  const monthlyCoins = Number(user.monthly_coins_earned || 0);
+
+  if (Boolean(user.vpn_flag) || Boolean(opts?.vpnDetected)) {
+    score += 2;
+    riskFlags.push("vpn_detected");
+  }
+
+  if (adsToday > 10) {
+    score += 2;
+    riskFlags.push("too_many_ads_today");
+  }
+
+  let rapidAdRepeat = Boolean(opts?.rapidAdRepeat);
+  if (!rapidAdRepeat) {
+    const rapidRes = await db.query(
+      `SELECT created_at
+         FROM public.ad_watch_logs
+        WHERE uid = $1
+        ORDER BY created_at DESC
+        LIMIT 2`,
+      [uid]
+    );
+    if ((rapidRes.rowCount || 0) >= 2) {
+      const a = new Date(rapidRes.rows[0].created_at).getTime();
+      const b = new Date(rapidRes.rows[1].created_at).getTime();
+      if (Number.isFinite(a) && Number.isFinite(b)) {
+        rapidAdRepeat = (Math.abs(a - b) / 1000) < FRAUD_MIN_SECONDS_BETWEEN_REWARDED_ADS;
+      }
+    }
+  }
+  if (rapidAdRepeat) {
+    score += 2;
+    riskFlags.push("rapid_ad_repeat");
+  }
+
+  if (wallet) {
+    const dupWalletRes = await db.query(
+      `SELECT COUNT(*)::int AS c
+         FROM public.users
+        WHERE pi_wallet_identifier = $1`,
+      [wallet]
+    );
+    const dupWalletCount = Number(dupWalletRes.rows[0]?.c || 0);
+    if (dupWalletCount >= FRAUD_DUPLICATE_WALLET_THRESHOLD) {
+      score += 3;
+      riskFlags.push("duplicate_wallet_cluster");
+    }
+  }
+
+  if (lastIp) {
+    const sharedIpRes = await db.query(
+      `SELECT COUNT(DISTINCT uid)::int AS c
+         FROM public.ad_watch_logs
+        WHERE ip = $1
+          AND created_at >= (NOW() - INTERVAL '14 days')`,
+      [lastIp]
+    );
+    const sharedIpUsers = Number(sharedIpRes.rows[0]?.c || 0);
+    if (sharedIpUsers >= FRAUD_SHARED_IP_USER_THRESHOLD) {
+      score += 3;
+      riskFlags.push("shared_ip_cluster");
+    }
+  }
+
+  if (payoutFails >= 3) {
+    score += 2;
+    riskFlags.push("repeated_payout_failures");
+  }
+
+  if (monthlyCoins >= SUSPICIOUS_MONTHLY_COINS) {
+    score += 2;
+    riskFlags.push("high_monthly_earnings");
+  }
+
+  const accountMs = user.account_created_at ? new Date(user.account_created_at).getTime() : NaN;
+  if (Number.isFinite(accountMs)) {
+    const ageDays = Math.max(0, Math.floor((Date.now() - accountMs) / 86400000));
+    if (ageDays < FRAUD_NEW_ACCOUNT_DAYS) {
+      score += 2;
+      riskFlags.push("new_account");
+    }
+  }
+
+  const uniqueFlags = Array.from(new Set(riskFlags));
+  const suspicious = score >= FRAUD_SCORE_SUSPICIOUS_THRESHOLD;
+  const manualReview = score >= FRAUD_SCORE_MANUAL_REVIEW_THRESHOLD;
+  const payoutLocked = score >= FRAUD_SCORE_PAYOUT_LOCK_THRESHOLD;
+
+  const updated = await db.query(
+    `UPDATE public.users
+        SET fraud_score = $2,
+            suspicious = $3,
+            manual_review_required = $4,
+            payout_locked = $5,
+            risk_flags = $6::jsonb,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING uid, fraud_score, suspicious, manual_review_required, payout_locked, risk_flags, vpn_flag, ads_watched_today`,
+    [uid, score, suspicious, manualReview, payoutLocked, JSON.stringify(uniqueFlags)]
+  );
+
+  return {
+    ok: true,
+    uid,
+    fraud_score: score,
+    suspicious,
+    manual_review_required: manualReview,
+    payout_locked: payoutLocked,
+    risk_flags: uniqueFlags,
+    user: updated.rows[0] || null,
+  };
+}
+
 export async function trackRewardedAdActivity(opts: {
   uid: string;
   ip?: string | null;
+  user_agent?: string | null;
   country?: string | null;
   asn?: string | null;
   isp?: string | null;
@@ -896,7 +1114,7 @@ export async function trackRewardedAdActivity(opts: {
     await client.query("BEGIN");
 
     const lock = await client.query(
-      `SELECT uid, fraud_score, vpn_flag, suspicious, ads_watched_today, last_ad_at
+      `SELECT uid, fraud_score, vpn_flag, suspicious, ads_watched_today, last_ad_at, last_ad_watch_at
          FROM public.users
         WHERE uid = $1
         FOR UPDATE`,
@@ -905,10 +1123,23 @@ export async function trackRewardedAdActivity(opts: {
     const user = lock.rows[0];
     if (!user) throw new Error("user_not_found");
 
+    const ipRisk = await lookupIpRisk(opts.ip || null, opts.user_agent || null);
+    const isVpn = Boolean(opts.is_vpn) || Boolean(ipRisk.is_vpn);
+    const country = opts.country || ipRisk.country || null;
+    const asn = opts.asn || ipRisk.asn || null;
+    const isp = opts.isp || ipRisk.isp || null;
+    const adsWatchedToday = Number(user?.ads_watched_today || 0);
+    const eligibleForPayout = adsWatchedToday < PAYOUT_ELIGIBLE_ADS_PER_DAY;
+    const lastAdMs = user?.last_ad_watch_at ? new Date(user.last_ad_watch_at).getTime() : NaN;
+    const rapidRepeat = Number.isFinite(lastAdMs)
+      ? ((Date.now() - Number(lastAdMs)) / 1000) < FRAUD_MIN_SECONDS_BETWEEN_REWARDED_ADS
+      : false;
+
     const scoreAdd = calculateFraudScore(user, {
-      is_vpn: Boolean(opts.is_vpn),
+      is_vpn: isVpn,
       level_before: opts.level_before ?? null,
       level_after: opts.level_after ?? null,
+      rapidRepeat,
     });
 
     await client.query(
@@ -918,31 +1149,62 @@ export async function trackRewardedAdActivity(opts: {
       [
         opts.uid,
         opts.ip || null,
-        opts.country || null,
-        opts.asn || null,
-        opts.isp || null,
-        Boolean(opts.is_vpn),
+        country,
+        asn,
+        isp,
+        isVpn,
         opts.ad_type,
         opts.level_before ?? null,
         opts.level_after ?? null,
       ]
     );
 
-    const updated = await client.query(
+    await client.query(
+      `INSERT INTO public.ad_watch_logs (
+         uid, ad_type, ip, user_agent, country, isp, asn, is_vpn, eligible_for_payout, created_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())`,
+      [
+        opts.uid,
+        opts.ad_type,
+        opts.ip || null,
+        opts.user_agent || null,
+        country,
+        isp,
+        asn,
+        isVpn,
+        eligibleForPayout,
+      ]
+    );
+
+    await client.query(
       `UPDATE public.users
           SET fraud_score = COALESCE(fraud_score, 0) + $2,
               vpn_flag = CASE WHEN $3 THEN TRUE ELSE COALESCE(vpn_flag, FALSE) END,
               ads_watched_today = COALESCE(ads_watched_today, 0) + 1,
               last_ad_at = NOW(),
-              suspicious = CASE WHEN (COALESCE(fraud_score, 0) + $2) >= 6 THEN TRUE ELSE COALESCE(suspicious, FALSE) END,
+              last_ad_watch_at = NOW(),
+              last_ip = COALESCE($4, last_ip),
+              last_user_agent = COALESCE($5, last_user_agent),
               updated_at = NOW()
-        WHERE uid = $1
-        RETURNING *`,
-      [opts.uid, scoreAdd, Boolean(opts.is_vpn)]
+        WHERE uid = $1`,
+      [opts.uid, scoreAdd, isVpn, opts.ip || null, opts.user_agent || null]
     );
 
+    const fraudEval = await evaluateUserFraud(opts.uid, {
+      client,
+      rapidAdRepeat: rapidRepeat,
+      vpnDetected: isVpn,
+    });
+
     await client.query("COMMIT");
-    return { ok: true, score_added: scoreAdd, user: updated.rows[0] || null };
+    try { await incrementDailyUserStats(opts.uid, { adsWatched: 1 }); } catch {}
+    return {
+      ok: true,
+      score_added: scoreAdd,
+      eligible_for_payout: eligibleForPayout,
+      ip_risk: ipRisk,
+      fraud: fraudEval,
+    };
   } catch (e) {
     await client.query("ROLLBACK");
     throw e;
@@ -950,7 +1212,6 @@ export async function trackRewardedAdActivity(opts: {
     client.release();
   }
 }
-
 export async function resetDailyAdCounters() {
   const out = await pool.query(
     `UPDATE public.users
@@ -1091,21 +1352,28 @@ export async function closeMonthlyPayoutCycle(opts: {
          COALESCE(u.payout_carry_coins, 0)::bigint AS carry_in_coins,
          (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint) AS total_coins_for_settlement,
           CASE
-            WHEN (COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= 6)
+            WHEN (COALESCE(u.payout_locked, FALSE) = TRUE)
               THEN 0::numeric(20,8)
-            WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric THEN 0::numeric(20,8)
+            WHEN (COALESCE(u.manual_review_required, FALSE) = TRUE OR COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= $4)
+              THEN 0::numeric(20,8)
+            WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
+              THEN 0::numeric(20,8)
             ELSE ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric)::numeric(20,8)
           END AS payout_pi_amount,
           CASE
-            WHEN (COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= 6)
-              THEN 0::bigint
+            WHEN (COALESCE(u.payout_locked, FALSE) = TRUE)
+              THEN (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint)
+            WHEN (COALESCE(u.manual_review_required, FALSE) = TRUE OR COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= $4)
+              THEN (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint)
             WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
               THEN (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint)
             ELSE 0::bigint
           END AS carry_out_coins,
           CASE
-            WHEN (COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= 6)
+            WHEN (COALESCE(u.payout_locked, FALSE) = TRUE)
               THEN 'blocked'
+            WHEN (COALESCE(u.manual_review_required, FALSE) = TRUE OR COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= $4)
+              THEN 'manual_review'
             WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
               THEN 'below_threshold'
             ELSE 'eligible'
@@ -1114,7 +1382,7 @@ export async function closeMonthlyPayoutCycle(opts: {
        FROM public.users u
        WHERE (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint) > 0
        ON CONFLICT (cycle_id, uid) DO NOTHING`,
-      [cycle.id, conversionRateLocked, minPayoutThresholdPi]
+      [cycle.id, conversionRateLocked, minPayoutThresholdPi, FRAUD_SCORE_MANUAL_REVIEW_THRESHOLD]
     );
 
     await client.query(
@@ -1220,12 +1488,18 @@ export async function generatePayoutJobs(opts: { cycleId?: number; monthKey?: st
       totalPayoutPi += payoutOriginal;
       cappedTotalPi += payoutCapped;
 
+      const fraudState = await evaluateUserFraud(String(row.uid), { client });
       const risk = evaluateUserPayoutRisk(
         {
           ...row,
           level: Number(row.level || 1),
           pi_wallet_identifier: row.pi_wallet_identifier,
           payout_fail_count: Number(row.payout_fail_count || 0),
+          suspicious: Boolean(fraudState.suspicious),
+          vpn_flag: Boolean(row.vpn_flag),
+          fraud_score: Number(fraudState.fraud_score || row.fraud_score || 0),
+          manual_review_required: Boolean(fraudState.manual_review_required),
+          payout_locked: Boolean(fraudState.payout_locked),
         },
         { monthlyCoins: Number(row.total_coins_for_settlement || 0) }
       );
@@ -1239,6 +1513,23 @@ export async function generatePayoutJobs(opts: { cycleId?: number; monthKey?: st
               SET status = $3
             WHERE cycle_id = $1 AND uid = $2`,
           [cycle.id, row.uid, nextStatus]
+        );
+
+        await client.query(
+          `INSERT INTO public.pi_payout_jobs (
+             cycle_id, uid, payout_pi_amount, wallet_identifier, status,
+             flagged, risk_reason, review_status, created_at, updated_at
+           ) VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,NOW(),NOW())
+           ON CONFLICT (cycle_id, uid) DO NOTHING`,
+          [
+            cycle.id,
+            row.uid,
+            payoutCapped,
+            row.pi_wallet_identifier || null,
+            nextStatus === "manual_review" ? "manual_review" : "blocked",
+            (risk.reasons || []).join(",") || (nextStatus === "manual_review" ? "manual_review_required" : "blocked_by_risk"),
+            nextStatus === "manual_review" ? "manual_review" : "auto",
+          ]
         );
         continue;
       }
@@ -1277,11 +1568,12 @@ export async function generatePayoutJobs(opts: { cycleId?: number; monthKey?: st
            payout_pi_amount,
            wallet_identifier,
            status,
+           flagged,
            risk_reason,
            review_status,
            created_at,
            updated_at
-         ) VALUES ($1, $2, $3, $4, 'queued', $5, 'auto', NOW(), NOW())
+         ) VALUES ($1, $2, $3, $4, 'queued', $5, $6, 'auto', NOW(), NOW())
          ON CONFLICT (cycle_id, uid) DO NOTHING
          RETURNING id`,
         [
@@ -1289,6 +1581,7 @@ export async function generatePayoutJobs(opts: { cycleId?: number; monthKey?: st
           row.uid,
           payoutCapped,
           row.pi_wallet_identifier || null,
+          payoutOriginal > payoutCapped,
           payoutOriginal > payoutCapped ? "user_cap_applied" : null,
         ]
       );
@@ -1398,6 +1691,9 @@ export async function adminListPayoutJobs(opts?: {
        j.payout_pi_amount,
        j.wallet_identifier,
        j.status,
+       j.flagged,
+       j.risk_reason,
+       j.review_status,
        j.txid,
        j.external_status,
        j.treasury_blocked,
@@ -1511,6 +1807,10 @@ export async function adminGetPayoutRuntimeConfig() {
     min_level_for_payout: MIN_LEVEL_FOR_PAYOUT,
     treasury_reserve_pi: TREASURY_RESERVE_PI,
     sending_wallet_min_required_pi: SENDING_WALLET_MIN_REQUIRED_PI,
+    fraud_score_suspicious_threshold: FRAUD_SCORE_SUSPICIOUS_THRESHOLD,
+    fraud_score_manual_review_threshold: FRAUD_SCORE_MANUAL_REVIEW_THRESHOLD,
+    fraud_score_payout_lock_threshold: FRAUD_SCORE_PAYOUT_LOCK_THRESHOLD,
+    payout_eligible_ads_per_day: PAYOUT_ELIGIBLE_ADS_PER_DAY,
   };
 }
 
@@ -1857,6 +2157,7 @@ export async function runPayoutWorkerBatch(opts?: { limit?: number }) {
 
     const userRes = await pool.query(
       `SELECT u.uid, u.pi_wallet_identifier, u.payout_locked, u.manual_review_required,
+              u.suspicious, u.vpn_flag, u.fraud_score, u.risk_flags,
               u.payout_fail_count, u.account_created_at, u.monthly_coins_earned, p.level
          FROM public.users u
          LEFT JOIN public.progress p ON p.uid = u.uid
@@ -2126,6 +2427,134 @@ export async function getUserByUid(uid: string) {
   );
   return rows[0] || null;
 }
+export async function incrementDailyUserStats(uid: string, delta?: {
+  coinsEarned?: number;
+  levelsCompleted?: number;
+  adsWatched?: number;
+}) {
+  const coinsEarned = Math.max(0, Math.floor(Number(delta?.coinsEarned || 0)));
+  const levelsCompleted = Math.max(0, Math.floor(Number(delta?.levelsCompleted || 0)));
+  const adsWatched = Math.max(0, Math.floor(Number(delta?.adsWatched || 0)));
+
+  if (coinsEarned <= 0 && levelsCompleted <= 0 && adsWatched <= 0) {
+    return { ok: true, skipped: true };
+  }
+
+  await pool.query(
+    `INSERT INTO public.daily_user_stats (
+       uid, date_key, coins_earned, levels_completed, ads_watched, created_at, updated_at
+     ) VALUES ($1, CURRENT_DATE, $2, $3, $4, NOW(), NOW())
+     ON CONFLICT (uid, date_key)
+     DO UPDATE SET
+       coins_earned = public.daily_user_stats.coins_earned + EXCLUDED.coins_earned,
+       levels_completed = public.daily_user_stats.levels_completed + EXCLUDED.levels_completed,
+       ads_watched = public.daily_user_stats.ads_watched + EXCLUDED.ads_watched,
+       updated_at = NOW()`,
+    [uid, coinsEarned, levelsCompleted, adsWatched]
+  );
+
+  return { ok: true };
+}
+
+export async function getDailyLeaderboard(limit = 20) {
+  const safeLimit = Math.max(1, Math.min(100, Math.floor(Number(limit || 20))));
+  const out = await pool.query(
+    `WITH ranked AS (
+       SELECT
+         ROW_NUMBER() OVER (ORDER BY s.coins_earned DESC, s.updated_at ASC, s.uid ASC)::int AS rank,
+         s.uid,
+         COALESCE(u.username, s.uid) AS username,
+         s.coins_earned
+       FROM public.daily_user_stats s
+       JOIN public.users u ON u.uid = s.uid
+       WHERE s.date_key = CURRENT_DATE
+         AND COALESCE(u.suspicious, FALSE) = FALSE
+         AND COALESCE(u.payout_locked, FALSE) = FALSE
+         AND COALESCE(u.manual_review_required, FALSE) = FALSE
+     )
+     SELECT rank, uid, username, coins_earned
+       FROM ranked
+      ORDER BY rank ASC
+      LIMIT $1`,
+    [safeLimit]
+  );
+  return { ok: true, rows: out.rows };
+}
+
+export async function getDailyLeaderboardMe(uid: string) {
+  const meUser = await pool.query(
+    `SELECT uid, COALESCE(username, uid) AS username
+       FROM public.users
+      WHERE uid = $1
+      LIMIT 1`,
+    [uid]
+  );
+  const username = String(meUser.rows[0]?.username || uid);
+
+  const own = await pool.query(
+    `SELECT COALESCE(coins_earned, 0)::int AS coins_earned
+       FROM public.daily_user_stats
+      WHERE uid = $1
+        AND date_key = CURRENT_DATE
+      LIMIT 1`,
+    [uid]
+  );
+  const coinsEarned = Number(own.rows[0]?.coins_earned || 0);
+
+  const ranked = await pool.query(
+    `WITH ranked AS (
+       SELECT
+         ROW_NUMBER() OVER (ORDER BY s.coins_earned DESC, s.updated_at ASC, s.uid ASC)::int AS rank,
+         s.uid
+       FROM public.daily_user_stats s
+       JOIN public.users u ON u.uid = s.uid
+       WHERE s.date_key = CURRENT_DATE
+         AND COALESCE(u.suspicious, FALSE) = FALSE
+         AND COALESCE(u.payout_locked, FALSE) = FALSE
+         AND COALESCE(u.manual_review_required, FALSE) = FALSE
+     )
+     SELECT rank
+       FROM ranked
+      WHERE uid = $1
+      LIMIT 1`,
+    [uid]
+  );
+
+  return {
+    ok: true,
+    row: {
+      rank: ranked.rows[0]?.rank != null ? Number(ranked.rows[0].rank) : null,
+      uid,
+      username,
+      coins_earned: coinsEarned,
+    },
+  };
+}
+
+export async function getDailyLeaderboardRaw(limit = 100) {
+  const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit || 100))));
+  const out = await pool.query(
+    `SELECT
+       s.uid,
+       COALESCE(u.username, s.uid) AS username,
+       s.date_key,
+       s.coins_earned,
+       s.levels_completed,
+       s.ads_watched,
+       s.updated_at,
+       COALESCE(u.suspicious, FALSE) AS suspicious,
+       COALESCE(u.payout_locked, FALSE) AS payout_locked,
+       COALESCE(u.manual_review_required, FALSE) AS manual_review_required
+     FROM public.daily_user_stats s
+     LEFT JOIN public.users u ON u.uid = s.uid
+     WHERE s.date_key = CURRENT_DATE
+     ORDER BY s.coins_earned DESC, s.updated_at ASC, s.uid ASC
+     LIMIT $1`,
+    [safeLimit]
+  );
+  return { ok: true, rows: out.rows };
+}
+
 export async function addCoins(uid: string, delta: number) {
   const d = Number(delta || 0);
 
@@ -2142,6 +2571,10 @@ export async function addCoins(uid: string, delta: number) {
   `,
     [uid, d]
   );
+  if (d > 0) {
+    try { await incrementDailyUserStats(uid, { coinsEarned: d }); } catch {}
+  }
+
   return rows[0];
 }
 
@@ -2600,11 +3033,17 @@ export async function adminListUsers({
   limit,
   offset,
   suspiciousOnly,
+  vpnOnly,
+  manualReviewOnly,
+  payoutLockedOnly,
 }: {
   search?: string;
   limit: number;
   offset: number;
   suspiciousOnly?: boolean;
+  vpnOnly?: boolean;
+  manualReviewOnly?: boolean;
+  payoutLockedOnly?: boolean;
 }) {
   const values: any[] = [];
   const where: string[] = [];
@@ -2615,8 +3054,11 @@ export async function adminListUsers({
   }
 
   if (suspiciousOnly) {
-    where.push(`(COALESCE(suspicious, FALSE) = TRUE OR COALESCE(vpn_flag, FALSE) = TRUE OR COALESCE(fraud_score, 0) >= 6)`);
+    where.push(`(COALESCE(suspicious, FALSE) = TRUE OR COALESCE(vpn_flag, FALSE) = TRUE OR COALESCE(fraud_score, 0) >= ${FRAUD_SCORE_MANUAL_REVIEW_THRESHOLD})`);
   }
+  if (vpnOnly) where.push(`COALESCE(vpn_flag, FALSE) = TRUE`);
+  if (manualReviewOnly) where.push(`COALESCE(manual_review_required, FALSE) = TRUE`);
+  if (payoutLockedOnly) where.push(`COALESCE(payout_locked, FALSE) = TRUE`);
 
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
@@ -2667,6 +3109,48 @@ export async function adminGetUser(uid: string) {
   };
 }
 
+export async function adminSetUserPayoutLock(uid: string, locked: boolean) {
+  const { rows } = await pool.query(
+    `UPDATE public.users
+        SET payout_locked = $2,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING uid, payout_locked, suspicious, manual_review_required, fraud_score, risk_flags`,
+    [uid, locked]
+  );
+  if (!rows[0]) throw new Error("user_not_found");
+  return { ok: true, row: rows[0] };
+}
+
+export async function adminSetUserSuspicious(uid: string, suspicious: boolean) {
+  const { rows } = await pool.query(
+    `UPDATE public.users
+        SET suspicious = $2,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING uid, payout_locked, suspicious, manual_review_required, fraud_score, risk_flags`,
+    [uid, suspicious]
+  );
+  if (!rows[0]) throw new Error("user_not_found");
+  return { ok: true, row: rows[0] };
+}
+
+export async function adminSetUserManualReview(uid: string, manualReview: boolean) {
+  const { rows } = await pool.query(
+    `UPDATE public.users
+        SET manual_review_required = $2,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING uid, payout_locked, suspicious, manual_review_required, fraud_score, risk_flags`,
+    [uid, manualReview]
+  );
+  if (!rows[0]) throw new Error("user_not_found");
+  return { ok: true, row: rows[0] };
+}
+
+export async function adminReevaluateUserFraud(uid: string) {
+  return evaluateUserFraud(uid);
+}
 export async function adminResetFreeCounters(uid: string) {
   const { rows } = await pool.query(
     `
