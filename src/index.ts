@@ -231,7 +231,6 @@ if (firstRecoverableMissedDay) {
   };
 }
     res.json({
-      ok: true,
 
       user: user
         ? {
@@ -262,8 +261,7 @@ if (firstRecoverableMissedDay) {
             invited_usernames: invitedUsernames,
             pi_wallet_identifier: user.pi_wallet_identifier ?? null,
             wallet_verified: Boolean(user.wallet_verified),
-            wallet_last_updated_at: user.wallet_last_updated_at ?? null,
-          }
+            wallet_last_updated_at: user.wallet_last_updated_at ?? null,          }
         : null,
 
       progress: progress
@@ -368,7 +366,6 @@ app.post("/api/user/set-wallet", async (req, res) => {
     }
 
     res.json({
-      ok: true,
       duplicate_in_use: (duplicateRes.rowCount || 0) > 0,
       suspicious_wallet_cluster: sameWalletCount >= 3,
     });
@@ -383,7 +380,6 @@ app.get("/api/invite/me", async (req, res) => {
     const out = await getInviteSummary(uid);
 
     res.json({
-      ok: true,
       ...out,
       invite_link: `https://pi-maze.com/?invite=${encodeURIComponent(out.invite_code)}`
     });
@@ -467,6 +463,10 @@ function rewardForDay(day:number){
 
 function isoDateUTC(input: Date | string) {
   return new Date(input).toISOString().slice(0, 10);
+}
+
+function nextUtcDayStartMs(now = new Date()) {
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0);
 }
 
 function dayDiffFromIsoDate(lastIsoDate: string, now = new Date()) {
@@ -588,7 +588,6 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
     );
 
     res.json({
-      ok: true,
       reward,
       user: updated.rows[0]
     });
@@ -673,7 +672,6 @@ app.post("/api/daily-reward/recover", async (req, res) => {
     );
 
     return res.json({
-      ok: true,
       recoveredDay: missedDay,
       coinsAwarded: rewardCoins,
       user: updatedRes.rows[0],
@@ -775,7 +773,6 @@ app.post("/api/daily-reward/claim", async (req, res) => {
     );
 
     return res.json({
-      ok: true,
       day: targetDay,
       coinsAwarded: rewardCoins,
       mysteryChestReady,
@@ -903,7 +900,6 @@ app.post("/api/rewards/recover-day", async (req, res) => {
     );
 
     res.json({
-      ok: true,
       recoveredDay: day,
       coinsAwarded: coins,
       mysteryChestReady,
@@ -1173,7 +1169,9 @@ res.json(out);
 app.get("/api/leaderboard/daily", async (req, res) => {
   try {
     const out = await getDailyLeaderboard(20);
-    res.json({ ok: true, rows: out.rows || [] });
+    const serverTimeMs = Date.now();
+    const nextDailyResetAtMs = nextUtcDayStartMs(new Date(serverTimeMs));
+    res.json({ ok: true, rows: out.rows || [], server_time_ms: serverTimeMs, next_daily_reset_at_ms: nextDailyResetAtMs });
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message });
   }
@@ -1183,7 +1181,9 @@ app.get("/api/leaderboard/daily/me", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
     const out = await getDailyLeaderboardMe(uid);
-    res.json({ ok: true, row: out.row });
+    const serverTimeMs = Date.now();
+    const nextDailyResetAtMs = nextUtcDayStartMs(new Date(serverTimeMs));
+    res.json({ ok: true, row: out.row, server_time_ms: serverTimeMs, next_daily_reset_at_ms: nextDailyResetAtMs });
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message });
   }
@@ -1390,7 +1390,6 @@ app.post("/api/restart", async (req, res) => {
     );
 
     res.json({
-      ok: true,
       free_restarts_used: updatedProgress.rows[0].free_restarts_used,
       restarts_balance: updatedUser.rows[0].restarts_balance,
       coins: updatedUser.rows[0].coins,
@@ -1462,7 +1461,6 @@ app.post("/api/rewards/daily-claim", async (req, res) => {
     try { await recalcAndStoreMonthlyRate(uid); } catch {}
 
     res.json({
-      ok: true,
       day: plan.nextDay,
       coins: reward,
       user: updated.rows[0],
@@ -1588,7 +1586,6 @@ app.post("/api/skip", async (req, res) => {
     );
 
     res.json({
-      ok: true,
       free_skips_used: updatedProgress.rows[0].free_skips_used,
       skips_balance: updatedUser.rows[0].skips_balance,
       coins: updatedUser.rows[0].coins,
@@ -1718,7 +1715,6 @@ app.post("/api/hint", async (req, res) => {
     );
 
     res.json({
-      ok: true,
       free_hints_used: updatedProgress.rows[0].free_hints_used,
       hints_balance: updatedUser.rows[0].hints_balance,
       coins: updatedUser.rows[0].coins,
@@ -2122,6 +2118,11 @@ async function start() {
 }
 
 start();
+
+
+
+
+
 
 
 
