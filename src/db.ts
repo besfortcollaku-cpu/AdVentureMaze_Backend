@@ -2468,9 +2468,6 @@ export async function getDailyLeaderboard(limit = 20) {
        FROM public.daily_user_stats s
        JOIN public.users u ON u.uid = s.uid
        WHERE s.date_key = CURRENT_DATE
-         AND COALESCE(u.suspicious, FALSE) = FALSE
-         AND COALESCE(u.payout_locked, FALSE) = FALSE
-         AND COALESCE(u.manual_review_required, FALSE) = FALSE
      )
      SELECT rank, uid, username, coins_earned
        FROM ranked
@@ -3719,31 +3716,5 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
