@@ -2483,13 +2483,23 @@ export async function getDailyLeaderboard(limit = 20) {
 
 export async function getDailyLeaderboardMe(uid: string) {
   const meUser = await pool.query(
-    `SELECT uid, COALESCE(username, uid) AS username
+    `SELECT uid,
+            COALESCE(username, uid) AS username,
+            COALESCE(suspicious, FALSE) AS suspicious,
+            COALESCE(payout_locked, FALSE) AS payout_locked,
+            COALESCE(manual_review_required, FALSE) AS manual_review_required
        FROM public.users
       WHERE uid = $1
       LIMIT 1`,
     [uid]
   );
-  const username = String(meUser.rows[0]?.username || uid);
+
+  const userRow = meUser.rows[0] || {};
+  const username = String(userRow?.username || uid);
+  const publicEligible =
+    !Boolean(userRow?.suspicious) &&
+    !Boolean(userRow?.payout_locked) &&
+    !Boolean(userRow?.manual_review_required);
 
   const own = await pool.query(
     `SELECT COALESCE(coins_earned, 0)::int AS coins_earned
@@ -2501,17 +2511,13 @@ export async function getDailyLeaderboardMe(uid: string) {
   );
   const coinsEarned = Number(own.rows[0]?.coins_earned || 0);
 
-  const ranked = await pool.query(
+  const rankedAll = await pool.query(
     `WITH ranked AS (
        SELECT
          ROW_NUMBER() OVER (ORDER BY s.coins_earned DESC, s.updated_at ASC, s.uid ASC)::int AS rank,
          s.uid
        FROM public.daily_user_stats s
-       JOIN public.users u ON u.uid = s.uid
        WHERE s.date_key = CURRENT_DATE
-         AND COALESCE(u.suspicious, FALSE) = FALSE
-         AND COALESCE(u.payout_locked, FALSE) = FALSE
-         AND COALESCE(u.manual_review_required, FALSE) = FALSE
      )
      SELECT rank
        FROM ranked
@@ -2520,13 +2526,23 @@ export async function getDailyLeaderboardMe(uid: string) {
     [uid]
   );
 
+  const publicReason = !publicEligible
+    ? (Boolean(userRow?.payout_locked)
+        ? "payout_locked"
+        : Boolean(userRow?.manual_review_required)
+          ? "manual_review_required"
+          : "suspicious")
+    : null;
+
   return {
     ok: true,
     row: {
-      rank: ranked.rows[0]?.rank != null ? Number(ranked.rows[0].rank) : null,
+      rank: rankedAll.rows[0]?.rank != null ? Number(rankedAll.rows[0].rank) : null,
       uid,
       username,
       coins_earned: coinsEarned,
+      public_eligible: publicEligible,
+      public_exclusion_reason: publicReason,
     },
   };
 }
@@ -3703,6 +3719,8 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
+
+
 
 
 
