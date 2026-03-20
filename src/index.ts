@@ -1443,6 +1443,7 @@ app.post("/api/restart", async (req, res) => {
     );
 
     res.json({
+      ok: true,
       free_restarts_used: updatedProgress.rows[0].free_restarts_used,
       restarts_balance: updatedUser.rows[0].restarts_balance,
       coins: updatedUser.rows[0].coins,
@@ -1639,6 +1640,7 @@ app.post("/api/skip", async (req, res) => {
     );
 
     res.json({
+      ok: true,
       free_skips_used: updatedProgress.rows[0].free_skips_used,
       skips_balance: updatedUser.rows[0].skips_balance,
       coins: updatedUser.rows[0].coins,
@@ -1768,6 +1770,7 @@ app.post("/api/hint", async (req, res) => {
     );
 
     res.json({
+      ok: true,
       free_hints_used: updatedProgress.rows[0].free_hints_used,
       hints_balance: updatedUser.rows[0].hints_balance,
       coins: updatedUser.rows[0].coins,
@@ -2171,6 +2174,7 @@ async function start() {
 }
 
 start();
+
 
 
 
