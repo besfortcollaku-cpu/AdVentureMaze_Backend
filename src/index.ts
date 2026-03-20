@@ -592,6 +592,7 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
     );
 
     res.json({
+      ok: true,
       reward,
       user: updated.rows[0]
     });
@@ -2174,6 +2175,7 @@ async function start() {
 }
 
 start();
+
 
 
 
