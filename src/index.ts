@@ -1,4 +1,4 @@
-process.on("unhandledRejection", (reason) => {
+﻿process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:", reason);
 });
 
@@ -72,7 +72,7 @@ import {
   adminSetUserSuspicious,
   adminSetUserManualReview,
   adminReevaluateUserFraud,
-  // ✅ charts1
+  // âœ… charts1
   adminChartCoins,
   adminChartActiveUsers,
 } from "./db";
@@ -242,7 +242,7 @@ if (firstRecoverableMissedDay) {
             username: user.username,
             coins: user.coins,
 
-            // 🔹 paid balances (wallet)
+            // ðŸ”¹ paid balances (wallet)
             restarts_balance: user.restarts_balance ?? 0,
             skips_balance: user.skips_balance ?? 0,
             hints_balance: user.hints_balance ?? 0,
@@ -777,6 +777,7 @@ app.post("/api/daily-reward/claim", async (req, res) => {
     );
 
     return res.json({
+      ok: true,
       day: targetDay,
       coinsAwarded: rewardCoins,
       mysteryChestReady,
@@ -904,6 +905,7 @@ app.post("/api/rewards/recover-day", async (req, res) => {
     );
 
     res.json({
+      ok: true,
       recoveredDay: day,
       coinsAwarded: coins,
       mysteryChestReady,
@@ -960,7 +962,7 @@ app.patch("/api/user/username", async (req, res) => {
     username = username.trim();
 
     if (username.length < 3 || username.length > 20) {
-      return res.status(400).json({ ok: false, error: "Username must be 3–20 characters" });
+      return res.status(400).json({ ok: false, error: "Username must be 3â€“20 characters" });
     }
 
     // allow only letters, numbers, underscore
@@ -2016,7 +2018,7 @@ app.get("/admin/online", async (req,res)=>{
   }
 });
 
-/* ✅ NEW: admin users list + detail (Fix 2) */
+/* âœ… NEW: admin users list + detail (Fix 2) */
 app.get("/admin/users", async (req,res)=>{
   try{
     requireAdmin(req);
@@ -2094,7 +2096,7 @@ app.post("/admin/users/:uid/fraud-recompute", async (req,res)=>{
   }
 });
 
-/* ✅ NEW: charts endpoints (Step 1 – “A: last 7 days”) */
+/* âœ… NEW: charts endpoints (Step 1 â€“ â€œA: last 7 daysâ€) */
 app.get("/admin/charts/coins", async (req,res)=>{
   try{
     requireAdmin(req);
@@ -2118,7 +2120,7 @@ app.get("/admin/charts/active", async (req,res)=>{
 });
 
 
-// ✅ ADMIN: delete user completely
+// âœ… ADMIN: delete user completely
 app.delete("/admin/users/:uid", async (req, res) => {
   try {
     requireAdmin(req);
@@ -2169,6 +2171,8 @@ async function start() {
 }
 
 start();
+
+
 
 
 
