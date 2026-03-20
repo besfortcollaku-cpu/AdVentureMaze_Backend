@@ -48,6 +48,10 @@ import {
   getDailyLeaderboard,
   getDailyLeaderboardMe,
   getDailyLeaderboardRaw,
+  snapshotDailyLeaderboardRewards,
+  getDailyLeaderboardRewardMe,
+  claimDailyLeaderboardReward,
+  adminGetDailyLeaderboardRewardRaw,
   resetDailyAdCounters,
   ensureInviteCode,
   getInviteSummary,
@@ -1189,6 +1193,53 @@ app.get("/api/leaderboard/daily/me", async (req, res) => {
   }
 });
 
+
+app.get("/api/leaderboard/daily-reward/me", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const out = await getDailyLeaderboardRewardMe(uid);
+    res.json(out);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/leaderboard/daily-reward/claim", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const out = await claimDailyLeaderboardReward(uid);
+    if (!out?.ok) {
+      return res.status(400).json(out);
+    }
+    res.json(out);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/admin/leaderboard/daily-reward/snapshot", async (req, res) => {
+  try {
+    requireAdmin(req);
+    const dateKey = req.query.date ? String(req.query.date) : (req.body?.date ? String(req.body.date) : null);
+    const out = await snapshotDailyLeaderboardRewards({ dateKey });
+    res.json(out);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/admin/leaderboard/daily-reward/raw", async (req, res) => {
+  try {
+    requireAdmin(req);
+    const dateKey = req.query.date ? String(req.query.date) : null;
+    const limit = req.query.limit ? Number(req.query.limit) : 100;
+    const out = await adminGetDailyLeaderboardRewardRaw({ dateKey, limit });
+    res.json(out);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/admin/leaderboard/daily/raw", async (req, res) => {
   try {
     requireAdmin(req);
@@ -2118,6 +2169,8 @@ async function start() {
 }
 
 start();
+
+
 
 
 

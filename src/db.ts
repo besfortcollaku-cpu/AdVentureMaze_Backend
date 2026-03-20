@@ -261,6 +261,27 @@ await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_
       ON public.daily_user_stats (date_key, coins_earned DESC);
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.daily_leaderboard_snapshots (
+      id BIGSERIAL PRIMARY KEY,
+      date_key DATE NOT NULL,
+      uid TEXT NOT NULL,
+      rank INTEGER NOT NULL,
+      coins_earned INTEGER NOT NULL,
+      reward_coins INTEGER NOT NULL DEFAULT 0,
+      eligible BOOLEAN NOT NULL DEFAULT TRUE,
+      claimed BOOLEAN NOT NULL DEFAULT FALSE,
+      claimed_at TIMESTAMP NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE(date_key, uid)
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS daily_leaderboard_snapshots_date_rank_idx
+      ON public.daily_leaderboard_snapshots (date_key, rank);
+  `);
+
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS reward_claims (
@@ -2568,6 +2589,244 @@ export async function getDailyLeaderboardRaw(limit = 100) {
   return { ok: true, rows: out.rows };
 }
 
+const DAILY_RANKING_REWARD_TABLE: Record<number, number> = {
+  1: 120,
+  2: 100,
+  3: 80,
+  4: 60,
+  5: 50,
+  6: 40,
+  7: 35,
+  8: 30,
+  9: 25,
+ 10: 20,
+};
+
+function parseDateKey(input?: string | null) {
+  const raw = String(input || "").trim();
+  if (!raw) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) throw new Error("invalid_date_key");
+  return raw;
+}
+
+export async function snapshotDailyLeaderboardRewards(opts?: { dateKey?: string | null }) {
+  const dateKey = parseDateKey(opts?.dateKey);
+  const targetDateExpr = dateKey ? "$1::date" : "(CURRENT_DATE - INTERVAL '1 day')::date";
+  const params = dateKey ? [dateKey] : [];
+
+  const snapshotSql = `WITH ranked AS (
+      SELECT
+        s.uid,
+        s.coins_earned::int AS coins_earned,
+        ROW_NUMBER() OVER (ORDER BY s.coins_earned DESC, s.updated_at ASC, s.uid ASC)::int AS rank
+      FROM public.daily_user_stats s
+      JOIN public.users u ON u.uid = s.uid
+      WHERE s.date_key = ${targetDateExpr}
+        AND COALESCE(u.suspicious, FALSE) = FALSE
+        AND COALESCE(u.payout_locked, FALSE) = FALSE
+        AND COALESCE(u.manual_review_required, FALSE) = FALSE
+    ), top10 AS (
+      SELECT * FROM ranked WHERE rank <= 10
+    )
+    INSERT INTO public.daily_leaderboard_snapshots (
+      date_key, uid, rank, coins_earned, reward_coins, eligible, claimed, created_at
+    )
+    SELECT
+      ${targetDateExpr} AS date_key,
+      t.uid,
+      t.rank,
+      t.coins_earned,
+      CASE t.rank
+        WHEN 1 THEN 120
+        WHEN 2 THEN 100
+        WHEN 3 THEN 80
+        WHEN 4 THEN 60
+        WHEN 5 THEN 50
+        WHEN 6 THEN 40
+        WHEN 7 THEN 35
+        WHEN 8 THEN 30
+        WHEN 9 THEN 25
+        WHEN 10 THEN 20
+        ELSE 0
+      END::int AS reward_coins,
+      TRUE AS eligible,
+      FALSE AS claimed,
+      NOW() AS created_at
+    FROM top10 t
+    ON CONFLICT (date_key, uid) DO NOTHING`;
+
+  await pool.query(snapshotSql, params);
+
+  const summarySql = `SELECT
+      date_key,
+      COUNT(*)::int AS rows_count,
+      COALESCE(SUM(reward_coins), 0)::int AS total_reward_coins
+    FROM public.daily_leaderboard_snapshots
+    WHERE date_key = ${targetDateExpr}
+    GROUP BY date_key`;
+
+  const summary = await pool.query(summarySql, params);
+
+  return {
+    ok: true,
+    date_key: summary.rows[0]?.date_key || (dateKey || null),
+    rows_count: Number(summary.rows[0]?.rows_count || 0),
+    total_reward_coins: Number(summary.rows[0]?.total_reward_coins || 0),
+  };
+}
+
+export async function getDailyLeaderboardRewardMe(uid: string) {
+  const out = await pool.query(
+    `SELECT date_key, rank, reward_coins, claimed, claimed_at
+       FROM public.daily_leaderboard_snapshots
+      WHERE uid = $1
+        AND eligible = TRUE
+        AND claimed = FALSE
+        AND reward_coins > 0
+      ORDER BY date_key DESC, rank ASC
+      LIMIT 1`,
+    [uid]
+  );
+
+  if (!out.rows.length) return { ok: true, available: false };
+
+  return {
+    ok: true,
+    available: true,
+    row: {
+      date_key: out.rows[0].date_key,
+      rank: Number(out.rows[0].rank || 0),
+      reward_coins: Number(out.rows[0].reward_coins || 0),
+      claimed: Boolean(out.rows[0].claimed),
+      claimed_at: out.rows[0].claimed_at || null,
+    },
+  };
+}
+
+export async function claimDailyLeaderboardReward(uid: string) {
+  await pool.query("BEGIN");
+  try {
+    const userLock = await pool.query(
+      `SELECT uid, coins,
+              COALESCE(suspicious, FALSE) AS suspicious,
+              COALESCE(payout_locked, FALSE) AS payout_locked,
+              COALESCE(manual_review_required, FALSE) AS manual_review_required
+         FROM public.users
+        WHERE uid = $1
+        FOR UPDATE`,
+      [uid]
+    );
+
+    if (!userLock.rows.length) {
+      await pool.query("ROLLBACK");
+      return { ok: false, error: "user_not_found" };
+    }
+
+    if (Boolean(userLock.rows[0].suspicious) || Boolean(userLock.rows[0].payout_locked) || Boolean(userLock.rows[0].manual_review_required)) {
+      await pool.query("ROLLBACK");
+      return { ok: false, error: "no_reward_available" };
+    }
+
+    const rewardRow = await pool.query(
+      `SELECT id, date_key, rank, reward_coins
+         FROM public.daily_leaderboard_snapshots
+        WHERE uid = $1
+          AND eligible = TRUE
+          AND claimed = FALSE
+          AND reward_coins > 0
+        ORDER BY date_key DESC, rank ASC
+        LIMIT 1
+        FOR UPDATE`,
+      [uid]
+    );
+
+    if (!rewardRow.rows.length) {
+      await pool.query("ROLLBACK");
+      return { ok: false, error: "no_reward_available" };
+    }
+
+    const row = rewardRow.rows[0];
+    const rewardCoins = Number(row.reward_coins || 0);
+    if (rewardCoins <= 0) {
+      await pool.query("ROLLBACK");
+      return { ok: false, error: "no_reward_available" };
+    }
+
+    const updatedUser = await pool.query(
+      `UPDATE public.users
+          SET coins = COALESCE(coins,0) + $2,
+              monthly_coins_earned = COALESCE(monthly_coins_earned,0) + $2,
+              lifetime_coins_earned = COALESCE(lifetime_coins_earned,0) + $2,
+              updated_at = NOW()
+        WHERE uid = $1
+      RETURNING *`,
+      [uid, rewardCoins]
+    );
+
+    await pool.query(
+      `UPDATE public.daily_leaderboard_snapshots
+          SET claimed = TRUE,
+              claimed_at = NOW()
+        WHERE id = $1`,
+      [row.id]
+    );
+
+    await pool.query("COMMIT");
+
+    try {
+      await recalcAndStoreMonthlyRate(uid);
+    } catch {}
+
+    try {
+      await auditRewardEvent({
+        uid,
+        eventType: "daily_leaderboard_reward",
+        eventKey: `${row.date_key}:#${row.rank}`,
+        amountCoins: rewardCoins,
+        accepted: true,
+      });
+    } catch {}
+
+    return {
+      ok: true,
+      rewardCoins,
+      rank: Number(row.rank || 0),
+      dateKey: String(row.date_key),
+      user: updatedUser.rows[0] || null,
+    };
+  } catch (e) {
+    await pool.query("ROLLBACK");
+    throw e;
+  }
+}
+
+export async function adminGetDailyLeaderboardRewardRaw(opts?: { dateKey?: string | null; limit?: number }) {
+  const dateKey = parseDateKey(opts?.dateKey);
+  const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(opts?.limit || 100))));
+  const out = await pool.query(
+    `SELECT
+       s.id,
+       s.date_key,
+       s.uid,
+       COALESCE(u.username, s.uid) AS username,
+       s.rank,
+       s.coins_earned,
+       s.reward_coins,
+       s.eligible,
+       s.claimed,
+       s.claimed_at,
+       s.created_at
+     FROM public.daily_leaderboard_snapshots s
+     LEFT JOIN public.users u ON u.uid = s.uid
+     WHERE ($1::date IS NULL OR s.date_key = $1::date)
+     ORDER BY s.date_key DESC, s.rank ASC, s.uid ASC
+     LIMIT $2`,
+    [dateKey, safeLimit]
+  );
+
+  return { ok: true, rows: out.rows };
+}
+
 export async function addCoins(uid: string, delta: number) {
   const d = Number(delta || 0);
 
@@ -3716,5 +3975,6 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
+
 
 
