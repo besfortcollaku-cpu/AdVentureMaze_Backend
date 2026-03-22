@@ -688,6 +688,39 @@ export function getMonthKey(date = new Date()) {
   return monthKeyForDate(date);
 }
 
+export function clampRpAward(requestedAmount: number, currentDailyRp: number, cap: number = DAILY_RP_CAP) {
+  const requested = Math.max(0, Math.trunc(Number(requestedAmount || 0)));
+  const current = Math.max(0, Math.trunc(Number(currentDailyRp || 0)));
+  const limit = Math.max(0, Math.trunc(Number(cap || 0)));
+  if (!requested || !limit) return 0;
+  const remaining = Math.max(0, limit - current);
+  return Math.min(requested, remaining);
+}
+
+export function sumMonthlyPayoutPi(rows: Array<{ payout_pi: string | number }>) {
+  return rows.reduce((sum, row) => sum + Math.max(0, Number(row?.payout_pi || 0)), 0);
+}
+
+export function verifyMonthlyPayoutRows(
+  rows: Array<{ payout_pi: string | number }>,
+  totalPoolPi: number,
+  tolerance: number = 0.000001
+) {
+  const safePool = Math.max(0, Number(totalPoolPi || 0));
+  const safeTolerance = Math.max(0, Number(tolerance || 0));
+  const totalPayoutPi = sumMonthlyPayoutPi(rows);
+
+  if (rows.some((row) => Number(row?.payout_pi || 0) < 0)) {
+    throw new Error("invalid_negative_payout");
+  }
+
+  if (totalPayoutPi - safePool > safeTolerance) {
+    throw new Error("invalid_payout_total_exceeds_pool");
+  }
+
+  return { totalPayoutPi };
+}
+
 export type MonthlyPiPayoutRow = {
   uid: string;
   rp_score: number;
@@ -4215,6 +4248,22 @@ function normalizeAdminStats(raw: any) {
     currentMonthPayoutRows: raw?.currentMonthPayoutRows ?? raw?.current_month_payout_rows ?? null,
     levelsCompleted: raw?.levelsCompleted ?? raw?.level_complete_count ?? null,
     currentMonthKey: raw?.currentMonthKey ?? raw?.current_month_key ?? null,
+    totalUsersWithScore: raw?.totalUsersWithScore ?? raw?.total_users_with_score ?? null,
+    totalCurrentScore: raw?.totalCurrentScore ?? raw?.total_current_score ?? raw?.score_total ?? null,
+    alreadySettledCurrentMonth: raw?.alreadySettledCurrentMonth ?? raw?.already_settled_current_month ?? null,
+    lastSettlementMonthKey: raw?.lastSettlementMonthKey ?? raw?.last_settlement_month_key ?? null,
+    lastSettlementTotalPayoutPi: raw?.lastSettlementTotalPayoutPi ?? raw?.last_settlement_total_payout_pi ?? null,
+    lastSettlementEligibleUsers: raw?.lastSettlementEligibleUsers ?? raw?.last_settlement_eligible_users ?? null,
+    settlementStatus: raw?.settlementStatus ?? raw?.settlement_status ?? null,
+    duplicateSettlementRisk: raw?.duplicateSettlementRisk ?? raw?.duplicate_settlement_risk ?? null,
+    poolMismatchWarning: raw?.poolMismatchWarning ?? raw?.pool_mismatch_warning ?? null,
+    orphanPayoutRowsWarning: raw?.orphanPayoutRowsWarning ?? raw?.orphan_payout_rows_warning ?? null,
+    usersAtDailyCap: raw?.usersAtDailyCap ?? raw?.users_at_daily_cap ?? null,
+    usersWithScoreButNotEligible: raw?.usersWithScoreButNotEligible ?? raw?.users_with_score_but_not_eligible ?? null,
+    repeatLevelRpBlocksToday: raw?.repeatLevelRpBlocksToday ?? raw?.repeat_level_rp_blocks_today ?? null,
+    negativeBalanceAttemptsBlocked: raw?.negativeBalanceAttemptsBlocked ?? raw?.negative_balance_attempts_blocked ?? null,
+    manualScoreAdjustmentsThisMonth: raw?.manualScoreAdjustmentsThisMonth ?? raw?.manual_score_adjustments_this_month ?? null,
+    manualCoinsAdjustmentsThisMonth: raw?.manualCoinsAdjustmentsThisMonth ?? raw?.manual_coins_adjustments_this_month ?? null,
   };
 }
 
@@ -4583,6 +4632,8 @@ export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }
   const users = await pool.query(`SELECT COUNT(*) FROM public.users`);
   const coins = await pool.query(`SELECT COALESCE(SUM(mc_balance), 0)::bigint AS sum FROM public.users`);
   const score = await pool.query(`SELECT COALESCE(SUM(rp_score), 0)::bigint AS sum FROM public.users`);
+  const usersWithScore = await pool.query(`SELECT COUNT(*)::int AS c FROM public.users WHERE COALESCE(rp_score, 0) > 0`);
+  const usersAtDailyCapRes = await pool.query(`SELECT COUNT(*)::int AS c FROM public.users WHERE COALESCE(daily_rp, 0) >= $1`, [DAILY_RP_CAP]);
   const online = await pool.query(
     `
     SELECT COUNT(*) FROM sessions
@@ -4593,14 +4644,37 @@ export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }
   const levels = await pool.query(`SELECT COUNT(*) FROM level_rewards`);
   const currentMonthKey = normalizeMonthKey();
   const eligibleLeaderboard = await getEligibleLeaderboardUsers({ monthKey: currentMonthKey });
+  const scoredLeaderboard = await getMonthlyLeaderboardUsers({ eligibleOnly: false, monthKey: currentMonthKey });
   const currentPayoutRows = await pool.query(
-    `SELECT COUNT(*)::int AS c
+    `SELECT COUNT(*)::int AS c,
+            COALESCE(SUM(payout_pi), 0)::numeric(20,8) AS total_payout_pi
        FROM public.monthly_pi_payouts
       WHERE month_key = $1`,
     [currentMonthKey]
   );
+  const currentSettlementRun = await pool.query(
+    `SELECT month_key, status, pool_pi, eligible_users, total_score, total_payout_pi, updated_at
+       FROM public.monthly_settlement_runs
+      WHERE month_key = $1
+      LIMIT 1`,
+    [currentMonthKey]
+  );
+  const lastSettlementRun = await pool.query(
+    `SELECT month_key, status, pool_pi, eligible_users, total_score, total_payout_pi, updated_at
+       FROM public.monthly_settlement_runs
+      WHERE status = 'completed'
+      ORDER BY month_key DESC, updated_at DESC
+      LIMIT 1`
+  );
+  const adjustmentSummary = await pool.query(
+    `SELECT target, COUNT(*)::int AS c
+       FROM public.admin_adjustments
+      WHERE created_at >= date_trunc('month', NOW())
+      GROUP BY target`
+  );
 
   const eligibleUsers = eligibleLeaderboard.rows || [];
+  const scoredUsers = scoredLeaderboard.rows || [];
   const tierAssignments = eligibleUsers.length ? await assignRewardTiers(eligibleUsers) : [];
   const tierCounts = {
     champion: tierAssignments.filter((row) => row.tier_name === "A").length,
@@ -4608,18 +4682,52 @@ export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }
     advanced: tierAssignments.filter((row) => row.tier_name === "C").length,
     qualified: tierAssignments.filter((row) => row.tier_name === "D").length,
   };
+  const currentRun = currentSettlementRun.rows[0] || null;
+  const lastRun = lastSettlementRun.rows[0] || null;
+  const currentPayoutRowCount = Number(currentPayoutRows.rows[0]?.c || 0);
+  const currentPayoutTotal = Number(currentPayoutRows.rows[0]?.total_payout_pi || 0);
+  const duplicateSettlementRisk =
+    currentPayoutRowCount > 0 &&
+    String(currentRun?.status || "") !== "completed";
+  const orphanPayoutRowsWarning =
+    currentPayoutRowCount > 0 &&
+    !currentRun;
+  const expectedPool = Number(currentRun?.pool_pi ?? MONTHLY_PI_POOL);
+  const poolMismatchWarning =
+    currentPayoutRowCount > 0 &&
+    Math.abs(currentPayoutTotal - expectedPool) > 0.000001;
+  const adjustmentCounts = adjustmentSummary.rows.reduce((acc: any, row: any) => {
+    acc[String(row.target || "")] = Number(row.c || 0);
+    return acc;
+  }, {});
 
   return normalizeAdminStats({
     users_total: Number(users.rows[0].count),
     coins_total: Number(coins.rows[0].sum || 0),
     score_total: Number(score.rows[0].sum || 0),
+    total_users_with_score: Number(usersWithScore.rows[0]?.c || 0),
     online_now: Number(online.rows[0].count),
     payout_eligible_users: eligibleUsers.length,
+    total_current_score: scoredUsers.reduce((sum, row) => sum + Number(row.rp_score || 0), 0),
     totalEligibleScore: eligibleUsers.reduce((sum, row) => sum + Number(row.rp_score || 0), 0),
     current_season_pool: MONTHLY_PI_POOL,
-    current_month_payout_rows: Number(currentPayoutRows.rows[0]?.c || 0),
+    current_month_payout_rows: currentPayoutRowCount,
     level_complete_count: Number(levels.rows[0].count),
     current_month_key: currentMonthKey,
+    already_settled_current_month: Boolean(String(currentRun?.status || "") === "completed") || currentPayoutRowCount > 0,
+    last_settlement_month_key: lastRun?.month_key ?? null,
+    last_settlement_total_payout_pi: lastRun?.total_payout_pi != null ? Number(lastRun.total_payout_pi) : null,
+    last_settlement_eligible_users: lastRun?.eligible_users != null ? Number(lastRun.eligible_users) : null,
+    settlement_status: currentRun?.status ?? null,
+    duplicate_settlement_risk: duplicateSettlementRisk,
+    pool_mismatch_warning: poolMismatchWarning,
+    orphan_payout_rows_warning: orphanPayoutRowsWarning,
+    users_at_daily_cap: Number(usersAtDailyCapRes.rows[0]?.c || 0),
+    users_with_score_but_not_eligible: Math.max(0, scoredUsers.length - eligibleUsers.length),
+    repeat_level_rp_blocks_today: null,
+    negative_balance_attempts_blocked: null,
+    manual_score_adjustments_this_month: Number(adjustmentCounts.score || 0),
+    manual_coins_adjustments_this_month: Number(adjustmentCounts.coins || 0),
     tierCounts,
   });
 }

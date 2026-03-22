@@ -1473,7 +1473,7 @@ app.post("/api/restart", async (req, res) => {
       });
 
       if (reward?.already) {
-        throw new Error("Ad already claimed");
+        throw new Error("Ad reward already used");
       }
       usedAd = true;
 
@@ -1675,7 +1675,7 @@ app.post("/api/skip", async (req, res) => {
       });
 
       if (reward?.already) {
-        throw new Error("Ad already claimed");
+        throw new Error("Ad reward already used");
       }
       usedAd = true;
 
@@ -1808,7 +1808,7 @@ app.post("/api/hint", async (req, res) => {
       });
 
       if (reward?.already) {
-        throw new Error("Ad already claimed");
+        throw new Error("Ad reward already used");
       }
       usedAd = true;
 
