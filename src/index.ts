@@ -78,6 +78,7 @@ import {
   adminSetUserManualReview,
   adminReevaluateUserFraud,
   adminAdjustUserEconomy,
+  adminResetUserState,
   // âœ… charts1
   adminChartCoins,
   adminChartActiveUsers,
@@ -2187,6 +2188,24 @@ app.post("/admin/users/:uid/fraud-recompute", async (req,res)=>{
   try{
     requireAdmin(req);
     const out = await adminReevaluateUserFraud(String(req.params.uid));
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/reset-user", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const uid = String(req.body?.uid || "").trim();
+    const reason = String(req.body?.reason || "").trim();
+    if (!uid) throw new Error("missing_uid");
+    if (!reason) throw new Error("missing_reason");
+    const out = await adminResetUserState({
+      uid,
+      reason,
+      adminIdentity: null,
+    });
     res.json(out);
   }catch(e:any){
     res.status(400).json({ ok:false, error:e.message });

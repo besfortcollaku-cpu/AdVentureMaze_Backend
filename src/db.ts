@@ -4595,6 +4595,161 @@ export async function adminSetUserManualReview(uid: string, manualReview: boolea
 export async function adminReevaluateUserFraud(uid: string) {
   return evaluateUserFraud(uid);
 }
+
+async function tableExists(client: any, tableName: string) {
+  const out = await client.query(
+    `SELECT to_regclass($1) IS NOT NULL AS exists`,
+    [tableName]
+  );
+  return out.rows[0]?.exists === true;
+}
+
+async function columnExists(client: any, tableName: string, columnName: string) {
+  const [schema, table] = tableName.includes(".")
+    ? tableName.split(".", 2)
+    : ["public", tableName];
+  const out = await client.query(
+    `SELECT EXISTS (
+       SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema = $1
+          AND table_name = $2
+          AND column_name = $3
+     ) AS exists`,
+    [schema, table, columnName]
+  );
+  return out.rows[0]?.exists === true;
+}
+
+export async function adminResetUserState(opts: {
+  uid: string;
+  reason: string;
+  adminIdentity?: string | null;
+}) {
+  const uid = String(opts.uid || "").trim();
+  const reason = String(opts.reason || "").trim();
+  if (!uid) throw new Error("missing_uid");
+  if (!reason) throw new Error("missing_reason");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const userRes = await client.query(
+      `SELECT uid
+         FROM public.users
+        WHERE uid = $1
+        LIMIT 1
+        FOR UPDATE`,
+      [uid]
+    );
+    if (!userRes.rows[0]) {
+      throw new Error("user_not_found");
+    }
+
+    const userAssignments = [
+      `coins = 0`,
+      `mc_balance = 0`,
+      `rp_score = 0`,
+      `daily_rp = 0`,
+      `free_restarts_used = 0`,
+      `free_skips_used = 0`,
+      `free_hints_used = 0`,
+      `restarts_balance = 0`,
+      `skips_balance = 0`,
+      `hints_balance = 0`,
+      `daily_streak = 0`,
+      `last_daily_claim_date = NULL`,
+      `monthly_coins_earned = 0`,
+      `monthly_login_days = 0`,
+      `monthly_levels_completed = 0`,
+      `monthly_skips_used = 0`,
+      `monthly_hints_used = 0`,
+      `monthly_restarts_used = 0`,
+      `monthly_ads_watched = 0`,
+      `monthly_surprise_boxes_opened = 0`,
+      `monthly_mystery_boxes_opened = 0`,
+      `monthly_valid_invites = 0`,
+      `monthly_max_win_streak = 0`,
+      `monthly_rate_breakdown = '{}'::jsonb`,
+      `monthly_final_rate = 50`,
+      `mystery_box_pending = FALSE`,
+      `updated_at = NOW()`,
+    ];
+
+    if (await columnExists(client, "public.users", "activity_streak")) {
+      userAssignments.push(`activity_streak = 0`);
+    }
+    if (await columnExists(client, "public.users", "last_active_day_key")) {
+      userAssignments.push(`last_active_day_key = NULL`);
+    }
+
+    await client.query(
+      `UPDATE public.users
+          SET ${userAssignments.join(", ")}
+        WHERE uid = $1`,
+      [uid]
+    );
+
+    if (await tableExists(client, "public.user_level_monthly_rp")) {
+      await client.query(`DELETE FROM public.user_level_monthly_rp WHERE uid = $1`, [uid]);
+    }
+    if (await tableExists(client, "public.user_daily_quests")) {
+      await client.query(`DELETE FROM public.user_daily_quests WHERE uid = $1`, [uid]);
+    }
+    if (await tableExists(client, "public.monthly_pi_payouts")) {
+      await client.query(`DELETE FROM public.monthly_pi_payouts WHERE uid = $1`, [uid]);
+    }
+    if (await tableExists(client, "public.admin_adjustments")) {
+      await client.query(`DELETE FROM public.admin_adjustments WHERE uid = $1`, [uid]);
+    }
+
+    if (await tableExists(client, "public.progress")) {
+      const progressAssignments: string[] = [];
+      if (await columnExists(client, "public.progress", "level")) progressAssignments.push(`level = 1`);
+      if (await columnExists(client, "public.progress", "coins")) progressAssignments.push(`coins = 0`);
+      if (await columnExists(client, "public.progress", "painted_keys")) progressAssignments.push(`painted_keys = '[]'::jsonb`);
+      if (await columnExists(client, "public.progress", "resume")) progressAssignments.push(`resume = NULL`);
+      if (await columnExists(client, "public.progress", "free_restarts_used")) progressAssignments.push(`free_restarts_used = 0`);
+      if (await columnExists(client, "public.progress", "free_skips_used")) progressAssignments.push(`free_skips_used = 0`);
+      if (await columnExists(client, "public.progress", "free_hints_used")) progressAssignments.push(`free_hints_used = 0`);
+      if (await columnExists(client, "public.progress", "hints")) progressAssignments.push(`hints = 0`);
+      if (await columnExists(client, "public.progress", "skips")) progressAssignments.push(`skips = 0`);
+      if (await columnExists(client, "public.progress", "updated_at")) progressAssignments.push(`updated_at = NOW()`);
+
+      if (progressAssignments.length) {
+        await client.query(
+          `UPDATE public.progress
+              SET ${progressAssignments.join(", ")}
+            WHERE uid = $1`,
+          [uid]
+        );
+      }
+    }
+
+    if (await tableExists(client, "public.admin_adjustments")) {
+      await client.query(
+        `INSERT INTO public.admin_adjustments
+           (uid, target, operation, amount, before_value, after_value, reason, admin_identity, created_at)
+         VALUES ($1, $2, $3, $4, NULL, NULL, $5, $6, NOW())`,
+        [uid, "reset", "reset_user", 0, reason, opts.adminIdentity ?? null]
+      );
+    }
+
+    await client.query("COMMIT");
+    return {
+      success: true,
+      uid,
+      message: "User reset to new player state",
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 export async function adminResetFreeCounters(uid: string) {
   const { rows } = await pool.query(
     `
