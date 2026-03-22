@@ -1,4 +1,4 @@
-import { Pool } from "pg";
+﻿import { Pool } from "pg";
 import { sendPiPayout as sendPiPayoutAdapter, getSendingWalletAvailableBalancePi } from "./services/piPayoutSender";
 import { lookupIpRisk } from "./services/ipRisk";
 console.log("Backend v2.0.1");
@@ -10,7 +10,7 @@ export const pool = new Pool({
 });
 
 /* =====================================================
-   INIT  (✅ Fix 1: auto-create core tables incl. sessions)
+   INIT  (âœ… Fix 1: auto-create core tables incl. sessions)
 ===================================================== */
 
 export async function useNonce(uid: string, nonce: string) {
@@ -191,6 +191,20 @@ await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_
       ADD COLUMN IF NOT EXISTS last_user_agent TEXT,
       ADD COLUMN IF NOT EXISTS last_ad_at TIMESTAMP,
       ADD COLUMN IF NOT EXISTS last_ad_watch_at TIMESTAMP;
+  `);
+  await pool.query(`
+    ALTER TABLE public.users
+      ADD COLUMN IF NOT EXISTS mc_balance INT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS rp_score INT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS daily_rp INT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_rp_reset TIMESTAMP DEFAULT NOW();
+  `);
+
+  await pool.query(`
+    UPDATE public.users
+       SET mc_balance = COALESCE(coins, 0)
+     WHERE COALESCE(mc_balance, 0) = 0
+       AND COALESCE(coins, 0) <> 0
   `);
 
   await pool.query(`
@@ -2448,6 +2462,130 @@ export async function getUserByUid(uid: string) {
   );
   return rows[0] || null;
 }
+
+const DAILY_RP_CAP = 30;
+
+export async function syncMcBalanceFromLegacyCoins(uid: string) {
+  const out = await pool.query(
+    `UPDATE public.users
+        SET mc_balance = COALESCE(coins, 0)
+      WHERE uid = $1
+        AND COALESCE(mc_balance, 0) <> COALESCE(coins, 0)
+      RETURNING uid, coins, mc_balance`,
+    [uid]
+  );
+  return { ok: true, synced: (out.rowCount ?? 0) > 0, user: out.rows[0] || null };
+}
+
+export async function resetDailyRP(uid: string) {
+  const out = await pool.query(
+    `UPDATE public.users
+        SET daily_rp = 0,
+            last_rp_reset = NOW(),
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING uid, daily_rp, last_rp_reset`,
+    [uid]
+  );
+  return { ok: true, user: out.rows[0] || null };
+}
+
+export async function resetDailyRPIfNeeded(uid: string) {
+  const out = await pool.query(
+    `UPDATE public.users
+        SET daily_rp = 0,
+            last_rp_reset = NOW(),
+            updated_at = NOW()
+      WHERE uid = $1
+        AND (
+          last_rp_reset IS NULL
+          OR (last_rp_reset AT TIME ZONE 'UTC')::date < (NOW() AT TIME ZONE 'UTC')::date
+        )
+      RETURNING uid, daily_rp, last_rp_reset`,
+    [uid]
+  );
+  return { ok: true, reset: (out.rowCount ?? 0) > 0, user: out.rows[0] || null };
+}
+
+export async function addMC(uid: string, amount: number) {
+  const delta = Math.trunc(Number(amount || 0));
+  if (!Number.isFinite(delta) || delta === 0) {
+    return getUserByUid(uid);
+  }
+
+  const out = await pool.query(
+    `UPDATE public.users
+        SET mc_balance = COALESCE(mc_balance, 0) + $2,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING *`,
+    [uid, delta]
+  );
+  return out.rows[0] || null;
+}
+
+export async function addRP(uid: string, amount: number) {
+  const requested = Math.max(0, Math.trunc(Number(amount || 0)));
+  if (!requested) return { ok: true, added: 0, cap: DAILY_RP_CAP };
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `UPDATE public.users
+          SET daily_rp = 0,
+              last_rp_reset = NOW(),
+              updated_at = NOW()
+        WHERE uid = $1
+          AND (
+            last_rp_reset IS NULL
+            OR (last_rp_reset AT TIME ZONE 'UTC')::date < (NOW() AT TIME ZONE 'UTC')::date
+          )`,
+      [uid]
+    );
+
+    const lock = await client.query(
+      `SELECT daily_rp, rp_score
+         FROM public.users
+        WHERE uid = $1
+        FOR UPDATE`,
+      [uid]
+    );
+
+    const user = lock.rows[0];
+    if (!user) {
+      await client.query('ROLLBACK');
+      return { ok: false, error: 'user_not_found' };
+    }
+
+    const remaining = Math.max(0, DAILY_RP_CAP - Number(user.daily_rp || 0));
+    const toAdd = Math.min(requested, remaining);
+
+    if (toAdd <= 0) {
+      await client.query('COMMIT');
+      return { ok: true, added: 0, cap: DAILY_RP_CAP };
+    }
+
+    const updated = await client.query(
+      `UPDATE public.users
+          SET rp_score = COALESCE(rp_score, 0) + $2,
+              daily_rp = COALESCE(daily_rp, 0) + $2,
+              updated_at = NOW()
+        WHERE uid = $1
+        RETURNING uid, rp_score, daily_rp`,
+      [uid, toAdd]
+    );
+
+    await client.query('COMMIT');
+    return { ok: true, added: toAdd, cap: DAILY_RP_CAP, user: updated.rows[0] || null };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
 export async function incrementDailyUserStats(uid: string, delta?: {
   coinsEarned?: number;
   levelsCompleted?: number;
@@ -2835,6 +2973,7 @@ export async function addCoins(uid: string, delta: number) {
     UPDATE public.users
     SET
       coins = COALESCE(coins,0) + $2,
+      mc_balance = COALESCE(mc_balance,0) + $2,
       monthly_coins_earned = COALESCE(monthly_coins_earned,0) + GREATEST($2,0),
       lifetime_coins_earned = COALESCE(lifetime_coins_earned,0) + GREATEST($2,0),
       updated_at=NOW()
@@ -2859,6 +2998,7 @@ export async function spendCoins(uid: string, amount: number) {
     UPDATE public.users
 SET
   coins = COALESCE(coins,0) - $2,
+  mc_balance = COALESCE(mc_balance,0) - $2,
   lifetime_coins_spent = COALESCE(lifetime_coins_spent,0) + $2,
   updated_at=NOW()
       WHERE uid=$1 AND COALESCE(coins,0) >= $2
@@ -3504,7 +3644,7 @@ export async function adminListOnlineUsers({
 
 
 /* ============================
-   Charts (Step 1 – 7 days default)
+   Charts (Step 1 â€“ 7 days default)
 ============================ */
 export async function adminChartCoins({ days }: { days: number }) {
   const d = Math.max(1, Math.min(90, Number(days || 7)));
@@ -3616,16 +3756,16 @@ function coinRewardForAd(adsForCoinsThisMonth: number) {
   return Math.max(reward, 2);
 }
 export async function claimCoinAd(uid: string) {
-  // 1️⃣ Track ad view
+  // 1ï¸âƒ£ Track ad view
   await trackAdView(uid, "coins");
 
-  // 2️⃣ Read monthly ads
+  // 2ï¸âƒ£ Read monthly ads
   const ads = await getMonthlyAds(uid);
 
   // ads_for_coins already incremented
   const coins = coinRewardForAd(ads.ads_for_coins - 1);
 
-  // 3️⃣ Use EXISTING reward system
+  // 3ï¸âƒ£ Use EXISTING reward system
   const nonce = `coin-ad-${currentMonthKey()}-${ads.ads_for_coins}`;
 
   return await claimReward({
@@ -3975,6 +4115,10 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
+
+
+
+
 
 
 

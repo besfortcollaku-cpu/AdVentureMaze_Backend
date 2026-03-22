@@ -43,6 +43,8 @@ import {
   ensureMonthlyKey,
   claimMonthlyRewards,
   recalcAndStoreMonthlyRate,
+  syncMcBalanceFromLegacyCoins,
+  resetDailyRPIfNeeded,
   trackRewardedAdActivity,
   incrementDailyUserStats,
   getDailyLeaderboard,
@@ -240,7 +242,13 @@ if (firstRecoverableMissedDay) {
         ? {
             uid: user.uid,
             username: user.username,
-            coins: user.coins,
+            coins: user.mc_balance ?? user.coins ?? 0,
+            legacy_coins: user.coins ?? 0,
+            mc_balance: user.mc_balance ?? user.coins ?? 0,
+            score: user.rp_score ?? 0,
+            rp_score: user.rp_score ?? 0,
+            daily_rp: user.daily_rp ?? 0,
+            last_rp_reset: user.last_rp_reset ?? null,
 
             // ðŸ”¹ paid balances (wallet)
             restarts_balance: user.restarts_balance ?? 0,
@@ -1040,6 +1048,8 @@ await upsertUser({ uid, username });
 
 await ensureMonthlyKey(uid);
 await ensureInviteCode(uid);
+await syncMcBalanceFromLegacyCoins(uid);
+await resetDailyRPIfNeeded(uid);
 
 // mark user online on ANY request
 await touchUserOnline(uid);
@@ -2175,6 +2185,10 @@ async function start() {
 }
 
 start();
+
+
+
+
 
 
 
