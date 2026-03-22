@@ -531,6 +531,46 @@ await pool.query(`
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.admin_adjustments (
+      id BIGSERIAL PRIMARY KEY,
+      uid TEXT NOT NULL,
+      target TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      amount INT NOT NULL,
+      before_value INT,
+      after_value INT,
+      reason TEXT NOT NULL,
+      admin_identity TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS admin_adjustments_uid_created_idx
+      ON public.admin_adjustments (uid, created_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS admin_adjustments_target_created_idx
+      ON public.admin_adjustments (target, created_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.monthly_settlement_runs (
+      id BIGSERIAL PRIMARY KEY,
+      month_key TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL,
+      pool_pi NUMERIC,
+      eligible_users INT,
+      total_score INT,
+      total_payout_pi NUMERIC,
+      notes TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS pi_payout_jobs_idempotency_key_uniq
       ON public.pi_payout_jobs (idempotency_key)
       WHERE idempotency_key IS NOT NULL;
@@ -1564,6 +1604,55 @@ export async function closeMonthlyPayoutCycle(opts: {
     await client.query("BEGIN");
 
     await client.query(
+      `INSERT INTO public.monthly_settlement_runs (
+         month_key, status, pool_pi, created_at, updated_at
+       ) VALUES ($1, 'previewed', $2::numeric, NOW(), NOW())
+       ON CONFLICT (month_key) DO NOTHING`,
+      [monthKey, MONTHLY_PI_POOL]
+    );
+
+    const existingSettlementRunRes = await client.query(
+      `SELECT *
+         FROM public.monthly_settlement_runs
+        WHERE month_key = $1
+        FOR UPDATE`,
+      [monthKey]
+    );
+    const existingSettlementRun = existingSettlementRunRes.rows[0] || null;
+
+    const existingPayoutRowsRes = await client.query(
+      `SELECT COUNT(*)::int AS c,
+              COALESCE(SUM(payout_pi), 0)::numeric(20,8) AS total_payout_pi,
+              COALESCE(MAX(total_rp_score), 0)::int AS total_rp
+         FROM public.monthly_pi_payouts
+        WHERE month_key = $1`,
+      [monthKey]
+    );
+    const existingPayoutRowCount = Number(existingPayoutRowsRes.rows[0]?.c || 0);
+
+    if (String(existingSettlementRun?.status || "") === "completed" || existingPayoutRowCount > 0) {
+      await client.query("COMMIT");
+      return {
+        ok: true,
+        cycle_id: null,
+        month_key: monthKey,
+        monthKey,
+        action: "run",
+        status: String(existingSettlementRun?.status || "completed"),
+        alreadySettled: true,
+        eligibleUsers: Number(existingSettlementRun?.eligible_users || existingPayoutRowCount || 0),
+        totalRp: Number(existingSettlementRun?.total_score || existingPayoutRowsRes.rows[0]?.total_rp || 0),
+        totalScore: Number(existingSettlementRun?.total_score || existingPayoutRowsRes.rows[0]?.total_rp || 0),
+        totalPoolPi: Number(existingSettlementRun?.pool_pi || MONTHLY_PI_POOL),
+        poolPi: Number(existingSettlementRun?.pool_pi || MONTHLY_PI_POOL),
+        totalPayoutPi: Number(existingSettlementRun?.total_payout_pi || existingPayoutRowsRes.rows[0]?.total_payout_pi || 0),
+        payoutsCreated: existingPayoutRowCount,
+        payoutRowCount: existingPayoutRowCount,
+        idempotent: true,
+      };
+    }
+
+    await client.query(
       `INSERT INTO public.monthly_payout_cycles (
          month_key,
          conversion_rate_locked,
@@ -1625,6 +1714,16 @@ export async function closeMonthlyPayoutCycle(opts: {
     );
 
     if (totalRp <= 0) {
+      await client.query(
+        `UPDATE public.monthly_settlement_runs
+            SET status = 'completed',
+                eligible_users = 0,
+                total_score = 0,
+                total_payout_pi = 0,
+                updated_at = NOW()
+          WHERE month_key = $1`,
+        [monthKey]
+      );
       await client.query(
         `UPDATE public.monthly_payout_cycles
             SET total_payout_pi = 0,
@@ -1694,10 +1793,12 @@ export async function closeMonthlyPayoutCycle(opts: {
       );
     }
 
-    await client.query(
-      `UPDATE public.users
+      await client.query(
+        `UPDATE public.users
           SET rp_score = 0,
               daily_rp = 0,
+              monthly_hints_used = 0,
+              monthly_skips_used = 0,
               last_rp_reset = NOW(),
               updated_at = NOW()
         WHERE COALESCE(rp_score, 0) > 0`
@@ -1719,6 +1820,24 @@ export async function closeMonthlyPayoutCycle(opts: {
       [cycle.id, String(totalsRes.rows[0]?.total_pool_pi || 0)]
     );
 
+    await client.query(
+      `UPDATE public.monthly_settlement_runs
+          SET status = 'completed',
+              pool_pi = $2::numeric,
+              eligible_users = $3,
+              total_score = $4,
+              total_payout_pi = $5::numeric,
+              updated_at = NOW()
+        WHERE month_key = $1`,
+      [
+        monthKey,
+        String(MONTHLY_PI_POOL),
+        eligibleUsers.length,
+        totalRp,
+        String(totalsRes.rows[0]?.total_pool_pi || 0),
+      ]
+    );
+
     await client.query("COMMIT");
 
     return {
@@ -1726,15 +1845,30 @@ export async function closeMonthlyPayoutCycle(opts: {
       cycle_id: Number(cycle.id),
       month_key: monthKey,
       monthKey: monthKey,
+      action: "run",
       status: "closed" as MonthlyPayoutCycleStatus,
+      alreadySettled: false,
       eligibleUsers: eligibleUsers.length,
       totalRp,
+      totalScore: totalRp,
       totalPoolPi: Number(totalsRes.rows[0]?.total_pool_pi || 0),
+      poolPi: MONTHLY_PI_POOL,
+      totalPayoutPi: Number(totalsRes.rows[0]?.total_pool_pi || 0),
       payoutsCreated: Number(totalsRes.rows[0]?.payouts_created || 0),
+      payoutRowCount: Number(totalsRes.rows[0]?.payouts_created || 0),
       idempotent: false,
     };
   } catch (e) {
     await client.query("ROLLBACK");
+    await pool.query(
+      `INSERT INTO public.monthly_settlement_runs (month_key, status, notes, created_at, updated_at)
+       VALUES ($1, 'failed', $2, NOW(), NOW())
+       ON CONFLICT (month_key) DO UPDATE
+         SET status = 'failed',
+             notes = EXCLUDED.notes,
+             updated_at = NOW()`,
+      [normalizeMonthKey(opts.monthKey), String((e as any)?.message || "settlement_failed")]
+    ).catch(() => {});
     throw e;
   } finally {
     client.release();
@@ -2001,6 +2135,7 @@ export async function adminListPayoutJobs(opts?: {
        j.cycle_id,
        c.month_key,
        j.uid,
+       u.username,
        j.payout_pi_amount,
        j.wallet_identifier,
        j.status,
@@ -2019,6 +2154,7 @@ export async function adminListPayoutJobs(opts?: {
        j.updated_at
      FROM public.pi_payout_jobs j
      JOIN public.monthly_payout_cycles c ON c.id = j.cycle_id
+     LEFT JOIN public.users u ON u.uid = j.uid
      ${whereSql}
      ORDER BY j.created_at DESC, j.id DESC
      LIMIT $${limitIndex} OFFSET $${offsetIndex}`,
@@ -2027,8 +2163,116 @@ export async function adminListPayoutJobs(opts?: {
 
   return {
     ok: true,
-    rows: out.rows,
+    monthKey: opts?.monthKey ? normalizeMonthKey(opts.monthKey) : null,
+    rows: out.rows.map((row) => normalizeAdminPayoutRow(row)),
+    payoutRows: out.rows.map((row) => normalizeAdminPayoutRow(row)),
     count: Number(countRes.rows[0]?.c || 0),
+  };
+}
+
+function buildSettlementTierSummary(rows: MonthlyPiPayoutRow[]) {
+  return REWARD_TIERS.map((tier) => {
+    const tierRows = rows.filter((row) => row.tier_name === tier.name);
+    return {
+      tierName: tier.name,
+      tierLabel: tier.label,
+      userCount: tierRows.length,
+      totalScore: tierRows.reduce((sum, row) => sum + Number(row.rp_score || 0), 0),
+      poolPi: Number(
+        tierRows.length > 0 ? tierRows[0].pool_pi || 0 : ((MONTHLY_PI_POOL * tier.poolShare) / 100)
+      ),
+    };
+  });
+}
+
+async function getExistingSettlementSummary(monthKey: string) {
+  const runRes = await pool.query(
+    `SELECT id, month_key, status, pool_pi, eligible_users, total_score, total_payout_pi, notes, created_at, updated_at
+       FROM public.monthly_settlement_runs
+      WHERE month_key = $1
+      LIMIT 1`,
+    [monthKey]
+  );
+  const payoutRes = await pool.query(
+    `SELECT p.uid, u.username, p.rp_score, p.total_rp_score, p.pool_pi, p.payout_pi, p.tier_name, p.tier_label, p.leaderboard_rank, p.status, p.created_at
+       FROM public.monthly_pi_payouts p
+       LEFT JOIN public.users u ON u.uid = p.uid
+      WHERE p.month_key = $1
+      ORDER BY p.leaderboard_rank ASC, p.uid ASC`,
+    [monthKey]
+  );
+
+  const rows = payoutRes.rows.map((row) => normalizeAdminPayoutRow(row));
+  const totalPayoutPi = rows.reduce((sum, row) => sum + Number(row.payoutPi || 0), 0);
+  const totalScore = rows.reduce((sum, row) => sum + Number(row.score || 0), 0);
+  const tierSummary = buildSettlementTierSummary(
+    payoutRes.rows.map((row: any) => ({
+      uid: String(row.uid),
+      rp_score: Number(row.rp_score || 0),
+      total_rp_score: Number(row.total_rp_score || 0),
+      pool_pi: String(row.pool_pi || 0),
+      payout_pi: String(row.payout_pi || 0),
+      tier_name: row.tier_name ?? null,
+      tier_label: row.tier_label ?? null,
+      leaderboard_rank: Number(row.leaderboard_rank || 0),
+    }))
+  );
+
+  return {
+    run: runRes.rows[0] || null,
+    payoutRows: rows,
+    payoutRowCount: rows.length,
+    totalPayoutPi,
+    totalScore,
+    eligibleUsers: rows.filter((row) => Number(row.payoutPi || 0) > 0 || row.tierName).length,
+    tierSummary,
+  };
+}
+
+export async function adminPreviewSettlement(opts: { monthKey?: string }) {
+  const monthKey = normalizeMonthKey(opts?.monthKey);
+  const existing = await getExistingSettlementSummary(monthKey);
+  const calc = await calculateMonthlyPiPayouts({ monthKey });
+  const rows = (calc.rows || []).map((row) => normalizeAdminPayoutRow(row)).slice(0, 20);
+
+  return {
+    ok: true,
+    action: "preview",
+    monthKey,
+    alreadySettled: Boolean(existing.run && String(existing.run.status) === "completed") || existing.payoutRowCount > 0,
+    status: existing.run?.status || "preview",
+    poolPi: Number(calc.totalPoolPi || MONTHLY_PI_POOL),
+    eligibleUsers: (calc.rows || []).length,
+    totalScore: Number(calc.totalRp || 0),
+    payoutRowCount: (calc.rows || []).length,
+    totalProjectedPayoutPi: (calc.rows || []).reduce((sum, row) => sum + Number(row.payout_pi || 0), 0),
+    totalPayoutPi: existing.totalPayoutPi || 0,
+    tierSummary: buildSettlementTierSummary(calc.rows || []),
+    projectedPayoutRows: rows,
+    rows,
+  };
+}
+
+export async function adminGetSettlementStatus(opts: { monthKey?: string }) {
+  const monthKey = normalizeMonthKey(opts?.monthKey);
+  const existing = await getExistingSettlementSummary(monthKey);
+
+  return {
+    ok: true,
+    action: "status",
+    monthKey,
+    status: existing.run?.status || "not_started",
+    alreadySettled: Boolean(existing.run && String(existing.run.status) === "completed") || existing.payoutRowCount > 0,
+    poolPi: Number(existing.run?.pool_pi ?? MONTHLY_PI_POOL),
+    eligibleUsers: Number(existing.run?.eligible_users ?? existing.eligibleUsers ?? 0),
+    totalScore: Number(existing.run?.total_score ?? existing.totalScore ?? 0),
+    payoutRowCount: existing.payoutRowCount,
+    totalPayoutPi: Number(existing.run?.total_payout_pi ?? existing.totalPayoutPi ?? 0),
+    tierSummary: existing.tierSummary,
+    createdAt: existing.run?.created_at ?? null,
+    updatedAt: existing.run?.updated_at ?? null,
+    rows: existing.payoutRows.slice(0, 20),
+    projectedPayoutRows: existing.payoutRows.slice(0, 20),
   };
 }
 
@@ -2068,7 +2312,16 @@ export async function adminListPayoutCycles(opts?: { limit?: number }) {
     [limit]
   );
 
-  return { ok: true, rows: out.rows };
+  return {
+    ok: true,
+    rows: out.rows.map((row: any) => ({
+      ...row,
+      monthKey: row.month_key,
+      poolPi: Number(row.total_payout_pi || 0),
+      eligibleUsers: Number(row.total_users || 0),
+      status: row.status,
+    })),
+  };
 }
 
 export async function adminGetPayoutSnapshotSummary(opts?: { cycleId?: number; monthKey?: string }) {
@@ -2104,7 +2357,19 @@ export async function adminGetPayoutSnapshotSummary(opts?: { cycleId?: number; m
     values
   );
 
-  return { ok: true, summary: out.rows[0] || null };
+  const summary = out.rows[0] || null;
+  return {
+    ok: true,
+    monthKey: opts?.monthKey ? normalizeMonthKey(opts.monthKey) : null,
+    summary: summary
+      ? {
+          ...summary,
+          eligibleUsers: Number(summary.eligible_count || 0),
+          status: "snapshot_ready",
+          tierSummary: null,
+        }
+      : null,
+  };
 }
 
 export async function adminGetPayoutRuntimeConfig() {
@@ -2173,16 +2438,28 @@ export async function adminListPayoutSnapshots(opts?: {
   const offsetIndex = values.length;
 
   const out = await pool.query(
-    `SELECT s.*, c.month_key
+    `SELECT s.*, c.month_key, u.username
      FROM public.monthly_payout_snapshots s
      JOIN public.monthly_payout_cycles c ON c.id = s.cycle_id
+     LEFT JOIN public.users u ON u.uid = s.uid
      ${whereSql}
      ORDER BY s.created_at DESC, s.id DESC
      LIMIT $${limitIndex} OFFSET $${offsetIndex}`,
     values
   );
-
-  return { ok: true, rows: out.rows, summary: summaryRes.rows[0] || null };
+  const summary = summaryRes.rows[0] || null;
+  const rows = out.rows.map((row: any) => normalizeAdminPayoutRow(row));
+  return {
+    ok: true,
+    monthKey: opts?.monthKey ? normalizeMonthKey(opts.monthKey) : null,
+    status: "snapshot_ready",
+    rows,
+    payoutRows: rows,
+    eligibleUsers: Number(summary?.eligible_count || 0),
+    totalScore: null,
+    tierSummary: null,
+    summary,
+  };
 }
 
 export async function adminRetryFailedPayouts(opts?: { monthKey?: string }) {
@@ -3867,10 +4144,242 @@ export async function endSession(uid: string) {
    ADMIN
 ===================================================== */
 
+function normalizeAdminUser(user: any, extra?: {
+  currentRank?: number | null;
+  projectedTier?: string | null;
+  projectedTierName?: string | null;
+  projectedTierLabel?: string | null;
+}) {
+  const coins = Number(user?.mc_balance ?? user?.coins ?? 0);
+  const score = Number(user?.rp_score ?? user?.score ?? user?.rpScore ?? 0);
+  const dailyScore = Number(user?.daily_rp ?? user?.dailyScore ?? user?.dailyRp ?? 0);
+  const wallet = user?.pi_wallet_identifier ?? user?.wallet ?? null;
+  const projectedTier =
+    extra?.projectedTier ??
+    user?.projectedTier ??
+    extra?.projectedTierLabel ??
+    extra?.projectedTierName ??
+    user?.projectedTierLabel ??
+    user?.projectedTierName ??
+    user?.tier_label ??
+    user?.tier_name ??
+    null;
+
+  return {
+    ...user,
+    uid: user?.uid ?? null,
+    username: user?.username ?? null,
+    coins,
+    score,
+    dailyScore,
+    currentRank: extra?.currentRank ?? user?.currentRank ?? user?.current_rank ?? null,
+    projectedTier,
+    wallet,
+    hintCount: Number(user?.free_hints_used ?? user?.hintCount ?? 0),
+    skipCount: Number(user?.free_skips_used ?? user?.skipCount ?? 0),
+    fraudFlag: Boolean(user?.fraud_score > 0 || user?.fraudFlag),
+    vpnFlag: Boolean(user?.vpn_flag ?? user?.vpnFlag),
+    suspiciousFlag: Boolean(user?.suspicious ?? user?.suspiciousFlag),
+    manualFlag: Boolean(user?.manual_review_required ?? user?.manualFlag),
+    lockedFlag: Boolean(user?.payout_locked ?? user?.lockedFlag),
+    updatedAt: user?.updated_at ?? user?.updatedAt ?? null,
+  };
+}
+
+function normalizeAdminPayoutRow(row: any) {
+  return {
+    ...row,
+    uid: row?.uid ?? null,
+    username: row?.username ?? null,
+    monthKey: row?.month_key ?? row?.monthKey ?? null,
+    poolPi: Number(row?.pool_pi ?? row?.poolPi ?? 0),
+    payoutPi: Number(row?.payout_pi_amount ?? row?.payout_pi ?? row?.payoutPi ?? 0),
+    score: Number(row?.rp_score ?? row?.score ?? 0),
+    tierName: row?.tier_name ?? row?.tierName ?? null,
+    tierLabel: row?.tier_label ?? row?.tierLabel ?? null,
+    leaderboardRank: row?.leaderboard_rank ?? row?.leaderboardRank ?? null,
+    eligibleUsers: row?.eligible_users ?? row?.total_users ?? null,
+    totalScore: Number(row?.total_rp_score ?? row?.totalScore ?? 0),
+  };
+}
+
+function normalizeAdminStats(raw: any) {
+  return {
+    ...raw,
+    totalUsers: raw?.totalUsers ?? raw?.users_total ?? null,
+    totalCoins: raw?.totalCoins ?? raw?.coins_total ?? null,
+    totalScore: raw?.totalScore ?? raw?.score_total ?? null,
+    onlineNow: raw?.onlineNow ?? raw?.online_now ?? null,
+    payoutEligibleUsers: raw?.payoutEligibleUsers ?? raw?.payout_eligible_users ?? null,
+    currentSeasonPool: raw?.currentSeasonPool ?? raw?.current_season_pool ?? null,
+    currentMonthPayoutRows: raw?.currentMonthPayoutRows ?? raw?.current_month_payout_rows ?? null,
+    levelsCompleted: raw?.levelsCompleted ?? raw?.level_complete_count ?? null,
+    currentMonthKey: raw?.currentMonthKey ?? raw?.current_month_key ?? null,
+  };
+}
+
+type AdminAdjustmentTarget = "coins" | "score";
+type AdminAdjustmentOperation = "add" | "sub" | "set";
+
+function normalizeAdminAdjustmentInput(input: {
+  target?: string;
+  operation?: string;
+  amount?: number;
+  reason?: string;
+}) {
+  const target = String(input?.target || "").trim().toLowerCase();
+  const operation = String(input?.operation || "").trim().toLowerCase();
+  const amount = Number(input?.amount);
+  const reason = String(input?.reason || "").trim();
+
+  if (target !== "coins" && target !== "score") {
+    throw new Error("invalid_adjustment_target");
+  }
+  if (operation !== "add" && operation !== "sub" && operation !== "set") {
+    throw new Error("invalid_adjustment_operation");
+  }
+  if (!Number.isFinite(amount) || !Number.isInteger(amount) || amount < 0) {
+    throw new Error("invalid_adjustment_amount");
+  }
+  if (!reason) {
+    throw new Error("adjustment_reason_required");
+  }
+
+  return {
+    target: target as AdminAdjustmentTarget,
+    operation: operation as AdminAdjustmentOperation,
+    amount,
+    reason,
+  };
+}
+
+export async function adminAdjustUserEconomy(opts: {
+  uid: string;
+  target: string;
+  operation: string;
+  amount: number;
+  reason: string;
+  adminIdentity?: string | null;
+}) {
+  const normalized = normalizeAdminAdjustmentInput(opts);
+  const field = normalized.target === "coins" ? "mc_balance" : "rp_score";
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const currentRes = await client.query(
+      `SELECT uid,
+              COALESCE(mc_balance, 0)::int AS mc_balance,
+              COALESCE(rp_score, 0)::int AS rp_score,
+              COALESCE(daily_rp, 0)::int AS daily_rp
+         FROM public.users
+        WHERE uid = $1
+        LIMIT 1
+        FOR UPDATE`,
+      [opts.uid]
+    );
+
+    const user = currentRes.rows[0];
+    if (!user) throw new Error("user_not_found");
+
+    const beforeValue = Number(user[field] || 0);
+    let afterValue = beforeValue;
+
+    if (normalized.operation === "add") {
+      afterValue = beforeValue + normalized.amount;
+    } else if (normalized.operation === "sub") {
+      afterValue = beforeValue - normalized.amount;
+    } else {
+      afterValue = normalized.amount;
+    }
+
+    if (afterValue < 0) {
+      throw new Error(
+        normalized.target === "coins" ? "coins_balance_negative" : "score_balance_negative"
+      );
+    }
+
+    const updateRes = await client.query(
+      `UPDATE public.users
+          SET ${field} = $2,
+              updated_at = NOW()
+        WHERE uid = $1
+        RETURNING uid,
+                  COALESCE(mc_balance, 0)::int AS mc_balance,
+                  COALESCE(rp_score, 0)::int AS rp_score,
+                  COALESCE(daily_rp, 0)::int AS daily_rp,
+                  updated_at`,
+      [opts.uid, afterValue]
+    );
+
+    await client.query(
+      `INSERT INTO public.admin_adjustments
+         (uid, target, operation, amount, before_value, after_value, reason, admin_identity, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+      [
+        opts.uid,
+        normalized.target,
+        normalized.operation,
+        normalized.amount,
+        beforeValue,
+        afterValue,
+        normalized.reason,
+        opts.adminIdentity ?? null,
+      ]
+    );
+
+    await client.query("COMMIT");
+
+    const updatedUser = updateRes.rows[0];
+    return {
+      ok: true,
+      uid: opts.uid,
+      target: normalized.target,
+      operation: normalized.operation,
+      amount: normalized.amount,
+      reason: normalized.reason,
+      beforeValue,
+      afterValue,
+      user: {
+        coins: Number(updatedUser?.mc_balance || 0),
+        score: Number(updatedUser?.rp_score || 0),
+        dailyScore: Number(updatedUser?.daily_rp || 0),
+        mc_balance: Number(updatedUser?.mc_balance || 0),
+        rp_score: Number(updatedUser?.rp_score || 0),
+        daily_rp: Number(updatedUser?.daily_rp || 0),
+      },
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function adminListUserAdjustments(uid: string, limit = 20) {
+  const out = await pool.query(
+    `SELECT id, uid, target, operation, amount,
+            before_value AS "beforeValue",
+            after_value AS "afterValue",
+            reason,
+            admin_identity AS "adminIdentity",
+            created_at AS "createdAt"
+       FROM public.admin_adjustments
+      WHERE uid = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT $2`,
+    [uid, Math.max(1, Math.min(100, Number(limit || 20)))]
+  );
+  return out.rows;
+}
+
 export async function adminListUsers({
   search,
   limit,
   offset,
+  order,
   suspiciousOnly,
   vpnOnly,
   manualReviewOnly,
@@ -3879,6 +4388,7 @@ export async function adminListUsers({
   search?: string;
   limit: number;
   offset: number;
+  order?: string;
   suspiciousOnly?: boolean;
   vpnOnly?: boolean;
   manualReviewOnly?: boolean;
@@ -3900,6 +4410,14 @@ export async function adminListUsers({
   if (payoutLockedOnly) where.push(`COALESCE(payout_locked, FALSE) = TRUE`);
 
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const orderBy =
+    String(order || "").toLowerCase() === "coins_desc"
+      ? `COALESCE(mc_balance, coins, 0) DESC, updated_at DESC`
+      : String(order || "").toLowerCase() === "score_desc"
+      ? `COALESCE(rp_score, 0) DESC, updated_at DESC`
+      : String(order || "").toLowerCase() === "created_at_desc"
+      ? `created_at DESC, updated_at DESC`
+      : `updated_at DESC`;
 
   values.push(limit);
   const limitIdx = values.length;
@@ -3911,7 +4429,7 @@ export async function adminListUsers({
     SELECT *
     FROM public.users
     ${whereSql}
-    ORDER BY updated_at DESC
+    ORDER BY ${orderBy}
     LIMIT $${limitIdx} OFFSET $${offsetIdx}
   `,
     values
@@ -3923,12 +4441,14 @@ export async function adminListUsers({
     countValues
   );
 
-  return { rows, count: Number(c[0].count) };
+  return { rows: rows.map((row) => normalizeAdminUser(row)), count: Number(c[0].count) };
 }
 
 export async function adminGetUser(uid: string) {
   const user = await getUserByUid(uid);
   const progress = await getProgressByUid(uid);
+  const leaderboard = await getMonthlyLeaderboardMe(uid).catch(() => null);
+  const recentAdjustments = await adminListUserAdjustments(uid, 20).catch(() => []);
 
   const { rows: stats } = await pool.query(
     `SELECT type,COUNT(*) FROM reward_claims WHERE uid=$1 GROUP BY type`,
@@ -3940,11 +4460,47 @@ export async function adminGetUser(uid: string) {
     [uid]
   );
 
+  const { rows: payoutRows } = await pool.query(
+    `SELECT month_key, rp_score, total_rp_score, pool_pi, payout_pi, tier_name, tier_label, leaderboard_rank, status, created_at
+       FROM public.monthly_pi_payouts
+      WHERE uid = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT 10`,
+    [uid]
+  );
+
+  const { rows: rewardRows } = await pool.query(
+    `SELECT event_type, event_key, amount_coins, accepted, reject_reason, created_at
+       FROM public.reward_event_audit
+      WHERE uid = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT 20`,
+    [uid]
+  ).catch(() => ({ rows: [] as any[] }));
+
   return {
-    user,
+    user: normalizeAdminUser(user, {
+      currentRank: leaderboard?.currentRank ?? null,
+      projectedTier: leaderboard?.projectedTierLabel ?? leaderboard?.projectedTierName ?? null,
+      projectedTierName: leaderboard?.projectedTierName ?? null,
+      projectedTierLabel: leaderboard?.projectedTierLabel ?? null,
+    }),
+    uid,
+    username: user?.username ?? null,
+    coins: Number(user?.mc_balance ?? user?.coins ?? 0),
+    score: Number(user?.rp_score ?? 0),
+    dailyScore: Number(user?.daily_rp ?? 0),
+    currentRank: leaderboard?.currentRank ?? null,
+    projectedTier: leaderboard?.projectedTierLabel ?? leaderboard?.projectedTierName ?? null,
+    wallet: user?.pi_wallet_identifier ?? null,
+    hintCount: Number(user?.free_hints_used ?? 0),
+    skipCount: Number(user?.free_skips_used ?? 0),
     progress,
     stats,
     last_session: session[0] || null,
+    recentPayouts: payoutRows.map((row) => normalizeAdminPayoutRow(row)),
+    recentRewards: rewardRows,
+    recentAdjustments,
   };
 }
 
@@ -4025,7 +4581,8 @@ export async function adminDeleteUser(uid: string) {
 }
 export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }) {
   const users = await pool.query(`SELECT COUNT(*) FROM public.users`);
-  const coins = await pool.query(`SELECT SUM(coins) FROM public.users`);
+  const coins = await pool.query(`SELECT COALESCE(SUM(mc_balance), 0)::bigint AS sum FROM public.users`);
+  const score = await pool.query(`SELECT COALESCE(SUM(rp_score), 0)::bigint AS sum FROM public.users`);
   const online = await pool.query(
     `
     SELECT COUNT(*) FROM sessions
@@ -4033,21 +4590,38 @@ export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }
   `,
     [onlineMinutes]
   );
-
-
-
-  const ad50 = await pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='ad_50'`);
-  const daily = await pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='daily_login'`);
   const levels = await pool.query(`SELECT COUNT(*) FROM level_rewards`);
+  const currentMonthKey = normalizeMonthKey();
+  const eligibleLeaderboard = await getEligibleLeaderboardUsers({ monthKey: currentMonthKey });
+  const currentPayoutRows = await pool.query(
+    `SELECT COUNT(*)::int AS c
+       FROM public.monthly_pi_payouts
+      WHERE month_key = $1`,
+    [currentMonthKey]
+  );
 
-  return {
+  const eligibleUsers = eligibleLeaderboard.rows || [];
+  const tierAssignments = eligibleUsers.length ? await assignRewardTiers(eligibleUsers) : [];
+  const tierCounts = {
+    champion: tierAssignments.filter((row) => row.tier_name === "A").length,
+    elite: tierAssignments.filter((row) => row.tier_name === "B").length,
+    advanced: tierAssignments.filter((row) => row.tier_name === "C").length,
+    qualified: tierAssignments.filter((row) => row.tier_name === "D").length,
+  };
+
+  return normalizeAdminStats({
     users_total: Number(users.rows[0].count),
     coins_total: Number(coins.rows[0].sum || 0),
+    score_total: Number(score.rows[0].sum || 0),
     online_now: Number(online.rows[0].count),
-    ad50_count: Number(ad50.rows[0].count),
-    daily_login_count: Number(daily.rows[0].count),
+    payout_eligible_users: eligibleUsers.length,
+    totalEligibleScore: eligibleUsers.reduce((sum, row) => sum + Number(row.rp_score || 0), 0),
+    current_season_pool: MONTHLY_PI_POOL,
+    current_month_payout_rows: Number(currentPayoutRows.rows[0]?.c || 0),
     level_complete_count: Number(levels.rows[0].count),
-  };
+    current_month_key: currentMonthKey,
+    tierCounts,
+  });
 }
 
 export async function adminListOnlineUsers({
@@ -4055,7 +4629,7 @@ export async function adminListOnlineUsers({
 }: { minutes: number; limit: number; offset: number; }) {
   const { rows } = await pool.query(
     `
-    SELECT u.uid,u.username,u.coins,
+    SELECT u.uid,u.username,u.coins,u.mc_balance,u.rp_score,u.daily_rp,
            s.last_seen_at,s.started_at,s.user_agent
     FROM sessions s
     JOIN public.users u ON u.uid=s.uid
@@ -4066,7 +4640,7 @@ export async function adminListOnlineUsers({
     [minutes, limit, offset]
   );
 
-  return { rows, count: rows.length };
+  return { rows: rows.map((row) => normalizeAdminUser(row)), count: rows.length };
 }
 
 

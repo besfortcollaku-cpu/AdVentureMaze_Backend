@@ -25,6 +25,8 @@ import {
   getFreeSkipsLeft,
   getFreeHintsLeft,
   closeMonthlyPayoutCycle,
+  adminPreviewSettlement,
+  adminGetSettlementStatus,
   generatePayoutJobs,
   adminListPayoutJobs,
   adminListPayoutCycles,
@@ -75,6 +77,7 @@ import {
   adminSetUserSuspicious,
   adminSetUserManualReview,
   adminReevaluateUserFraud,
+  adminAdjustUserEconomy,
   // âœ… charts1
   adminChartCoins,
   adminChartActiveUsers,
@@ -1862,6 +1865,28 @@ app.post("/api/hint", async (req, res) => {
 });
 
 /* ---------------- ADMIN: month close ---------------- */
+app.get("/admin/settlement/preview", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const monthKey = req.query.month_key ? String(req.query.month_key) : undefined;
+    const out = await adminPreviewSettlement({ monthKey });
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
+  }
+});
+
+app.get("/admin/settlement/status", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const monthKey = req.query.month_key ? String(req.query.month_key) : undefined;
+    const out = await adminGetSettlementStatus({ monthKey });
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ok:false,error:e.message});
+  }
+});
+
 app.post("/admin/month-close", async (req,res)=>{
   try{
     requireAdmin(req);
@@ -2105,6 +2130,7 @@ app.get("/admin/users", async (req,res)=>{
       search,
       limit,
       offset,
+      order,
       suspiciousOnly,
       vpnOnly,
       manualReviewOnly,
@@ -2161,6 +2187,114 @@ app.post("/admin/users/:uid/fraud-recompute", async (req,res)=>{
   try{
     requireAdmin(req);
     const out = await adminReevaluateUserFraud(String(req.params.uid));
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/users/:uid/economy-adjust", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const out = await adminAdjustUserEconomy({
+      uid: String(req.params.uid),
+      target: String(req.body?.target || ""),
+      operation: String(req.body?.operation || ""),
+      amount: Number(req.body?.amount),
+      reason: String(req.body?.reason || ""),
+      adminIdentity: null,
+    });
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/users/:uid/coins/add", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const delta = Number(req.body?.delta);
+    if (!Number.isFinite(delta) || delta === 0) throw new Error("invalid_adjustment_amount");
+    const out = await adminAdjustUserEconomy({
+      uid: String(req.params.uid),
+      target: "coins",
+      operation: delta >= 0 ? "add" : "sub",
+      amount: Math.abs(Math.trunc(delta)),
+      reason: String(req.body?.reason || "legacy_admin_coins_add"),
+      adminIdentity: null,
+    });
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/users/:uid/coins/set", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const coins = Number(req.body?.coins);
+    const out = await adminAdjustUserEconomy({
+      uid: String(req.params.uid),
+      target: "coins",
+      operation: "set",
+      amount: Math.trunc(coins),
+      reason: String(req.body?.reason || "legacy_admin_coins_set"),
+      adminIdentity: null,
+    });
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/users/:uid/coins/reset", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const out = await adminAdjustUserEconomy({
+      uid: String(req.params.uid),
+      target: "coins",
+      operation: "set",
+      amount: 0,
+      reason: String(req.body?.reason || "legacy_admin_coins_reset"),
+      adminIdentity: null,
+    });
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/users/:uid/score/add", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const delta = Number(req.body?.delta);
+    if (!Number.isFinite(delta) || delta === 0) throw new Error("invalid_adjustment_amount");
+    const out = await adminAdjustUserEconomy({
+      uid: String(req.params.uid),
+      target: "score",
+      operation: delta >= 0 ? "add" : "sub",
+      amount: Math.abs(Math.trunc(delta)),
+      reason: String(req.body?.reason || ""),
+      adminIdentity: null,
+    });
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/users/:uid/score/set", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const score = Number(req.body?.score);
+    const out = await adminAdjustUserEconomy({
+      uid: String(req.params.uid),
+      target: "score",
+      operation: "set",
+      amount: Math.trunc(score),
+      reason: String(req.body?.reason || ""),
+      adminIdentity: null,
+    });
     res.json(out);
   }catch(e:any){
     res.status(400).json({ ok:false, error:e.message });
