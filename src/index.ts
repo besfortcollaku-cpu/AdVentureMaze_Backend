@@ -253,9 +253,11 @@ if (firstRecoverableMissedDay) {
             daily_rp: user.daily_rp ?? 0,
             rpScore: user.rp_score ?? 0,
             dailyRp: user.daily_rp ?? 0,
-            currentRank: monthlyLeaderboardMe?.row?.rank ?? null,
-            projectedTierName: monthlyLeaderboardMe?.row?.projectedTierName ?? null,
-            projectedTierLabel: monthlyLeaderboardMe?.row?.projectedTierLabel ?? null,
+            currentRank: monthlyLeaderboardMe?.currentRank ?? null,
+            projectedTierName: monthlyLeaderboardMe?.projectedTierName ?? null,
+            projectedTierLabel: monthlyLeaderboardMe?.projectedTierLabel ?? null,
+            nextTierName: monthlyLeaderboardMe?.nextTierName ?? null,
+            rpNeededForNextTier: monthlyLeaderboardMe?.rpNeededForNextTier ?? null,
             last_rp_reset: user.last_rp_reset ?? null,
 
             // ðŸ”¹ paid balances (wallet)
@@ -1188,6 +1190,27 @@ app.post("/api/monthly/claim", async (req, res) => {
 res.json(out);
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/api/leaderboard", async (req, res) => {
+  try {
+    const limit = req.query.limit ? Number(req.query.limit) : undefined;
+    const offset = req.query.offset ? Number(req.query.offset) : undefined;
+    const out = await getMonthlyLeaderboard({ limit, offset });
+    res.json(out);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/api/leaderboard/me", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const out = await getMonthlyLeaderboardMe(uid);
+    res.json(out);
+  } catch (e: any) {
+    res.status(401).json({ ok: false, error: e.message });
   }
 });
 

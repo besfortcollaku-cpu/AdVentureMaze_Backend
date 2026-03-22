@@ -1451,44 +1451,101 @@ export async function calculateMonthlyPiPayouts(opts?: { monthKey?: string }) {
   };
 }
 
-export async function getMonthlyLeaderboard(opts?: { limit?: number; offset?: number }) {
-  const limit = Math.max(1, Math.min(200, Number(opts?.limit || 50)));
+function buildLeaderboardTierCutoffs(assignments: MonthlyPiPayoutRow[]) {
+  return REWARD_TIERS.map((tier) => {
+    const tierRows = assignments.filter((row) => row.tier_name === tier.name);
+    const lastRow = tierRows.length ? tierRows[tierRows.length - 1] : null;
+    return {
+      tierName: tier.name,
+      tierLabel: tier.label,
+      minRank: tierRows.length ? Number(tierRows[0].leaderboard_rank || 0) : null,
+      maxRank: tierRows.length ? Number(lastRow?.leaderboard_rank || 0) : null,
+      minRpScore: lastRow ? Number(lastRow.rp_score || 0) : null,
+    };
+  });
+}
+
+function getNextTierCutoff(tierName: string | null, tierCutoffs: Array<{ tierName: string; tierLabel: string; minRank: number | null; maxRank: number | null; minRpScore: number | null; }>) {
+  const tierOrder = REWARD_TIERS.map((tier) => tier.name);
+  if (!tierName) {
+    return tierCutoffs[tierCutoffs.length - 1] || null;
+  }
+
+  const currentIndex = tierOrder.indexOf(tierName);
+  if (currentIndex <= 0) return null;
+  return tierCutoffs[currentIndex - 1] || null;
+}
+
+export async function getMonthlyLeaderboard(opts?: { limit?: number; offset?: number; monthKey?: string }) {
+  const monthKey = normalizeMonthKey(opts?.monthKey);
+  const limit = Math.max(1, Math.min(100, Number(opts?.limit || 50)));
   const offset = Math.max(0, Number(opts?.offset || 0));
-  const leaderboard = await getMonthlyLeaderboardUsers();
-  const assignments = await assignRewardTiers(leaderboard.rows || []);
-  const rows = assignments.slice(offset, offset + limit).map((row) => ({
-    rank: Number(row.leaderboard_rank || 0),
-    uid: row.uid,
-    rpScore: Number(row.rp_score || 0),
-    projectedTierName: row.tier_name,
-    projectedTierLabel: row.tier_label,
-  }));
+  const leaderboard = await getMonthlyLeaderboardUsers({ monthKey });
+  const users = leaderboard.rows || [];
+  const assignments = await assignRewardTiers(users);
+  const userByUid = new Map(users.map((row) => [row.uid, row]));
+  const items = assignments.slice(offset, offset + limit).map((row) => {
+    const user = userByUid.get(row.uid);
+    return {
+      rank: Number(row.leaderboard_rank || 0),
+      uid: row.uid,
+      rpScore: Number(row.rp_score || 0),
+      projectedTierName: row.tier_name,
+      projectedTierLabel: row.tier_label,
+      monthlyHintCount: Number(user?.monthly_hints_used || 0),
+      monthlySkipCount: Number(user?.monthly_skips_used || 0),
+    };
+  });
 
   return {
     ok: true,
-    count: assignments.length,
+    monthKey,
+    totalEligibleUsers: assignments.length,
     limit,
     offset,
-    rows,
+    tierCutoffs: buildLeaderboardTierCutoffs(assignments),
+    items,
   };
 }
 
-export async function getMonthlyLeaderboardMe(uid: string) {
-  const leaderboard = await getMonthlyLeaderboardUsers();
-  const assignments = await assignRewardTiers(leaderboard.rows || []);
+export async function getMonthlyLeaderboardMe(uid: string, opts?: { monthKey?: string }) {
+  const monthKey = normalizeMonthKey(opts?.monthKey);
+  const leaderboard = await getMonthlyLeaderboardUsers({ monthKey });
+  const users = leaderboard.rows || [];
+  const assignments = await assignRewardTiers(users);
+  const tierCutoffs = buildLeaderboardTierCutoffs(assignments);
   const row = assignments.find((entry) => String(entry.uid) === String(uid)) || null;
+  const user = users.find((entry) => String(entry.uid) === String(uid)) || null;
+  const userRes = await pool.query(
+    `SELECT COALESCE(rp_score, 0)::int AS rp_score,
+            COALESCE(daily_rp, 0)::int AS daily_rp,
+            COALESCE(monthly_hints_used, 0)::int AS monthly_hints_used,
+            COALESCE(monthly_skips_used, 0)::int AS monthly_skips_used
+       FROM public.users
+      WHERE uid = $1
+      LIMIT 1`,
+    [uid]
+  );
+  const userRow = userRes.rows[0] || null;
+  const effectiveRp = Number(user?.rp_score ?? userRow?.rp_score ?? 0);
+  const nextTier = getNextTierCutoff(row?.tier_name || null, tierCutoffs);
 
   return {
     ok: true,
-    row: row
-      ? {
-          rank: Number(row.leaderboard_rank || 0),
-          uid: row.uid,
-          rpScore: Number(row.rp_score || 0),
-          projectedTierName: row.tier_name,
-          projectedTierLabel: row.tier_label,
-        }
+    monthKey,
+    uid,
+    rpScore: effectiveRp,
+    dailyRp: Number(userRow?.daily_rp || 0),
+    currentRank: row ? Number(row.leaderboard_rank || 0) : null,
+    projectedTierName: row?.tier_name || null,
+    projectedTierLabel: row?.tier_label || null,
+    nextTierName: nextTier?.tierName || null,
+    rpNeededForNextTier: nextTier?.minRpScore != null
+      ? Math.max(0, Number(nextTier.minRpScore || 0) - effectiveRp)
       : null,
+    monthlyHintCount: Number(user?.monthly_hints_used ?? userRow?.monthly_hints_used ?? 0),
+    monthlySkipCount: Number(user?.monthly_skips_used ?? userRow?.monthly_skips_used ?? 0),
+    tierCutoffs,
   };
 }
 
