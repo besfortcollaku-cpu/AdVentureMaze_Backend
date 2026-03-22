@@ -4621,6 +4621,21 @@ async function columnExists(client: any, tableName: string, columnName: string) 
   return out.rows[0]?.exists === true;
 }
 
+async function existingColumns(client: any, tableName: string, columnNames: string[]) {
+  const [schema, table] = tableName.includes(".")
+    ? tableName.split(".", 2)
+    : ["public", tableName];
+  const out = await client.query(
+    `SELECT column_name
+       FROM information_schema.columns
+      WHERE table_schema = $1
+        AND table_name = $2
+        AND column_name = ANY($3::text[])`,
+    [schema, table, columnNames]
+  );
+  return new Set<string>(out.rows.map((row: any) => String(row.column_name)));
+}
+
 export async function adminResetUserState(opts: {
   uid: string;
   reason: string;
@@ -4647,49 +4662,76 @@ export async function adminResetUserState(opts: {
       throw new Error("user_not_found");
     }
 
-    const userAssignments = [
-      `coins = 0`,
-      `mc_balance = 0`,
-      `rp_score = 0`,
-      `daily_rp = 0`,
-      `free_restarts_used = 0`,
-      `free_skips_used = 0`,
-      `free_hints_used = 0`,
-      `restarts_balance = 0`,
-      `skips_balance = 0`,
-      `hints_balance = 0`,
-      `daily_streak = 0`,
-      `last_daily_claim_date = NULL`,
-      `monthly_coins_earned = 0`,
-      `monthly_login_days = 0`,
-      `monthly_levels_completed = 0`,
-      `monthly_skips_used = 0`,
-      `monthly_hints_used = 0`,
-      `monthly_restarts_used = 0`,
-      `monthly_ads_watched = 0`,
-      `monthly_surprise_boxes_opened = 0`,
-      `monthly_mystery_boxes_opened = 0`,
-      `monthly_valid_invites = 0`,
-      `monthly_max_win_streak = 0`,
-      `monthly_rate_breakdown = '{}'::jsonb`,
-      `monthly_final_rate = 50`,
-      `mystery_box_pending = FALSE`,
-      `updated_at = NOW()`,
-    ];
+    const userColumns = await existingColumns(client, "public.users", [
+      "coins",
+      "mc_balance",
+      "rp_score",
+      "daily_rp",
+      "free_restarts_used",
+      "free_skips_used",
+      "free_hints_used",
+      "restarts_balance",
+      "skips_balance",
+      "hints_balance",
+      "daily_streak",
+      "last_daily_claim_date",
+      "monthly_coins_earned",
+      "monthly_login_days",
+      "monthly_levels_completed",
+      "monthly_skips_used",
+      "monthly_hints_used",
+      "monthly_restarts_used",
+      "monthly_ads_watched",
+      "monthly_surprise_boxes_opened",
+      "monthly_mystery_boxes_opened",
+      "monthly_valid_invites",
+      "monthly_max_win_streak",
+      "monthly_rate_breakdown",
+      "monthly_final_rate",
+      "mystery_box_pending",
+      "updated_at",
+      "activity_streak",
+      "last_active_day_key",
+    ]);
+    const userAssignments: string[] = [];
+    if (userColumns.has("coins")) userAssignments.push(`coins = 0`);
+    if (userColumns.has("mc_balance")) userAssignments.push(`mc_balance = 0`);
+    if (userColumns.has("rp_score")) userAssignments.push(`rp_score = 0`);
+    if (userColumns.has("daily_rp")) userAssignments.push(`daily_rp = 0`);
+    if (userColumns.has("free_restarts_used")) userAssignments.push(`free_restarts_used = 0`);
+    if (userColumns.has("free_skips_used")) userAssignments.push(`free_skips_used = 0`);
+    if (userColumns.has("free_hints_used")) userAssignments.push(`free_hints_used = 0`);
+    if (userColumns.has("restarts_balance")) userAssignments.push(`restarts_balance = 0`);
+    if (userColumns.has("skips_balance")) userAssignments.push(`skips_balance = 0`);
+    if (userColumns.has("hints_balance")) userAssignments.push(`hints_balance = 0`);
+    if (userColumns.has("daily_streak")) userAssignments.push(`daily_streak = 0`);
+    if (userColumns.has("last_daily_claim_date")) userAssignments.push(`last_daily_claim_date = NULL`);
+    if (userColumns.has("monthly_coins_earned")) userAssignments.push(`monthly_coins_earned = 0`);
+    if (userColumns.has("monthly_login_days")) userAssignments.push(`monthly_login_days = 0`);
+    if (userColumns.has("monthly_levels_completed")) userAssignments.push(`monthly_levels_completed = 0`);
+    if (userColumns.has("monthly_skips_used")) userAssignments.push(`monthly_skips_used = 0`);
+    if (userColumns.has("monthly_hints_used")) userAssignments.push(`monthly_hints_used = 0`);
+    if (userColumns.has("monthly_restarts_used")) userAssignments.push(`monthly_restarts_used = 0`);
+    if (userColumns.has("monthly_ads_watched")) userAssignments.push(`monthly_ads_watched = 0`);
+    if (userColumns.has("monthly_surprise_boxes_opened")) userAssignments.push(`monthly_surprise_boxes_opened = 0`);
+    if (userColumns.has("monthly_mystery_boxes_opened")) userAssignments.push(`monthly_mystery_boxes_opened = 0`);
+    if (userColumns.has("monthly_valid_invites")) userAssignments.push(`monthly_valid_invites = 0`);
+    if (userColumns.has("monthly_max_win_streak")) userAssignments.push(`monthly_max_win_streak = 0`);
+    if (userColumns.has("monthly_rate_breakdown")) userAssignments.push(`monthly_rate_breakdown = '{}'::jsonb`);
+    if (userColumns.has("monthly_final_rate")) userAssignments.push(`monthly_final_rate = 50`);
+    if (userColumns.has("mystery_box_pending")) userAssignments.push(`mystery_box_pending = FALSE`);
+    if (userColumns.has("updated_at")) userAssignments.push(`updated_at = NOW()`);
+    if (userColumns.has("activity_streak")) userAssignments.push(`activity_streak = 0`);
+    if (userColumns.has("last_active_day_key")) userAssignments.push(`last_active_day_key = NULL`);
 
-    if (await columnExists(client, "public.users", "activity_streak")) {
-      userAssignments.push(`activity_streak = 0`);
+    if (userAssignments.length) {
+      await client.query(
+        `UPDATE public.users
+            SET ${userAssignments.join(", ")}
+          WHERE uid = $1`,
+        [uid]
+      );
     }
-    if (await columnExists(client, "public.users", "last_active_day_key")) {
-      userAssignments.push(`last_active_day_key = NULL`);
-    }
-
-    await client.query(
-      `UPDATE public.users
-          SET ${userAssignments.join(", ")}
-        WHERE uid = $1`,
-      [uid]
-    );
 
     if (await tableExists(client, "public.user_level_monthly_rp")) {
       await client.query(`DELETE FROM public.user_level_monthly_rp WHERE uid = $1`, [uid]);
