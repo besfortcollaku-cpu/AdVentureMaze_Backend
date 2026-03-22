@@ -24,7 +24,6 @@ import {
   pool,
   getFreeSkipsLeft,
   getFreeHintsLeft,
-  closeMonthAndResetCoins,
   closeMonthlyPayoutCycle,
   generatePayoutJobs,
   adminListPayoutJobs,
@@ -49,6 +48,8 @@ import {
   incrementDailyUserStats,
   getDailyLeaderboard,
   getDailyLeaderboardMe,
+  getMonthlyLeaderboard,
+  getMonthlyLeaderboardMe,
   getDailyLeaderboardRaw,
   snapshotDailyLeaderboardRewards,
   getDailyLeaderboardRewardMe,
@@ -151,6 +152,8 @@ const missedRowsRes = await pool.query(
   [uid]
 );
 
+const monthlyLeaderboardMe = await getMonthlyLeaderboardMe(uid);
+
 const persistedMissedDays = missedRowsRes.rows
   .filter((r: any) => !r.is_recovered)
   .map((r: any) => Number(r.day))
@@ -248,6 +251,11 @@ if (firstRecoverableMissedDay) {
             score: user.rp_score ?? 0,
             rp_score: user.rp_score ?? 0,
             daily_rp: user.daily_rp ?? 0,
+            rpScore: user.rp_score ?? 0,
+            dailyRp: user.daily_rp ?? 0,
+            currentRank: monthlyLeaderboardMe?.row?.rank ?? null,
+            projectedTierName: monthlyLeaderboardMe?.row?.projectedTierName ?? null,
+            projectedTierLabel: monthlyLeaderboardMe?.row?.projectedTierLabel ?? null,
             last_rp_reset: user.last_rp_reset ?? null,
 
             // ðŸ”¹ paid balances (wallet)
@@ -1183,6 +1191,27 @@ res.json(out);
   }
 });
 
+app.get("/api/leaderboard/monthly", async (req, res) => {
+  try {
+    const limit = req.query.limit ? Number(req.query.limit) : undefined;
+    const offset = req.query.offset ? Number(req.query.offset) : undefined;
+    const out = await getMonthlyLeaderboard({ limit, offset });
+    res.json(out);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/api/leaderboard/monthly/me", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const out = await getMonthlyLeaderboardMe(uid);
+    res.json(out);
+  } catch (e: any) {
+    res.status(401).json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/api/leaderboard/daily", async (req, res) => {
   try {
     const out = await getDailyLeaderboard(20);
@@ -1349,7 +1378,7 @@ app.post("/api/restart", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT restarts_balance, coins, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`,
+      `SELECT restarts_balance, mc_balance, rp_score, daily_rp, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
 
@@ -1366,7 +1395,7 @@ app.post("/api/restart", async (req, res) => {
     }
 
     const FREE_RESTART_LIMIT = 3;
-    const RESTART_PRICE = 50;
+    const RESTART_PRICE = 15;
 
     let usedFree = false;
     let usedAd = false;
@@ -1392,16 +1421,17 @@ app.post("/api/restart", async (req, res) => {
       );
 
     } else if (mode === "coins") {
-      if ((user.coins ?? 0) < RESTART_PRICE) {
-        throw new Error("Not enough coins");
-      }
-
-      await pool.query(
+      const spendRes = await pool.query(
         `UPDATE public.users
-         SET coins = coins - $1
-         WHERE uid=$2`,
+         SET mc_balance = COALESCE(mc_balance, 0) - $1
+         WHERE uid = $2 AND COALESCE(mc_balance, 0) >= $1
+         RETURNING mc_balance, rp_score, daily_rp`,
         [RESTART_PRICE, uid]
       );
+
+      if (!(spendRes.rowCount ?? 0)) {
+        throw new Error("NOT_ENOUGH_COINS");
+      }
 
     } else if (mode === "ad") {
       if (!nonce) {
@@ -1447,7 +1477,7 @@ app.post("/api/restart", async (req, res) => {
     }
 
     const updatedUser = await pool.query(
-      `SELECT restarts_balance, coins FROM public.users WHERE uid=$1`,
+      `SELECT restarts_balance, mc_balance, rp_score, daily_rp FROM public.users WHERE uid=$1`,
       [uid]
     );
 
@@ -1460,7 +1490,10 @@ app.post("/api/restart", async (req, res) => {
       ok: true,
       free_restarts_used: updatedProgress.rows[0].free_restarts_used,
       restarts_balance: updatedUser.rows[0].restarts_balance,
-      coins: updatedUser.rows[0].coins,
+      coins: updatedUser.rows[0].mc_balance,
+      mcBalance: updatedUser.rows[0].mc_balance,
+      rpScore: updatedUser.rows[0].rp_score,
+      dailyRp: updatedUser.rows[0].daily_rp,
       usedFree,
     });
 
@@ -1548,7 +1581,7 @@ app.post("/api/skip", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT skips_balance, coins, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`,
+      `SELECT skips_balance, mc_balance, rp_score, daily_rp, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
     const progressRes = await pool.query(
@@ -1564,7 +1597,7 @@ app.post("/api/skip", async (req, res) => {
     }
 
     const FREE_SKIP_LIMIT = 3;
-    const SKIP_PRICE = 50;
+    const SKIP_PRICE = 40;
 
     let usedFree = false;
     let usedAd = false;
@@ -1590,16 +1623,17 @@ app.post("/api/skip", async (req, res) => {
       );
 
     } else if (mode === "coins") {
-      if ((user.coins ?? 0) < SKIP_PRICE) {
-        throw new Error("Not enough coins");
-      }
-
-      await pool.query(
+      const spendRes = await pool.query(
         `UPDATE public.users
-         SET coins = coins - $1
-         WHERE uid=$2`,
+         SET mc_balance = COALESCE(mc_balance, 0) - $1
+         WHERE uid = $2 AND COALESCE(mc_balance, 0) >= $1
+         RETURNING mc_balance, rp_score, daily_rp`,
         [SKIP_PRICE, uid]
       );
+
+      if (!(spendRes.rowCount ?? 0)) {
+        throw new Error("NOT_ENOUGH_COINS");
+      }
 
     } else if (mode === "ad") {
       if (!nonce) {
@@ -1645,7 +1679,7 @@ app.post("/api/skip", async (req, res) => {
     }
 
     const updatedUser = await pool.query(
-      `SELECT skips_balance, coins FROM public.users WHERE uid=$1`,
+      `SELECT skips_balance, mc_balance, rp_score, daily_rp FROM public.users WHERE uid=$1`,
       [uid]
     );
     const updatedProgress = await pool.query(
@@ -1657,7 +1691,10 @@ app.post("/api/skip", async (req, res) => {
       ok: true,
       free_skips_used: updatedProgress.rows[0].free_skips_used,
       skips_balance: updatedUser.rows[0].skips_balance,
-      coins: updatedUser.rows[0].coins,
+      coins: updatedUser.rows[0].mc_balance,
+      mcBalance: updatedUser.rows[0].mc_balance,
+      rpScore: updatedUser.rows[0].rp_score,
+      dailyRp: updatedUser.rows[0].daily_rp,
       usedFree,
     });
 
@@ -1676,7 +1713,7 @@ app.post("/api/hint", async (req, res) => {
     await pool.query("BEGIN");
 
     const userRes = await pool.query(
-      `SELECT hints_balance, coins, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`,
+      `SELECT hints_balance, mc_balance, rp_score, daily_rp, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`,
       [uid]
     );
 
@@ -1693,7 +1730,7 @@ app.post("/api/hint", async (req, res) => {
     }
 
     const FREE_HINT_LIMIT = 3;
-    const HINT_PRICE = 50;
+    const HINT_PRICE = 15;
 
     let usedFree = false;
     let usedAd = false;
@@ -1719,16 +1756,17 @@ app.post("/api/hint", async (req, res) => {
       );
 
     } else if (mode === "coins") {
-      if ((user.coins ?? 0) < HINT_PRICE) {
-        throw new Error("Not enough coins");
-      }
-
-      await pool.query(
+      const spendRes = await pool.query(
         `UPDATE public.users
-         SET coins = coins - $1
-         WHERE uid=$2`,
+         SET mc_balance = COALESCE(mc_balance, 0) - $1
+         WHERE uid = $2 AND COALESCE(mc_balance, 0) >= $1
+         RETURNING mc_balance, rp_score, daily_rp`,
         [HINT_PRICE, uid]
       );
+
+      if (!(spendRes.rowCount ?? 0)) {
+        throw new Error("NOT_ENOUGH_COINS");
+      }
 
     } else if (mode === "ad") {
       if (!nonce) {
@@ -1774,7 +1812,7 @@ app.post("/api/hint", async (req, res) => {
     }
 
     const updatedUser = await pool.query(
-      `SELECT hints_balance, coins FROM public.users WHERE uid=$1`,
+      `SELECT hints_balance, mc_balance, rp_score, daily_rp FROM public.users WHERE uid=$1`,
       [uid]
     );
 
@@ -1787,7 +1825,10 @@ app.post("/api/hint", async (req, res) => {
       ok: true,
       free_hints_used: updatedProgress.rows[0].free_hints_used,
       hints_balance: updatedUser.rows[0].hints_balance,
-      coins: updatedUser.rows[0].coins,
+      coins: updatedUser.rows[0].mc_balance,
+      mcBalance: updatedUser.rows[0].mc_balance,
+      rpScore: updatedUser.rows[0].rp_score,
+      dailyRp: updatedUser.rows[0].daily_rp,
       usedFree,
     });
 
@@ -1814,16 +1855,6 @@ app.post("/admin/month-close", async (req,res)=>{
     res.json(out);
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
-  }
-});
-
-app.post("/admin/month-close-legacy", async (req,res)=>{
-  try{
-    requireAdmin(req);
-    const month = req.body?.month ? String(req.body.month) : undefined;
-    res.json(await closeMonthAndResetCoins({ month }));
-  }catch(e:any){
-    res.status(401).json({ok:false,error:e.message});
   }
 });
 
@@ -2188,6 +2219,12 @@ async function start() {
 }
 
 start();
+
+
+
+
+
+
 
 
 

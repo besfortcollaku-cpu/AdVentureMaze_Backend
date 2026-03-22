@@ -366,7 +366,29 @@ await pool.query(`
   CREATE UNIQUE INDEX IF NOT EXISTS level_rewards_uid_level_unique
   ON public.level_rewards (uid, level)
 `);
-  
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.user_level_monthly_rp (
+    id BIGSERIAL PRIMARY KEY,
+    uid TEXT NOT NULL,
+    level_id TEXT NOT NULL,
+    month_key TEXT NOT NULL,
+    rp_awarded INT NOT NULL DEFAULT 0,
+    first_completed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    CONSTRAINT user_level_monthly_rp_uid_level_month_unique UNIQUE (uid, level_id, month_key)
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS user_level_monthly_rp_uid_month_idx
+  ON public.user_level_monthly_rp (uid, month_key)
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS user_level_monthly_rp_uid_level_month_idx
+  ON public.user_level_monthly_rp (uid, level_id, month_key)
+`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       uid TEXT PRIMARY KEY,
@@ -402,6 +424,28 @@ await pool.query(`
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       closed_at TIMESTAMP
     );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.monthly_pi_payouts (
+      id BIGSERIAL PRIMARY KEY,
+      uid TEXT NOT NULL,
+      month_key TEXT NOT NULL,
+      rp_score INT NOT NULL,
+      total_rp_score INT NOT NULL,
+      pool_pi NUMERIC NOT NULL,
+      payout_pi NUMERIC NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (uid, month_key)
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE public.monthly_pi_payouts
+      ADD COLUMN IF NOT EXISTS tier_name TEXT,
+      ADD COLUMN IF NOT EXISTS tier_label TEXT,
+      ADD COLUMN IF NOT EXISTS leaderboard_rank INT;
   `);
 
   await pool.query(`
@@ -600,67 +644,30 @@ export function monthKeyForDate(d: Date) {
   return `${y}-${m}`;
 }
 
-/**
- * Month-close: takes each user's current coins, writes a ledger row (monthly_payouts),
- * then resets the user's coins to 0.
- *
- * IMPORTANT: This does NOT send Pi coins. It's the safe, idempotent
- * accounting step you need before you plug in the Pi transfer logic.
- */
-export async function closeMonthAndResetCoins(opts?: { month?: string }) {
-  const month = String(opts?.month || currentMonthKey());
-
-  // Use a transaction to avoid partial resets
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    const { rows } = await client.query(
-      `SELECT uid, COALESCE(coins,0)::int AS coins
-       FROM public.users
-       WHERE COALESCE(coins,0) <> 0
-       FOR UPDATE`,
-    );
-
-    for (const r of rows) {
-      const uid = String(r.uid);
-      const coins = Number(r.coins || 0);
-
-      // insert payout row once per (uid,month)
-      await client.query(
-        `INSERT INTO monthly_payouts (uid, month, coins_collected, status, created_at)
-         VALUES ($1,$2,$3,'pending',NOW())
-         ON CONFLICT (uid, month) DO NOTHING`,
-        [uid, month, coins]
-      );
-
-      // reset coins (idempotent)
-      await client.query(
-        `UPDATE public.users
-         SET coins = 0,
-             coins_month = $2,
-             updated_at = NOW()
-         WHERE uid = $1`,
-        [uid, month]
-      );
-    }
-
-    await client.query("COMMIT");
-
-    return {
-      ok: true,
-      month,
-      users_reset: rows.length,
-      total_coins_reset: rows.reduce((s, r) => s + Number(r.coins || 0), 0),
-    };
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
-  }
+export function getMonthKey(date = new Date()) {
+  return monthKeyForDate(date);
 }
 
+export type MonthlyPiPayoutRow = {
+  uid: string;
+  rp_score: number;
+  total_rp_score: number;
+  pool_pi: string;
+  payout_pi: string;
+  tier_name: string | null;
+  tier_label: string | null;
+  leaderboard_rank: number;
+};
+
+type LeaderboardUser = {
+  uid: string;
+  rp_score: number;
+  monthly_skips_used: number;
+  monthly_hints_used: number;
+  unique_rp_levels: number;
+};
+
+type TierAssignment = MonthlyPiPayoutRow;
 
 type MonthlyPayoutCycleStatus = "open" | "closed" | "payouts_generated" | "processing" | "completed";
 type MonthlyPayoutSnapshotStatus = "eligible" | "below_threshold" | "manual_review" | "blocked" | "queued" | "paid" | "failed";
@@ -712,6 +719,13 @@ function envNumber(name: string, fallback: number) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+const MONTHLY_PI_POOL = envNumber("MONTHLY_PI_POOL", 300);
+const REWARD_TIERS = [
+  { name: "A", label: "Champion", percent: 1, poolShare: 40 },
+  { name: "B", label: "Elite", percent: 4, poolShare: 27 },
+  { name: "C", label: "Advanced", percent: 15, poolShare: 20 },
+  { name: "D", label: "Qualified", percent: 30, poolShare: 13 },
+] as const;
 const MAX_USER_MONTHLY_PI = envNumber("MAX_USER_MONTHLY_PI", 100);
 const MAX_GLOBAL_MONTHLY_PI = envNumber("MAX_GLOBAL_MONTHLY_PI", 100000);
 const MIN_ACCOUNT_AGE_DAYS = envNumber("MIN_ACCOUNT_AGE_DAYS", 7);
@@ -1305,6 +1319,179 @@ async function resolveCycleForUpdate(
   throw new Error("cycle_reference_required");
 }
 
+async function getMonthlyLeaderboardUsers(opts?: { eligibleOnly?: boolean; monthKey?: string }) {
+  const monthKey = normalizeMonthKey(opts?.monthKey);
+  const minRpClause = opts?.eligibleOnly ? `AND COALESCE(u.rp_score, 0) >= 150` : ``;
+  const uniqueLevelClause = opts?.eligibleOnly ? `AND COALESCE(ul.unique_rp_levels, 0) >= 10` : ``;
+
+  const out = await pool.query(
+    `SELECT u.uid,
+            COALESCE(u.rp_score, 0)::int AS rp_score,
+            COALESCE(u.monthly_skips_used, 0)::int AS monthly_skips_used,
+            COALESCE(u.monthly_hints_used, 0)::int AS monthly_hints_used,
+            COALESCE(ul.unique_rp_levels, 0)::int AS unique_rp_levels
+       FROM public.users u
+       LEFT JOIN (
+         SELECT uid, COUNT(*)::int AS unique_rp_levels
+           FROM public.user_level_monthly_rp
+          WHERE month_key = $1
+            AND rp_awarded > 0
+          GROUP BY uid
+       ) ul ON ul.uid = u.uid
+      WHERE COALESCE(u.rp_score, 0) > 0
+        ${minRpClause}
+        ${uniqueLevelClause}
+      ORDER BY COALESCE(u.rp_score, 0) DESC,
+               COALESCE(u.monthly_skips_used, 0) ASC,
+               COALESCE(u.monthly_hints_used, 0) ASC,
+               u.uid ASC`,
+    [monthKey]
+  );
+
+  const rows: LeaderboardUser[] = out.rows.map((row: any) => ({
+    uid: String(row.uid),
+    rp_score: Number(row.rp_score || 0),
+    monthly_skips_used: Number(row.monthly_skips_used || 0),
+    monthly_hints_used: Number(row.monthly_hints_used || 0),
+    unique_rp_levels: Number(row.unique_rp_levels || 0),
+  }));
+
+  return { ok: true, rows };
+}
+
+export async function getEligibleLeaderboardUsers(opts?: { monthKey?: string }) {
+  return getMonthlyLeaderboardUsers({ eligibleOnly: true, monthKey: opts?.monthKey });
+}
+
+export async function assignRewardTiers(users: LeaderboardUser[]) {
+  const totalEligible = users.length;
+  if (!totalEligible) return [] as TierAssignment[];
+
+  const counts = REWARD_TIERS.map((tier, index) => {
+    const raw = Math.ceil(totalEligible * (tier.percent / 100));
+    return index === 0 ? Math.max(1, raw) : raw;
+  });
+
+  let remaining = totalEligible;
+  const clampedCounts = counts.map((count) => {
+    const next = Math.max(0, Math.min(count, remaining));
+    remaining -= next;
+    return next;
+  });
+
+  const assignments: TierAssignment[] = [];
+  let cursor = 0;
+
+  for (let i = 0; i < REWARD_TIERS.length; i += 1) {
+    const tier = REWARD_TIERS[i];
+    const tierCount = clampedCounts[i] || 0;
+    const tierUsers = users.slice(cursor, cursor + tierCount);
+    const tierRpTotal = tierUsers.reduce((sum, user) => sum + Math.max(0, Number(user.rp_score || 0)), 0);
+    const tierPoolPi = (MONTHLY_PI_POOL * tier.poolShare) / 100;
+
+    for (let j = 0; j < tierUsers.length; j += 1) {
+      const user = tierUsers[j];
+      const leaderboardRank = cursor + j + 1;
+      const payoutPi = tierRpTotal > 0
+        ? ((user.rp_score / tierRpTotal) * tierPoolPi)
+        : 0;
+
+      assignments.push({
+        uid: user.uid,
+        rp_score: user.rp_score,
+        total_rp_score: users.reduce((sum, row) => sum + Math.max(0, Number(row.rp_score || 0)), 0),
+        pool_pi: MONTHLY_PI_POOL.toFixed(8),
+        payout_pi: payoutPi.toFixed(8),
+        tier_name: tier.name,
+        tier_label: tier.label,
+        leaderboard_rank: leaderboardRank,
+      });
+    }
+
+    cursor += tierUsers.length;
+  }
+
+  for (let i = cursor; i < users.length; i += 1) {
+    assignments.push({
+      uid: users[i].uid,
+      rp_score: users[i].rp_score,
+      total_rp_score: users.reduce((sum, row) => sum + Math.max(0, Number(row.rp_score || 0)), 0),
+      pool_pi: MONTHLY_PI_POOL.toFixed(8),
+      payout_pi: '0.00000000',
+      tier_name: null,
+      tier_label: null,
+      leaderboard_rank: i + 1,
+    });
+  }
+
+  return assignments;
+}
+
+export async function calculateMonthlyPiPayouts(opts?: { monthKey?: string }) {
+  const leaderboard = await getEligibleLeaderboardUsers({ monthKey: opts?.monthKey });
+  const users = leaderboard.rows || [];
+  const totalRp = users.reduce((sum, row) => sum + Math.max(0, Number(row.rp_score || 0)), 0);
+
+  if (totalRp <= 0) {
+    return {
+      ok: true,
+      totalRp: 0,
+      totalPoolPi: MONTHLY_PI_POOL,
+      rows: [] as MonthlyPiPayoutRow[],
+    };
+  }
+
+  const rows = await assignRewardTiers(users);
+
+  return {
+    ok: true,
+    totalRp,
+    totalPoolPi: MONTHLY_PI_POOL,
+    rows,
+  };
+}
+
+export async function getMonthlyLeaderboard(opts?: { limit?: number; offset?: number }) {
+  const limit = Math.max(1, Math.min(200, Number(opts?.limit || 50)));
+  const offset = Math.max(0, Number(opts?.offset || 0));
+  const leaderboard = await getMonthlyLeaderboardUsers();
+  const assignments = await assignRewardTiers(leaderboard.rows || []);
+  const rows = assignments.slice(offset, offset + limit).map((row) => ({
+    rank: Number(row.leaderboard_rank || 0),
+    uid: row.uid,
+    rpScore: Number(row.rp_score || 0),
+    projectedTierName: row.tier_name,
+    projectedTierLabel: row.tier_label,
+  }));
+
+  return {
+    ok: true,
+    count: assignments.length,
+    limit,
+    offset,
+    rows,
+  };
+}
+
+export async function getMonthlyLeaderboardMe(uid: string) {
+  const leaderboard = await getMonthlyLeaderboardUsers();
+  const assignments = await assignRewardTiers(leaderboard.rows || []);
+  const row = assignments.find((entry) => String(entry.uid) === String(uid)) || null;
+
+  return {
+    ok: true,
+    row: row
+      ? {
+          rank: Number(row.leaderboard_rank || 0),
+          uid: row.uid,
+          rpScore: Number(row.rp_score || 0),
+          projectedTierName: row.tier_name,
+          projectedTierLabel: row.tier_label,
+        }
+      : null,
+  };
+}
+
 export async function closeMonthlyPayoutCycle(opts: {
   monthKey?: string;
   conversionRateLocked: number;
@@ -1343,20 +1530,31 @@ export async function closeMonthlyPayoutCycle(opts: {
 
     const existingStatus = assertCycleStatus(String(cycle.status || "open"));
     if (existingStatus !== "open") {
-      const snapCount = await client.query(
-        `SELECT COUNT(*)::int AS c FROM public.monthly_payout_snapshots WHERE cycle_id = $1`,
-        [cycle.id]
+      const existingPayouts = await client.query(
+        `SELECT COUNT(*)::int AS c,
+                COALESCE(MAX(total_rp_score), 0)::int AS total_rp,
+                COALESCE(SUM(payout_pi), 0)::numeric(20,8) AS total_pool_pi
+           FROM public.monthly_pi_payouts
+          WHERE month_key = $1`,
+        [monthKey]
       );
       await client.query("COMMIT");
       return {
         ok: true,
         cycle_id: Number(cycle.id),
         month_key: String(cycle.month_key),
+        monthKey: String(cycle.month_key),
         status: existingStatus,
-        snapshots_count: Number(snapCount.rows[0]?.c || 0),
+        totalRp: Number(existingPayouts.rows[0]?.total_rp || 0),
+        totalPoolPi: Number(existingPayouts.rows[0]?.total_pool_pi || 0),
+        payoutsCreated: Number(existingPayouts.rows[0]?.c || 0),
         idempotent: true,
       };
     }
+
+    const leaderboard = await getEligibleLeaderboardUsers({ monthKey });
+    const eligibleUsers = leaderboard.rows || [];
+    const totalRp = eligibleUsers.reduce((sum: number, row: LeaderboardUser) => sum + Math.max(0, Number(row.rp_score || 0)), 0);
 
     await client.query(
       `UPDATE public.monthly_payout_cycles
@@ -1368,78 +1566,99 @@ export async function closeMonthlyPayoutCycle(opts: {
       [cycle.id, conversionRateLocked, minPayoutThresholdPi]
     );
 
-    await client.query(
-      `INSERT INTO public.monthly_payout_snapshots (
-         cycle_id,
-         uid,
-         coins_earned,
-         carry_in_coins,
-         total_coins_for_settlement,
-         payout_pi_amount,
-         carry_out_coins,
-         status,
-         created_at
-       )
-       SELECT
-         $1 AS cycle_id,
-         u.uid,
-         COALESCE(u.coins, 0)::bigint AS coins_earned,
-         COALESCE(u.payout_carry_coins, 0)::bigint AS carry_in_coins,
-         (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint) AS total_coins_for_settlement,
-          CASE
-            WHEN (COALESCE(u.payout_locked, FALSE) = TRUE)
-              THEN 0::numeric(20,8)
-            WHEN (COALESCE(u.manual_review_required, FALSE) = TRUE OR COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= $4)
-              THEN 0::numeric(20,8)
-            WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
-              THEN 0::numeric(20,8)
-            ELSE ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric)::numeric(20,8)
-          END AS payout_pi_amount,
-          CASE
-            WHEN (COALESCE(u.payout_locked, FALSE) = TRUE)
-              THEN (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint)
-            WHEN (COALESCE(u.manual_review_required, FALSE) = TRUE OR COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= $4)
-              THEN (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint)
-            WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
-              THEN (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint)
-            ELSE 0::bigint
-          END AS carry_out_coins,
-          CASE
-            WHEN (COALESCE(u.payout_locked, FALSE) = TRUE)
-              THEN 'blocked'
-            WHEN (COALESCE(u.manual_review_required, FALSE) = TRUE OR COALESCE(u.suspicious, FALSE) = TRUE OR COALESCE(u.vpn_flag, FALSE) = TRUE OR COALESCE(u.fraud_score, 0) >= $4)
-              THEN 'manual_review'
-            WHEN ((COALESCE(u.coins, 0)::numeric + COALESCE(u.payout_carry_coins, 0)::numeric) * $2::numeric) < $3::numeric
-              THEN 'below_threshold'
-            ELSE 'eligible'
-          END AS status,
-         NOW()
-       FROM public.users u
-       WHERE (COALESCE(u.coins, 0)::bigint + COALESCE(u.payout_carry_coins, 0)::bigint) > 0
-       ON CONFLICT (cycle_id, uid) DO NOTHING`,
-      [cycle.id, conversionRateLocked, minPayoutThresholdPi, FRAUD_SCORE_MANUAL_REVIEW_THRESHOLD]
-    );
+    if (totalRp <= 0) {
+      await client.query(
+        `UPDATE public.monthly_payout_cycles
+            SET total_payout_pi = 0,
+                capped_total_payout_pi = 0
+          WHERE id = $1`,
+        [cycle.id]
+      );
+      await client.query("COMMIT");
+      return {
+        ok: true,
+        cycle_id: Number(cycle.id),
+        month_key: monthKey,
+        monthKey: monthKey,
+        status: "closed" as MonthlyPayoutCycleStatus,
+        eligibleUsers: 0,
+        totalRp: 0,
+        totalPoolPi: MONTHLY_PI_POOL,
+        payoutsCreated: 0,
+        idempotent: false,
+      };
+    }
+
+    const payoutCalc = await calculateMonthlyPiPayouts({ monthKey });
+    const payoutRows = payoutCalc.rows || [];
+
+    for (const row of payoutRows) {
+      await client.query(
+        `INSERT INTO public.monthly_pi_payouts (
+           uid, month_key, rp_score, total_rp_score, pool_pi, payout_pi, tier_name, tier_label, leaderboard_rank, status, created_at
+         ) VALUES ($1, $2, $3, $4, $5::numeric, $6::numeric, $7, $8, $9, $10, NOW())
+         ON CONFLICT (uid, month_key) DO NOTHING`,
+        [
+          row.uid,
+          monthKey,
+          row.rp_score,
+          row.total_rp_score,
+          row.pool_pi,
+          row.payout_pi,
+          row.tier_name,
+          row.tier_label,
+          row.leaderboard_rank,
+          Number(row.payout_pi || 0) > 0 ? 'pending' : 'no_tier',
+        ]
+      );
+
+      // TODO: monthly_payout_snapshots still uses legacy coin-shaped columns; map RP into it for downstream payout jobs until that schema is cleaned up.
+      await client.query(
+        `INSERT INTO public.monthly_payout_snapshots (
+           cycle_id,
+           uid,
+           coins_earned,
+           carry_in_coins,
+           total_coins_for_settlement,
+           payout_pi_amount,
+           carry_out_coins,
+           status,
+           created_at
+         ) VALUES ($1, $2, $3, 0, $3, $4::numeric, 0, $5, NOW())
+         ON CONFLICT (cycle_id, uid) DO NOTHING`,
+        [
+          cycle.id,
+          row.uid,
+          row.rp_score,
+          row.payout_pi,
+          Number(row.payout_pi || 0) > 0 ? 'eligible' : 'below_threshold',
+        ]
+      );
+    }
 
     await client.query(
-      `UPDATE public.users u
-          SET coins = 0,
-              payout_carry_coins = s.carry_out_coins,
+      `UPDATE public.users
+          SET rp_score = 0,
+              daily_rp = 0,
+              last_rp_reset = NOW(),
               updated_at = NOW()
-         FROM public.monthly_payout_snapshots s
-        WHERE s.cycle_id = $1
-          AND s.uid = u.uid`,
-      [cycle.id]
+        WHERE COALESCE(rp_score, 0) > 0`
     );
 
-    const countRes = await client.query(
-      `SELECT
-         COUNT(*)::int AS snapshots_count,
-         COALESCE(SUM(CASE WHEN status = 'eligible' THEN 1 ELSE 0 END), 0)::int AS eligible_count,
-         COALESCE(SUM(CASE WHEN status = 'below_threshold' THEN 1 ELSE 0 END), 0)::int AS below_threshold_count,
-         COALESCE(SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END), 0)::int AS blocked_count
-       FROM public.monthly_payout_snapshots
-       WHERE cycle_id = $1`,
-      [cycle.id]
+    const totalsRes = await client.query(
+      `SELECT COUNT(*)::int AS payouts_created,
+              COALESCE(SUM(payout_pi), 0)::numeric(20,8) AS total_pool_pi
+         FROM public.monthly_pi_payouts
+        WHERE month_key = $1`,
+      [monthKey]
+    );
+
+    await client.query(
+      `UPDATE public.monthly_payout_cycles
+          SET total_payout_pi = $2::numeric,
+              capped_total_payout_pi = $2::numeric
+        WHERE id = $1`,
+      [cycle.id, String(totalsRes.rows[0]?.total_pool_pi || 0)]
     );
 
     await client.query("COMMIT");
@@ -1448,11 +1667,12 @@ export async function closeMonthlyPayoutCycle(opts: {
       ok: true,
       cycle_id: Number(cycle.id),
       month_key: monthKey,
+      monthKey: monthKey,
       status: "closed" as MonthlyPayoutCycleStatus,
-      snapshots_count: Number(countRes.rows[0]?.snapshots_count || 0),
-      eligible_count: Number(countRes.rows[0]?.eligible_count || 0),
-      below_threshold_count: Number(countRes.rows[0]?.below_threshold_count || 0),
-      blocked_count: Number(countRes.rows[0]?.blocked_count || 0),
+      eligibleUsers: eligibleUsers.length,
+      totalRp,
+      totalPoolPi: Number(totalsRes.rows[0]?.total_pool_pi || 0),
+      payoutsCreated: Number(totalsRes.rows[0]?.payouts_created || 0),
       idempotent: false,
     };
   } catch (e) {
@@ -2524,6 +2744,29 @@ export async function addMC(uid: string, amount: number) {
   return out.rows[0] || null;
 }
 
+export async function spendMC(uid: string, amount: number) {
+  const cost = Math.max(0, Math.trunc(Number(amount || 0)));
+  if (!cost) {
+    return getUserByUid(uid);
+  }
+
+  const out = await pool.query(
+    `UPDATE public.users
+        SET mc_balance = COALESCE(mc_balance, 0) - $2,
+            updated_at = NOW()
+      WHERE uid = $1
+        AND COALESCE(mc_balance, 0) >= $2
+      RETURNING *`,
+    [uid, cost]
+  );
+
+  if (!out.rows.length) {
+    throw new Error("NOT_ENOUGH_COINS");
+  }
+
+  return out.rows[0] || null;
+}
+
 export async function addRP(uid: string, amount: number) {
   const requested = Math.max(0, Math.trunc(Number(amount || 0)));
   if (!requested) return { ok: true, added: 0, cap: DAILY_RP_CAP };
@@ -3179,6 +3422,56 @@ function calculateLevelRewards(params: { usedHint: boolean; usedSkip: boolean })
   return { mc, rp };
 }
 
+async function addRPWithClient(client: any, uid: string, amount: number) {
+  const requested = Math.max(0, Math.trunc(Number(amount || 0)));
+  if (!requested) return { ok: true, added: 0, cap: DAILY_RP_CAP };
+
+  await client.query(
+    `UPDATE public.users
+        SET daily_rp = 0,
+            last_rp_reset = NOW(),
+            updated_at = NOW()
+      WHERE uid = $1
+        AND (
+          last_rp_reset IS NULL
+          OR (last_rp_reset AT TIME ZONE 'UTC')::date < (NOW() AT TIME ZONE 'UTC')::date
+        )`,
+    [uid]
+  );
+
+  const lock = await client.query(
+    `SELECT daily_rp, rp_score
+       FROM public.users
+      WHERE uid = $1
+      FOR UPDATE`,
+    [uid]
+  );
+
+  const user = lock.rows[0];
+  if (!user) {
+    throw new Error("user_not_found");
+  }
+
+  const remaining = Math.max(0, DAILY_RP_CAP - Number(user.daily_rp || 0));
+  const toAdd = Math.min(requested, remaining);
+
+  if (toAdd <= 0) {
+    return { ok: true, added: 0, cap: DAILY_RP_CAP };
+  }
+
+  const updated = await client.query(
+    `UPDATE public.users
+        SET rp_score = COALESCE(rp_score, 0) + $2,
+            daily_rp = COALESCE(daily_rp, 0) + $2,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING uid, rp_score, daily_rp`,
+    [uid, toAdd]
+  );
+
+  return { ok: true, added: toAdd, cap: DAILY_RP_CAP, user: updated.rows[0] || null };
+}
+
 export async function claimLevelComplete(
   uid: string,
   level: number,
@@ -3187,52 +3480,93 @@ export async function claimLevelComplete(
   if (!Number.isInteger(level) || level < 1) {
     throw new Error("invalid_level");
   }
-  const insert = await pool.query(
-    `
-    INSERT INTO public.level_rewards (uid, level, created_at)
-    VALUES ($1, $2, NOW())
-    ON CONFLICT (uid, level) DO NOTHING
-    `,
-    [uid, level]
-  );
 
-  if ((insert.rowCount ?? 0) === 0) {
-    await auditRewardEvent({ uid, eventType: "level_complete", eventKey: String(level), amountCoins: 1, accepted: false, rejectReason: "duplicate_level_reward" });
-    return { already: true };
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const monthKey = getMonthKey();
+    const levelId = String(level);
+
+    const lifetimeInsert = await client.query(
+      `INSERT INTO public.level_rewards (uid, level, created_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (uid, level) DO NOTHING`,
+      [uid, level]
+    );
+
+    const isFirstLifetimeCompletion = (lifetimeInsert.rowCount ?? 0) > 0;
+
+    await client.query(
+      `UPDATE public.users
+          SET coins = COALESCE(coins, 0) + 1,
+              mc_balance = COALESCE(mc_balance, 0) + 2,
+              monthly_coins_earned = COALESCE(monthly_coins_earned, 0) + 1,
+              lifetime_coins_earned = COALESCE(lifetime_coins_earned, 0) + 1,
+              monthly_levels_completed = COALESCE(monthly_levels_completed,0) + 1,
+              lifetime_levels_completed = COALESCE(lifetime_levels_completed,0) + $2,
+              updated_at = NOW()
+        WHERE uid = $1`,
+      [uid, isFirstLifetimeCompletion ? 1 : 0]
+    );
+
+    const rewards = calculateLevelRewards({
+      usedHint: Boolean(opts?.usedHint),
+      usedSkip: Boolean(opts?.usedSkip),
+    });
+
+    const monthlyCredit = await client.query(
+      `SELECT id
+         FROM public.user_level_monthly_rp
+        WHERE uid = $1
+          AND level_id = $2
+          AND month_key = $3
+        LIMIT 1
+        FOR UPDATE`,
+      [uid, levelId, monthKey]
+    );
+
+    let awardedRp = 0;
+    const already = (monthlyCredit.rowCount ?? 0) > 0;
+
+    if (!already) {
+      const rpResult = await addRPWithClient(client, uid, rewards.rp);
+      awardedRp = Number(rpResult.added || 0);
+
+      await client.query(
+        `INSERT INTO public.user_level_monthly_rp (uid, level_id, month_key, rp_awarded, first_completed_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [uid, levelId, monthKey, awardedRp]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    await recalcAndStoreMonthlyRate(uid);
+    await auditRewardEvent({
+      uid,
+      eventType: "level_complete",
+      eventKey: `${levelId}:${monthKey}`,
+      amountCoins: 1,
+      accepted: true,
+      rejectReason: already ? "monthly_rp_already_awarded" : undefined,
+    });
+
+    const user = await getUserByUid(uid);
+    return {
+      already,
+      user,
+      rewards: {
+        mc: rewards.mc,
+        rp: awardedRp,
+      },
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
   }
-
-  await addCoins(uid, 1);
-
-  const rewards = calculateLevelRewards({
-    usedHint: Boolean(opts?.usedHint),
-    usedSkip: Boolean(opts?.usedSkip),
-  });
-
-  // Keep the legacy coin reward during migration, then add the remaining MC
-  // through the new balance so gameplay does not change abruptly.
-  if (rewards.mc > 1) {
-    await addMC(uid, rewards.mc - 1);
-  }
-
-  if (rewards.rp > 0) {
-    await addRP(uid, rewards.rp);
-  }
-
-  await pool.query(
-    `
-    UPDATE public.users
-    SET
-      monthly_levels_completed = COALESCE(monthly_levels_completed,0) + 1,
-      lifetime_levels_completed = COALESCE(lifetime_levels_completed,0) + 1
-    WHERE uid=$1
-    `,
-    [uid]
-  );
-
-  await recalcAndStoreMonthlyRate(uid);
-  await auditRewardEvent({ uid, eventType: "level_complete", eventKey: String(level), amountCoins: 1, accepted: true });
-  const user = await getUserByUid(uid);
-  return { user, rewards };
 }
 
 /* =====================================================
@@ -3909,73 +4243,36 @@ export async function recalcAndStoreMonthlyRate(uid: string) {
 export async function claimMonthlyRewards(uid: string, opts?: { month?: string }) {
   const month = String(opts?.month || prevMonthKey());
 
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
+  const out = await pool.query(
+    `SELECT uid,
+            month_key,
+            rp_score,
+            total_rp_score,
+            pool_pi,
+            tier_name,
+            tier_label,
+            leaderboard_rank,
+            payout_pi,
+            status,
+            created_at
+       FROM public.monthly_pi_payouts
+      WHERE uid = $1
+        AND month_key = $2
+      LIMIT 1`,
+    [uid, month]
+  );
 
-    // lock user
-    const { rows } = await client.query(
-      `SELECT * FROM public.users WHERE uid=$1 FOR UPDATE`,
-      [uid]
-    );
-    const u = rows[0];
-    if (!u) throw new Error("User not found");
+  const row = out.rows[0] || null;
 
-    // snapshot coins + rate
-    const coinsCollected = Number(u.coins || 0);
-    const rate = Math.max(0, Math.min(100, Number(u.monthly_final_rate || 50)));
-
-    // create payout row once
-    await client.query(
-      `
-      INSERT INTO monthly_payouts (uid, month, coins_collected, pi_amount, status, created_at)
-      VALUES ($1,$2,$3,NULL,'pending',NOW())
-      ON CONFLICT (uid, month) DO NOTHING
-      `,
-      [uid, month, coinsCollected]
-    );
-
-    // reset coins + monthly stats
-    await client.query(
-      `
-      UPDATE public.users
-      SET
-        coins = 0,
-        monthly_key = $2,
-        monthly_coins_earned = 0,
-        monthly_login_days = 0,
-        monthly_levels_completed = 0,
-        monthly_skips_used = 0,
-        monthly_hints_used = 0,
-        monthly_restarts_used = 0,
-        monthly_ads_watched = 0,
-        monthly_surprise_boxes_opened = 0,
-        monthly_mystery_boxes_opened = 0,
-        monthly_valid_invites = 0,
-        monthly_max_win_streak = 0,
-        monthly_rate_breakdown = '{}'::jsonb,
-        monthly_final_rate = 50,
-        updated_at = NOW()
-      WHERE uid=$1
-      RETURNING *
-      `,
-      [uid, currentMonthKey()]
-    );
-
-    await client.query("COMMIT");
-
-    return {
-      ok: true,
-      month,
-      coins_collected: coinsCollected,
-      rate_snapshot: rate,
-    };
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
-  }
+  return {
+    ok: true,
+    month,
+    row,
+    payout_pi: row ? Number(row.payout_pi || 0) : 0,
+    rp_score: row ? Number(row.rp_score || 0) : 0,
+    total_rp_score: row ? Number(row.total_rp_score || 0) : 0,
+    status: String(row?.status || 'none'),
+  };
 }
 
 
@@ -4150,6 +4447,21 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

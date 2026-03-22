@@ -38,6 +38,19 @@ app.get("/api/me", async (req, res) => {
         const userRes = await db_1.pool.query(`SELECT * FROM public.users WHERE uid = $1 LIMIT 1`, [uid]);
         const user = userRes.rows[0] ?? null;
         const progress = await (0, db_1.getProgressByUid)(uid);
+        const invitedUsersRes = await db_1.pool.query(`SELECT COALESCE(u.username, ui.invitee_uid) AS label
+   FROM public.user_invites ui
+   LEFT JOIN public.users u ON u.uid = ui.invitee_uid
+   WHERE ui.inviter_uid = $1
+   ORDER BY ui.created_at DESC
+   LIMIT 200`, [uid]);
+        const invitedUsernames = invitedUsersRes.rows
+            .map((r) => String(r.label || "").trim())
+            .filter(Boolean);
+        const invitedByNameRes = user?.invited_by_uid
+            ? await db_1.pool.query(`SELECT username FROM public.users WHERE uid = $1 LIMIT 1`, [user.invited_by_uid])
+            : { rows: [] };
+        const invitedByName = String(invitedByNameRes.rows?.[0]?.username || user?.invited_by_uid || "").trim() || null;
         const today = new Date().toISOString().slice(0, 10);
         const lastClaim = user?.last_daily_claim_date
             ? new Date(user.last_daily_claim_date).toISOString().slice(0, 10)
@@ -47,6 +60,7 @@ app.get("/api/me", async (req, res) => {
         const missedRowsRes = await db_1.pool.query(`SELECT day, is_recovered
    FROM daily_reward_missed_days
    WHERE uid = $1`, [uid]);
+        const monthlyLeaderboardMe = await (0, db_1.getMonthlyLeaderboardMe)(uid);
         const persistedMissedDays = missedRowsRes.rows
             .filter((r) => !r.is_recovered)
             .map((r) => Number(r.day))
@@ -111,13 +125,23 @@ app.get("/api/me", async (req, res) => {
             };
         }
         res.json({
-            ok: true,
             user: user
                 ? {
                     uid: user.uid,
                     username: user.username,
-                    coins: user.coins,
-                    // 🔹 paid balances (wallet)
+                    coins: user.mc_balance ?? user.coins ?? 0,
+                    legacy_coins: user.coins ?? 0,
+                    mc_balance: user.mc_balance ?? user.coins ?? 0,
+                    score: user.rp_score ?? 0,
+                    rp_score: user.rp_score ?? 0,
+                    daily_rp: user.daily_rp ?? 0,
+                    rpScore: user.rp_score ?? 0,
+                    dailyRp: user.daily_rp ?? 0,
+                    currentRank: monthlyLeaderboardMe?.row?.rank ?? null,
+                    projectedTierName: monthlyLeaderboardMe?.row?.projectedTierName ?? null,
+                    projectedTierLabel: monthlyLeaderboardMe?.row?.projectedTierLabel ?? null,
+                    last_rp_reset: user.last_rp_reset ?? null,
+                    // ðŸ”¹ paid balances (wallet)
                     restarts_balance: user.restarts_balance ?? 0,
                     skips_balance: user.skips_balance ?? 0,
                     hints_balance: user.hints_balance ?? 0,
@@ -135,6 +159,12 @@ app.get("/api/me", async (req, res) => {
                     monthly_valid_invites: user.monthly_valid_invites ?? 0,
                     lifetime_valid_invites: user.lifetime_valid_invites ?? 0,
                     invite_code: user.invite_code ?? null,
+                    invited_by_uid: user.invited_by_uid ?? null,
+                    invited_by_name: invitedByName,
+                    invited_usernames: invitedUsernames,
+                    pi_wallet_identifier: user.pi_wallet_identifier ?? null,
+                    wallet_verified: Boolean(user.wallet_verified),
+                    wallet_last_updated_at: user.wallet_last_updated_at ?? null,
                 }
                 : null,
             progress: progress
@@ -158,12 +188,77 @@ app.get("/api/me", async (req, res) => {
         res.status(401).json({ ok: false, error: e.message });
     }
 });
+function validatePiWalletInput(raw) {
+    const compact = String(raw || "").replace(/[\r\n]+/g, " ").trim();
+    if (!compact)
+        return { ok: false, error: "invalid_wallet_required" };
+    const words = compact.split(/\s+/).filter(Boolean);
+    if (words.length >= 12)
+        return { ok: false, error: "invalid_wallet_secret_like" };
+    if (compact.includes(" "))
+        return { ok: false, error: "invalid_wallet_format" };
+    const upper = compact.toUpperCase();
+    const hasSecretKeywords = /(seed|mnemonic|private|secret|phrase)/i.test(compact);
+    const alpha = compact.replace(/[^a-zA-Z]/g, "");
+    const lower = compact.replace(/[^a-z]/g, "");
+    const lowerHeavy = alpha.length >= 20 && (lower.length / alpha.length) >= 0.75;
+    const randomLongNoPrefix = upper.length >= 40 && !upper.startsWith("G");
+    if (hasSecretKeywords || lowerHeavy || randomLongNoPrefix) {
+        return { ok: false, error: "invalid_wallet_secret_like" };
+    }
+    if (upper.length < 20 || upper.length > 100) {
+        return { ok: false, error: "invalid_wallet_format" };
+    }
+    if (!/^[A-Z0-9]+$/.test(upper)) {
+        return { ok: false, error: "invalid_wallet_format" };
+    }
+    if (!upper.startsWith("G")) {
+        return { ok: false, error: "invalid_wallet_prefix" };
+    }
+    return { ok: true, wallet: upper };
+}
+app.post("/api/user/set-wallet", async (req, res) => {
+    try {
+        const { uid } = await requirePiUser(req);
+        const walletCheck = validatePiWalletInput(req.body?.wallet);
+        if (!walletCheck.ok) {
+            return res.status(400).json({ ok: false, error: walletCheck.error });
+        }
+        const wallet = walletCheck.wallet;
+        const duplicateRes = await db_1.pool.query(`SELECT uid FROM public.users
+        WHERE pi_wallet_identifier = $1
+          AND uid <> $2
+        LIMIT 1`, [wallet, uid]);
+        await db_1.pool.query(`UPDATE public.users
+          SET pi_wallet_identifier = $1,
+              wallet_verified = TRUE,
+              wallet_last_updated_at = NOW(),
+              updated_at = NOW()
+        WHERE uid = $2`, [wallet, uid]);
+        const sameWalletCountRes = await db_1.pool.query(`SELECT COUNT(*)::int AS c
+         FROM public.users
+        WHERE pi_wallet_identifier = $1`, [wallet]);
+        const sameWalletCount = Number(sameWalletCountRes.rows[0]?.c || 0);
+        if (sameWalletCount >= 3) {
+            await db_1.pool.query(`UPDATE public.users
+            SET suspicious = TRUE,
+                updated_at = NOW()
+          WHERE pi_wallet_identifier = $1`, [wallet]);
+        }
+        res.json({
+            duplicate_in_use: (duplicateRes.rowCount || 0) > 0,
+            suspicious_wallet_cluster: sameWalletCount >= 3,
+        });
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e?.message || "set_wallet_failed" });
+    }
+});
 app.get("/api/invite/me", async (req, res) => {
     try {
         const { uid } = await requirePiUser(req);
         const out = await (0, db_1.getInviteSummary)(uid);
         res.json({
-            ok: true,
             ...out,
             invite_link: `https://pi-maze.com/?invite=${encodeURIComponent(out.invite_code)}`
         });
@@ -226,6 +321,9 @@ function rewardForDay(day) {
 }
 function isoDateUTC(input) {
     return new Date(input).toISOString().slice(0, 10);
+}
+function nextUtcDayStartMs(now = new Date()) {
+    return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0);
 }
 function dayDiffFromIsoDate(lastIsoDate, now = new Date()) {
     const last = new Date(`${lastIsoDate}T00:00:00.000Z`);
@@ -309,6 +407,10 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
        WHERE uid = $1`, [uid]);
         await db_1.pool.query("COMMIT");
         try {
+            await (0, db_1.incrementDailyUserStats)(uid, { coinsEarned: reward });
+        }
+        catch { }
+        try {
             await (0, db_1.recalcAndStoreMonthlyRate)(uid);
         }
         catch { }
@@ -367,12 +469,15 @@ app.post("/api/daily-reward/recover", async (req, res) => {
        WHERE uid = $1`, [uid, rewardCoins]);
         await db_1.pool.query("COMMIT");
         try {
+            await (0, db_1.incrementDailyUserStats)(uid, { coinsEarned: rewardCoins, adsWatched: 1 });
+        }
+        catch { }
+        try {
             await (0, db_1.recalcAndStoreMonthlyRate)(uid);
         }
         catch { }
         const updatedRes = await db_1.pool.query(`SELECT * FROM public.users WHERE uid = $1`, [uid]);
         return res.json({
-            ok: true,
             recoveredDay: missedDay,
             coinsAwarded: rewardCoins,
             user: updatedRes.rows[0],
@@ -434,6 +539,10 @@ app.post("/api/daily-reward/claim", async (req, res) => {
            mystery_box_pending = $4
        WHERE uid = $1`, [uid, rewardCoins, targetDay, mysteryChestReady]);
         await db_1.pool.query("COMMIT");
+        try {
+            await (0, db_1.incrementDailyUserStats)(uid, { coinsEarned: rewardCoins });
+        }
+        catch { }
         try {
             await (0, db_1.recalcAndStoreMonthlyRate)(uid);
         }
@@ -523,6 +632,10 @@ app.post("/api/rewards/recover-day", async (req, res) => {
         }
         await db_1.pool.query("COMMIT");
         try {
+            await (0, db_1.incrementDailyUserStats)(uid, { coinsEarned: coins, adsWatched: 1 });
+        }
+        catch { }
+        try {
             await (0, db_1.recalcAndStoreMonthlyRate)(uid);
         }
         catch { }
@@ -572,7 +685,7 @@ app.patch("/api/user/username", async (req, res) => {
         }
         username = username.trim();
         if (username.length < 3 || username.length > 20) {
-            return res.status(400).json({ ok: false, error: "Username must be 3–20 characters" });
+            return res.status(400).json({ ok: false, error: "Username must be 3â€“20 characters" });
         }
         // allow only letters, numbers, underscore
         if (!/^[a-zA-Z0-9_]+$/.test(username)) {
@@ -629,6 +742,9 @@ async function requirePiUser(req) {
     const username = String(piUser.username);
     await (0, db_1.upsertUser)({ uid, username });
     await (0, db_1.ensureMonthlyKey)(uid);
+    await (0, db_1.ensureInviteCode)(uid);
+    await (0, db_1.syncMcBalanceFromLegacyCoins)(uid);
+    await (0, db_1.resetDailyRPIfNeeded)(uid);
     // mark user online on ANY request
     await (0, db_1.touchUserOnline)(uid);
     return { uid, username };
@@ -677,6 +793,41 @@ function requireAdmin(req) {
     if (secret !== process.env.ADMIN_SECRET)
         throw new Error("Unauthorized");
 }
+function requestIp(req) {
+    const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+    const realIp = String(req.headers["x-real-ip"] || "").trim();
+    const candidate = forwarded || realIp || req.ip || "";
+    return candidate.replace(/^::ffff:/, "");
+}
+function headerValue(req, key) {
+    const v = req.headers[key.toLowerCase()];
+    if (Array.isArray(v))
+        return String(v[0] || "").trim() || null;
+    const s = String(v || "").trim();
+    return s || null;
+}
+function boolHeader(req, key) {
+    const v = (headerValue(req, key) || "").toLowerCase();
+    return v === "1" || v === "true" || v === "yes";
+}
+function getAdRequestMeta(req) {
+    return {
+        ip: requestIp(req) || null,
+        user_agent: headerValue(req, "user-agent") || null,
+        country: headerValue(req, "cf-ipcountry") || headerValue(req, "x-country") || null,
+        asn: headerValue(req, "x-asn") || null,
+        isp: headerValue(req, "x-isp") || null,
+        is_vpn: boolHeader(req, "x-vpn") || boolHeader(req, "x-ip-vpn"),
+    };
+}
+function getAdRewardCoins(adsWatchedToday) {
+    if (adsWatchedToday < 10) {
+        return 50;
+    }
+    const extra = adsWatchedToday - 10;
+    const reward = 50 - (extra * 5);
+    return Math.max(reward, 5);
+}
 /* ---------------- PI VERIFY ---------------- */
 app.post("/api/pi/verify", async (req, res) => {
     try {
@@ -711,6 +862,107 @@ app.post("/api/monthly/claim", async (req, res) => {
         res.status(400).json({ ok: false, error: e.message });
     }
 });
+app.get("/api/leaderboard/monthly", async (req, res) => {
+    try {
+        const limit = req.query.limit ? Number(req.query.limit) : undefined;
+        const offset = req.query.offset ? Number(req.query.offset) : undefined;
+        const out = await (0, db_1.getMonthlyLeaderboard)({ limit, offset });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/api/leaderboard/monthly/me", async (req, res) => {
+    try {
+        const { uid } = await requirePiUser(req);
+        const out = await (0, db_1.getMonthlyLeaderboardMe)(uid);
+        res.json(out);
+    }
+    catch (e) {
+        res.status(401).json({ ok: false, error: e.message });
+    }
+});
+app.get("/api/leaderboard/daily", async (req, res) => {
+    try {
+        const out = await (0, db_1.getDailyLeaderboard)(20);
+        const serverTimeMs = Date.now();
+        const nextDailyResetAtMs = nextUtcDayStartMs(new Date(serverTimeMs));
+        res.json({ ok: true, rows: out.rows || [], server_time_ms: serverTimeMs, next_daily_reset_at_ms: nextDailyResetAtMs });
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/api/leaderboard/daily/me", async (req, res) => {
+    try {
+        const { uid } = await requirePiUser(req);
+        const out = await (0, db_1.getDailyLeaderboardMe)(uid);
+        const serverTimeMs = Date.now();
+        const nextDailyResetAtMs = nextUtcDayStartMs(new Date(serverTimeMs));
+        res.json({ ok: true, row: out.row, server_time_ms: serverTimeMs, next_daily_reset_at_ms: nextDailyResetAtMs });
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/api/leaderboard/daily-reward/me", async (req, res) => {
+    try {
+        const { uid } = await requirePiUser(req);
+        const out = await (0, db_1.getDailyLeaderboardRewardMe)(uid);
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/api/leaderboard/daily-reward/claim", async (req, res) => {
+    try {
+        const { uid } = await requirePiUser(req);
+        const out = await (0, db_1.claimDailyLeaderboardReward)(uid);
+        if (!out?.ok) {
+            return res.status(400).json(out);
+        }
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/leaderboard/daily-reward/snapshot", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const dateKey = req.query.date ? String(req.query.date) : (req.body?.date ? String(req.body.date) : null);
+        const out = await (0, db_1.snapshotDailyLeaderboardRewards)({ dateKey });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/admin/leaderboard/daily-reward/raw", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const dateKey = req.query.date ? String(req.query.date) : null;
+        const limit = req.query.limit ? Number(req.query.limit) : 100;
+        const out = await (0, db_1.adminGetDailyLeaderboardRewardRaw)({ dateKey, limit });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/admin/leaderboard/daily/raw", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const limit = req.query.limit ? Number(req.query.limit) : 100;
+        const out = await (0, db_1.getDailyLeaderboardRaw)(limit);
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
 /* ---------------- REWARDS ---------------- */
 app.post("/api/rewards/ad-50", async (req, res) => {
     try {
@@ -718,14 +970,31 @@ app.post("/api/rewards/ad-50", async (req, res) => {
         const nonce = String(req.body?.nonce || "");
         if (!nonce)
             return res.status(400).json({ ok: false });
+        const levelRes = await db_1.pool.query(`SELECT level FROM public.progress WHERE uid = $1 LIMIT 1`, [uid]);
+        const levelBefore = Number(levelRes.rows[0]?.level || 1);
+        const adStateRes = await db_1.pool.query(`SELECT ads_watched_today FROM public.users WHERE uid = $1 LIMIT 1`, [uid]);
+        const adsWatchedToday = Number(adStateRes.rows[0]?.ads_watched_today || 0);
+        const rewardCoins = getAdRewardCoins(adsWatchedToday);
         const out = await (0, db_1.claimReward)({
             uid,
             type: "ad_50",
             nonce,
-            amount: 50,
+            amount: rewardCoins,
             cooldownSeconds: 180,
         });
-        res.json({ ok: true, already: !!out?.already, user: out?.user });
+        if (!out?.already) {
+            try {
+                await (0, db_1.trackRewardedAdActivity)({
+                    uid,
+                    ...getAdRequestMeta(req),
+                    ad_type: "ad_50",
+                    level_before: levelBefore,
+                    level_after: levelBefore,
+                });
+            }
+            catch { }
+        }
+        res.json({ ok: true, already: !!out?.already, rewardCoins, user: out?.user });
     }
     catch (e) {
         res.status(400).json({ ok: false, error: e.message });
@@ -750,8 +1019,10 @@ app.post("/api/rewards/level-complete", async (req, res) => {
         if (level > savedLevel) {
             return res.status(403).json({ ok: false, error: "level_not_reached" });
         }
-        const out = await (0, db_1.claimLevelComplete)(uid, level);
-        res.json({ ok: true, already: !!out?.already, user: out?.user });
+        const usedHint = req.body?.usedHint === true;
+        const usedSkip = req.body?.usedSkip === true;
+        const out = await (0, db_1.claimLevelComplete)(uid, level, { usedHint, usedSkip });
+        res.json({ ok: true, already: !!out?.already, user: out?.user, rewards: out?.rewards || null });
     }
     catch (e) {
         res.status(400).json({ ok: false, error: e.message });
@@ -763,16 +1034,19 @@ app.post("/api/restart", async (req, res) => {
         const nonce = String(req.body?.nonce || "");
         const mode = String(req.body?.mode || "");
         await db_1.pool.query("BEGIN");
-        const userRes = await db_1.pool.query(`SELECT restarts_balance, coins FROM public.users WHERE uid=$1 FOR UPDATE`, [uid]);
-        const progressRes = await db_1.pool.query(`SELECT free_restarts_used FROM progress WHERE uid=$1 FOR UPDATE`, [uid]);
+        const userRes = await db_1.pool.query(`SELECT restarts_balance, mc_balance, rp_score, daily_rp, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`, [uid]);
+        const progressRes = await db_1.pool.query(`SELECT free_restarts_used, level FROM progress WHERE uid=$1 FOR UPDATE`, [uid]);
         const user = userRes.rows[0];
         const progress = progressRes.rows[0];
         if (!user || !progress) {
             throw new Error("User or progress not found");
         }
         const FREE_RESTART_LIMIT = 3;
-        const RESTART_PRICE = 50;
+        const RESTART_PRICE = 15;
         let usedFree = false;
+        let usedAd = false;
+        const adLevelBefore = Number(progress?.level ?? 1);
+        const rewardCoins = getAdRewardCoins(Number(user?.ads_watched_today || 0));
         if ((progress.free_restarts_used ?? 0) < FREE_RESTART_LIMIT) {
             await db_1.pool.query(`UPDATE progress
          SET free_restarts_used = free_restarts_used + 1
@@ -785,12 +1059,13 @@ app.post("/api/restart", async (req, res) => {
          WHERE uid=$1`, [uid]);
         }
         else if (mode === "coins") {
-            if ((user.coins ?? 0) < RESTART_PRICE) {
-                throw new Error("Not enough coins");
+            const spendRes = await db_1.pool.query(`UPDATE public.users
+         SET mc_balance = COALESCE(mc_balance, 0) - $1
+         WHERE uid = $2 AND COALESCE(mc_balance, 0) >= $1
+         RETURNING mc_balance, rp_score, daily_rp`, [RESTART_PRICE, uid]);
+            if (!(spendRes.rowCount ?? 0)) {
+                throw new Error("NOT_ENOUGH_COINS");
             }
-            await db_1.pool.query(`UPDATE public.users
-         SET coins = coins - $1
-         WHERE uid=$2`, [RESTART_PRICE, uid]);
         }
         else if (mode === "ad") {
             if (!nonce) {
@@ -800,12 +1075,13 @@ app.post("/api/restart", async (req, res) => {
                 uid,
                 type: "restart_ad",
                 nonce,
-                amount: 1,
+                amount: rewardCoins,
                 cooldownSeconds: 30,
             });
             if (reward?.already) {
                 throw new Error("Ad already claimed");
             }
+            usedAd = true;
         }
         else {
             throw new Error("No restarts available");
@@ -818,13 +1094,28 @@ app.post("/api/restart", async (req, res) => {
             await (0, db_1.recalcAndStoreMonthlyRate)(uid);
         }
         catch { }
-        const updatedUser = await db_1.pool.query(`SELECT restarts_balance, coins FROM public.users WHERE uid=$1`, [uid]);
+        if (usedAd) {
+            try {
+                await (0, db_1.trackRewardedAdActivity)({
+                    uid,
+                    ...getAdRequestMeta(req),
+                    ad_type: "restart_ad",
+                    level_before: adLevelBefore,
+                    level_after: adLevelBefore,
+                });
+            }
+            catch { }
+        }
+        const updatedUser = await db_1.pool.query(`SELECT restarts_balance, mc_balance, rp_score, daily_rp FROM public.users WHERE uid=$1`, [uid]);
         const updatedProgress = await db_1.pool.query(`SELECT free_restarts_used FROM progress WHERE uid=$1`, [uid]);
         res.json({
             ok: true,
             free_restarts_used: updatedProgress.rows[0].free_restarts_used,
             restarts_balance: updatedUser.rows[0].restarts_balance,
-            coins: updatedUser.rows[0].coins,
+            coins: updatedUser.rows[0].mc_balance,
+            mcBalance: updatedUser.rows[0].mc_balance,
+            rpScore: updatedUser.rows[0].rp_score,
+            dailyRp: updatedUser.rows[0].daily_rp,
             usedFree,
         });
     }
@@ -867,11 +1158,14 @@ app.post("/api/rewards/daily-claim", async (req, res) => {
        WHERE uid=$1`, [uid]);
         await db_1.pool.query("COMMIT");
         try {
+            await (0, db_1.incrementDailyUserStats)(uid, { coinsEarned: reward });
+        }
+        catch { }
+        try {
             await (0, db_1.recalcAndStoreMonthlyRate)(uid);
         }
         catch { }
         res.json({
-            ok: true,
             day: plan.nextDay,
             coins: reward,
             user: updated.rows[0],
@@ -888,16 +1182,19 @@ app.post("/api/skip", async (req, res) => {
         const nonce = String(req.body?.nonce || "");
         const mode = String(req.body?.mode || "");
         await db_1.pool.query("BEGIN");
-        const userRes = await db_1.pool.query(`SELECT skips_balance, coins FROM public.users WHERE uid=$1 FOR UPDATE`, [uid]);
-        const progressRes = await db_1.pool.query(`SELECT free_skips_used FROM progress WHERE uid=$1 FOR UPDATE`, [uid]);
+        const userRes = await db_1.pool.query(`SELECT skips_balance, mc_balance, rp_score, daily_rp, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`, [uid]);
+        const progressRes = await db_1.pool.query(`SELECT free_skips_used, level FROM progress WHERE uid=$1 FOR UPDATE`, [uid]);
         const user = userRes.rows[0];
         const progress = progressRes.rows[0];
         if (!user || !progress) {
             throw new Error("User or progress not found");
         }
         const FREE_SKIP_LIMIT = 3;
-        const SKIP_PRICE = 50;
+        const SKIP_PRICE = 40;
         let usedFree = false;
+        let usedAd = false;
+        const adLevelBefore = Number(progress?.level ?? 1);
+        const rewardCoins = getAdRewardCoins(Number(user?.ads_watched_today || 0));
         if ((progress.free_skips_used ?? 0) < FREE_SKIP_LIMIT) {
             await db_1.pool.query(`UPDATE progress
          SET free_skips_used = free_skips_used + 1
@@ -910,12 +1207,13 @@ app.post("/api/skip", async (req, res) => {
          WHERE uid=$1`, [uid]);
         }
         else if (mode === "coins") {
-            if ((user.coins ?? 0) < SKIP_PRICE) {
-                throw new Error("Not enough coins");
+            const spendRes = await db_1.pool.query(`UPDATE public.users
+         SET mc_balance = COALESCE(mc_balance, 0) - $1
+         WHERE uid = $2 AND COALESCE(mc_balance, 0) >= $1
+         RETURNING mc_balance, rp_score, daily_rp`, [SKIP_PRICE, uid]);
+            if (!(spendRes.rowCount ?? 0)) {
+                throw new Error("NOT_ENOUGH_COINS");
             }
-            await db_1.pool.query(`UPDATE public.users
-         SET coins = coins - $1
-         WHERE uid=$2`, [SKIP_PRICE, uid]);
         }
         else if (mode === "ad") {
             if (!nonce) {
@@ -925,12 +1223,13 @@ app.post("/api/skip", async (req, res) => {
                 uid,
                 type: "skip_ad",
                 nonce,
-                amount: 1,
+                amount: rewardCoins,
                 cooldownSeconds: 30,
             });
             if (reward?.already) {
                 throw new Error("Ad already claimed");
             }
+            usedAd = true;
         }
         else {
             throw new Error("No skips available");
@@ -943,13 +1242,28 @@ app.post("/api/skip", async (req, res) => {
             await (0, db_1.recalcAndStoreMonthlyRate)(uid);
         }
         catch { }
-        const updatedUser = await db_1.pool.query(`SELECT skips_balance, coins FROM public.users WHERE uid=$1`, [uid]);
+        if (usedAd) {
+            try {
+                await (0, db_1.trackRewardedAdActivity)({
+                    uid,
+                    ...getAdRequestMeta(req),
+                    ad_type: "skip_ad",
+                    level_before: adLevelBefore,
+                    level_after: adLevelBefore,
+                });
+            }
+            catch { }
+        }
+        const updatedUser = await db_1.pool.query(`SELECT skips_balance, mc_balance, rp_score, daily_rp FROM public.users WHERE uid=$1`, [uid]);
         const updatedProgress = await db_1.pool.query(`SELECT free_skips_used FROM progress WHERE uid=$1`, [uid]);
         res.json({
             ok: true,
             free_skips_used: updatedProgress.rows[0].free_skips_used,
             skips_balance: updatedUser.rows[0].skips_balance,
-            coins: updatedUser.rows[0].coins,
+            coins: updatedUser.rows[0].mc_balance,
+            mcBalance: updatedUser.rows[0].mc_balance,
+            rpScore: updatedUser.rows[0].rp_score,
+            dailyRp: updatedUser.rows[0].daily_rp,
             usedFree,
         });
     }
@@ -964,16 +1278,19 @@ app.post("/api/hint", async (req, res) => {
         const nonce = String(req.body?.nonce || "");
         const mode = String(req.body?.mode || "");
         await db_1.pool.query("BEGIN");
-        const userRes = await db_1.pool.query(`SELECT hints_balance, coins FROM public.users WHERE uid=$1 FOR UPDATE`, [uid]);
-        const progressRes = await db_1.pool.query(`SELECT free_hints_used FROM progress WHERE uid=$1 FOR UPDATE`, [uid]);
+        const userRes = await db_1.pool.query(`SELECT hints_balance, mc_balance, rp_score, daily_rp, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`, [uid]);
+        const progressRes = await db_1.pool.query(`SELECT free_hints_used, level FROM progress WHERE uid=$1 FOR UPDATE`, [uid]);
         const user = userRes.rows[0];
         const progress = progressRes.rows[0];
         if (!user || !progress) {
             throw new Error("User or progress not found");
         }
         const FREE_HINT_LIMIT = 3;
-        const HINT_PRICE = 50;
+        const HINT_PRICE = 15;
         let usedFree = false;
+        let usedAd = false;
+        const adLevelBefore = Number(progress?.level ?? 1);
+        const rewardCoins = getAdRewardCoins(Number(user?.ads_watched_today || 0));
         if ((progress.free_hints_used ?? 0) < FREE_HINT_LIMIT) {
             await db_1.pool.query(`UPDATE progress
          SET free_hints_used = free_hints_used + 1
@@ -986,12 +1303,13 @@ app.post("/api/hint", async (req, res) => {
          WHERE uid=$1`, [uid]);
         }
         else if (mode === "coins") {
-            if ((user.coins ?? 0) < HINT_PRICE) {
-                throw new Error("Not enough coins");
+            const spendRes = await db_1.pool.query(`UPDATE public.users
+         SET mc_balance = COALESCE(mc_balance, 0) - $1
+         WHERE uid = $2 AND COALESCE(mc_balance, 0) >= $1
+         RETURNING mc_balance, rp_score, daily_rp`, [HINT_PRICE, uid]);
+            if (!(spendRes.rowCount ?? 0)) {
+                throw new Error("NOT_ENOUGH_COINS");
             }
-            await db_1.pool.query(`UPDATE public.users
-         SET coins = coins - $1
-         WHERE uid=$2`, [HINT_PRICE, uid]);
         }
         else if (mode === "ad") {
             if (!nonce) {
@@ -1001,12 +1319,13 @@ app.post("/api/hint", async (req, res) => {
                 uid,
                 type: "hint_ad",
                 nonce,
-                amount: 1,
+                amount: rewardCoins,
                 cooldownSeconds: 30,
             });
             if (reward?.already) {
                 throw new Error("Ad already claimed");
             }
+            usedAd = true;
         }
         else {
             throw new Error("No hints available");
@@ -1019,13 +1338,28 @@ app.post("/api/hint", async (req, res) => {
             await (0, db_1.recalcAndStoreMonthlyRate)(uid);
         }
         catch { }
-        const updatedUser = await db_1.pool.query(`SELECT hints_balance, coins FROM public.users WHERE uid=$1`, [uid]);
+        if (usedAd) {
+            try {
+                await (0, db_1.trackRewardedAdActivity)({
+                    uid,
+                    ...getAdRequestMeta(req),
+                    ad_type: "hint_ad",
+                    level_before: adLevelBefore,
+                    level_after: adLevelBefore,
+                });
+            }
+            catch { }
+        }
+        const updatedUser = await db_1.pool.query(`SELECT hints_balance, mc_balance, rp_score, daily_rp FROM public.users WHERE uid=$1`, [uid]);
         const updatedProgress = await db_1.pool.query(`SELECT free_hints_used FROM progress WHERE uid=$1`, [uid]);
         res.json({
             ok: true,
             free_hints_used: updatedProgress.rows[0].free_hints_used,
             hints_balance: updatedUser.rows[0].hints_balance,
-            coins: updatedUser.rows[0].coins,
+            coins: updatedUser.rows[0].mc_balance,
+            mcBalance: updatedUser.rows[0].mc_balance,
+            rpScore: updatedUser.rows[0].rp_score,
+            dailyRp: updatedUser.rows[0].daily_rp,
             usedFree,
         });
     }
@@ -1038,11 +1372,198 @@ app.post("/api/hint", async (req, res) => {
 app.post("/admin/month-close", async (req, res) => {
     try {
         requireAdmin(req);
-        const month = req.body?.month ? String(req.body.month) : undefined;
-        res.json(await (0, db_1.closeMonthAndResetCoins)({ month }));
+        const monthKey = req.body?.month_key ? String(req.body.month_key) : undefined;
+        const conversionRateLocked = Number(req.body?.conversion_rate_locked);
+        const minPayoutThresholdPi = Number(req.body?.min_payout_threshold_pi ?? 0);
+        const out = await (0, db_1.closeMonthlyPayoutCycle)({
+            monthKey,
+            conversionRateLocked,
+            minPayoutThresholdPi,
+        });
+        res.json(out);
     }
     catch (e) {
-        res.status(401).json({ ok: false, error: e.message });
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/payouts/generate", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const cycleId = req.body?.cycle_id ? Number(req.body.cycle_id) : undefined;
+        const monthKey = req.body?.month_key ? String(req.body.month_key) : undefined;
+        const out = await (0, db_1.generatePayoutJobs)({ cycleId, monthKey });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/admin/payouts/jobs", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const cycleId = req.query.cycle_id ? Number(req.query.cycle_id) : undefined;
+        const monthKey = req.query.month_key ? String(req.query.month_key) : undefined;
+        const status = req.query.status ? String(req.query.status) : undefined;
+        const uidSearch = req.query.uid ? String(req.query.uid) : undefined;
+        const limit = req.query.limit ? Number(req.query.limit) : undefined;
+        const offset = req.query.offset ? Number(req.query.offset) : undefined;
+        const out = await (0, db_1.adminListPayoutJobs)({
+            cycleId,
+            monthKey,
+            status: status,
+            uidSearch,
+            limit,
+            offset,
+        });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/admin/payouts/cycles", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const limit = req.query.limit ? Number(req.query.limit) : undefined;
+        const out = await (0, db_1.adminListPayoutCycles)({ limit });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/admin/payouts/summary", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const cycleId = req.query.cycle_id ? Number(req.query.cycle_id) : undefined;
+        const monthKey = req.query.month_key ? String(req.query.month_key) : undefined;
+        const out = await (0, db_1.adminGetPayoutSnapshotSummary)({ cycleId, monthKey });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/admin/payouts/config", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const out = await (0, db_1.adminGetPayoutRuntimeConfig)();
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/payouts/config/simulation", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const enabled = String(req.body?.enabled || "").toLowerCase();
+        const out = await (0, db_1.adminSetPayoutSimulationMode)(enabled === "true" || enabled === "1");
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/admin/payouts/snapshots", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const cycleId = req.query.cycle_id ? Number(req.query.cycle_id) : undefined;
+        const monthKey = req.query.month_key ? String(req.query.month_key) : undefined;
+        const limit = req.query.limit ? Number(req.query.limit) : undefined;
+        const offset = req.query.offset ? Number(req.query.offset) : undefined;
+        const out = await (0, db_1.adminListPayoutSnapshots)({ cycleId, monthKey, limit, offset });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/payouts/retry", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const monthKey = req.body?.month_key ? String(req.body.month_key) : undefined;
+        const out = await (0, db_1.adminRetryFailedPayouts)({ monthKey });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/payouts/requeue", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const jobId = Number(req.body?.job_id || 0);
+        const out = await (0, db_1.adminRequeueFailedPayoutJob)(jobId);
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/payouts/jobs/:id/resolve", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const jobId = Number(req.params.id);
+        const out = await (0, db_1.adminResolvePayoutJob)(jobId);
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/payouts/jobs/:id/status", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const jobId = Number(req.params.id);
+        const status = String(req.body?.status || "");
+        const txid = req.body?.txid ? String(req.body.txid) : undefined;
+        const errorMessage = req.body?.error_message ? String(req.body.error_message) : undefined;
+        const out = await (0, db_1.adminUpdatePayoutJobStatus)({
+            jobId,
+            status: status,
+            txid,
+            errorMessage,
+        });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/admin/payouts/jobs/:id/logs", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const jobId = Number(req.params.id);
+        const limit = req.query.limit ? Number(req.query.limit) : undefined;
+        const out = await (0, db_1.adminListPayoutTransferLogs)(jobId, limit);
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/payouts/jobs/:id/requeue", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const jobId = Number(req.params.id);
+        const out = await (0, db_1.adminRequeueFailedPayoutJob)(jobId);
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/payouts/worker/run", async (req, res) => {
+    try {
+        requireAdmin(req);
+        await (0, db_1.adminSyncPayoutSimulationModeFromDb)();
+        const limit = req.body?.limit ? Number(req.body.limit) : undefined;
+        const out = await (0, db_1.runPayoutWorkerBatch)({ limit });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
     }
 });
 /* ---------------- ADMIN: stats/online/users ---------------- */
@@ -1069,7 +1590,7 @@ app.get("/admin/online", async (req, res) => {
         res.status(401).json({ ok: false, error: e.message });
     }
 });
-/* ✅ NEW: admin users list + detail (Fix 2) */
+/* âœ… NEW: admin users list + detail (Fix 2) */
 app.get("/admin/users", async (req, res) => {
     try {
         requireAdmin(req);
@@ -1077,7 +1598,19 @@ app.get("/admin/users", async (req, res) => {
         const limit = Math.max(1, Math.min(200, Number(req.query.limit || 25)));
         const offset = Math.max(0, Number(req.query.offset || 0));
         const order = String(req.query.order || "updated_at_desc");
-        const out = await (0, db_1.adminListUsers)({ search, limit, offset });
+        const suspiciousOnly = String(req.query.suspicious || "") === "1";
+        const vpnOnly = String(req.query.vpn || "") === "1";
+        const manualReviewOnly = String(req.query.manual_review || "") === "1";
+        const payoutLockedOnly = String(req.query.payout_locked || "") === "1";
+        const out = await (0, db_1.adminListUsers)({
+            search,
+            limit,
+            offset,
+            suspiciousOnly,
+            vpnOnly,
+            manualReviewOnly,
+            payoutLockedOnly,
+        });
         res.json(out);
     }
     catch (e) {
@@ -1094,7 +1627,48 @@ app.get("/admin/users/:uid", async (req, res) => {
         res.status(401).json({ ok: false, error: e.message });
     }
 });
-/* ✅ NEW: charts endpoints (Step 1 – “A: last 7 days”) */
+app.post("/admin/users/:uid/payout-unlock", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const out = await (0, db_1.adminSetUserPayoutLock)(String(req.params.uid), false);
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/users/:uid/suspicious-clear", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const out = await (0, db_1.adminSetUserSuspicious)(String(req.params.uid), false);
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/users/:uid/manual-review", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const enabled = String(req.body?.enabled || "1") !== "0";
+        const out = await (0, db_1.adminSetUserManualReview)(String(req.params.uid), enabled);
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/users/:uid/fraud-recompute", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const out = await (0, db_1.adminReevaluateUserFraud)(String(req.params.uid));
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+/* âœ… NEW: charts endpoints (Step 1 â€“ â€œA: last 7 daysâ€) */
 app.get("/admin/charts/coins", async (req, res) => {
     try {
         requireAdmin(req);
@@ -1117,7 +1691,7 @@ app.get("/admin/charts/active", async (req, res) => {
         res.status(401).json({ ok: false, error: e.message });
     }
 });
-// ✅ ADMIN: delete user completely
+// âœ… ADMIN: delete user completely
 app.delete("/admin/users/:uid", async (req, res) => {
     try {
         requireAdmin(req);
@@ -1129,13 +1703,28 @@ app.delete("/admin/users/:uid", async (req, res) => {
     }
 });
 /* ---------------- START ---------------- */
+let lastAdResetDate = "";
+async function maybeRunDailyAdReset() {
+    const today = new Date().toISOString().slice(0, 10);
+    if (today === lastAdResetDate)
+        return;
+    try {
+        await (0, db_1.resetDailyAdCounters)();
+        lastAdResetDate = today;
+    }
+    catch (e) {
+        console.error("daily_ad_reset_failed", e);
+    }
+}
 const PORT = Number(process.env.PORT) || 8080;
 async function start() {
     try {
         await (0, db_1.initDB)();
+        await maybeRunDailyAdReset();
         const info = await db_1.pool.query(`
       SELECT current_database(), inet_server_addr(), inet_server_port()
     `);
+        setInterval(() => { void maybeRunDailyAdReset(); }, 60 * 60 * 1000);
         app.listen(PORT, "0.0.0.0", () => {
         });
     }
