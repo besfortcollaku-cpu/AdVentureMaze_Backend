@@ -1329,9 +1329,12 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
       return res.status(403).json({ ok:false, error:"level_not_reached" });
     }
 
-    const out = await claimLevelComplete(uid, level);
+    const usedHint = req.body?.usedHint === true;
+    const usedSkip = req.body?.usedSkip === true;
 
-    res.json({ ok:true, already:!!out?.already, user:out?.user });
+    const out = await claimLevelComplete(uid, level, { usedHint, usedSkip });
+
+    res.json({ ok:true, already:!!out?.already, user:out?.user, rewards: out?.rewards || null });
 
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
@@ -2185,6 +2188,7 @@ async function start() {
 }
 
 start();
+
 
 
 

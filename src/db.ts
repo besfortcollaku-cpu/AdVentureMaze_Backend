@@ -3164,7 +3164,26 @@ export async function claimDailyLogin(uid: string) {
   return { user };
 }
 
-export async function claimLevelComplete(uid: string, level: number) {
+function calculateLevelRewards(params: { usedHint: boolean; usedSkip: boolean }) {
+  const mc = 2;
+  let rp = 0;
+
+  if (params.usedSkip) {
+    rp = 0;
+  } else if (params.usedHint) {
+    rp = 1;
+  } else {
+    rp = 2;
+  }
+
+  return { mc, rp };
+}
+
+export async function claimLevelComplete(
+  uid: string,
+  level: number,
+  opts?: { usedHint?: boolean; usedSkip?: boolean }
+) {
   if (!Number.isInteger(level) || level < 1) {
     throw new Error("invalid_level");
   }
@@ -3182,7 +3201,22 @@ export async function claimLevelComplete(uid: string, level: number) {
     return { already: true };
   }
 
-  const user = await addCoins(uid, 1);
+  await addCoins(uid, 1);
+
+  const rewards = calculateLevelRewards({
+    usedHint: Boolean(opts?.usedHint),
+    usedSkip: Boolean(opts?.usedSkip),
+  });
+
+  // Keep the legacy coin reward during migration, then add the remaining MC
+  // through the new balance so gameplay does not change abruptly.
+  if (rewards.mc > 1) {
+    await addMC(uid, rewards.mc - 1);
+  }
+
+  if (rewards.rp > 0) {
+    await addRP(uid, rewards.rp);
+  }
 
   await pool.query(
     `
@@ -3197,7 +3231,8 @@ export async function claimLevelComplete(uid: string, level: number) {
 
   await recalcAndStoreMonthlyRate(uid);
   await auditRewardEvent({ uid, eventType: "level_complete", eventKey: String(level), amountCoins: 1, accepted: true });
-  return { user };
+  const user = await getUserByUid(uid);
+  return { user, rewards };
 }
 
 /* =====================================================
@@ -4115,6 +4150,7 @@ export async function claimInviteCode(inviteeUid: string, rawCode: string) {
     client.release();
   }
 }
+
 
 
 
