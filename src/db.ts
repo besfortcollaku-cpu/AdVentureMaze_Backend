@@ -726,6 +726,7 @@ const REWARD_TIERS = [
   { name: "C", label: "Advanced", percent: 15, poolShare: 20 },
   { name: "D", label: "Qualified", percent: 30, poolShare: 13 },
 ] as const;
+type RewardTierName = (typeof REWARD_TIERS)[number]["name"];
 const MAX_USER_MONTHLY_PI = envNumber("MAX_USER_MONTHLY_PI", 100);
 const MAX_GLOBAL_MONTHLY_PI = envNumber("MAX_GLOBAL_MONTHLY_PI", 100000);
 const MIN_ACCOUNT_AGE_DAYS = envNumber("MIN_ACCOUNT_AGE_DAYS", 7);
@@ -1465,7 +1466,7 @@ function buildLeaderboardTierCutoffs(assignments: MonthlyPiPayoutRow[]) {
   });
 }
 
-function getNextTierCutoff(tierName: string | null, tierCutoffs: Array<{ tierName: string; tierLabel: string; minRank: number | null; maxRank: number | null; minRpScore: number | null; }>) {
+function getNextTierCutoff(tierName: RewardTierName | null, tierCutoffs: Array<{ tierName: string; tierLabel: string; minRank: number | null; maxRank: number | null; minRpScore: number | null; }>) {
   const tierOrder = REWARD_TIERS.map((tier) => tier.name);
   if (!tierName) {
     return tierCutoffs[tierCutoffs.length - 1] || null;
@@ -1528,7 +1529,7 @@ export async function getMonthlyLeaderboardMe(uid: string, opts?: { monthKey?: s
   );
   const userRow = userRes.rows[0] || null;
   const effectiveRp = Number(user?.rp_score ?? userRow?.rp_score ?? 0);
-  const nextTier = getNextTierCutoff(row?.tier_name || null, tierCutoffs);
+  const nextTier = getNextTierCutoff((row?.tier_name as RewardTierName | null) || null, tierCutoffs);
 
   return {
     ok: true,
