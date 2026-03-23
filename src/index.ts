@@ -76,6 +76,7 @@ import {
   adminSetUserPayoutLock,
   adminSetUserSuspicious,
   adminSetUserManualReview,
+  adminSetUserTestFlag,
   adminReevaluateUserFraud,
   adminAdjustUserEconomy,
   adminResetUserState,
@@ -2178,6 +2179,19 @@ app.post("/admin/users/:uid/manual-review", async (req,res)=>{
     requireAdmin(req);
     const enabled = String(req.body?.enabled || "1") !== "0";
     const out = await adminSetUserManualReview(String(req.params.uid), enabled);
+    res.json(out);
+  }catch(e:any){
+    res.status(400).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/admin/set-test-user", async (req,res)=>{
+  try{
+    requireAdmin(req);
+    const uid = String(req.body?.uid || "").trim();
+    if (!uid) throw new Error("missing_uid");
+    if (typeof req.body?.isTestUser !== "boolean") throw new Error("missing_is_test_user");
+    const out = await adminSetUserTestFlag(uid, Boolean(req.body.isTestUser));
     res.json(out);
   }catch(e:any){
     res.status(400).json({ ok:false, error:e.message });

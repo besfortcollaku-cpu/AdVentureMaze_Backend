@@ -197,7 +197,8 @@ await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_
       ADD COLUMN IF NOT EXISTS mc_balance INT NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS rp_score INT NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS daily_rp INT NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS last_rp_reset TIMESTAMP DEFAULT NOW();
+      ADD COLUMN IF NOT EXISTS last_rp_reset TIMESTAMP DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS is_test_user BOOLEAN NOT NULL DEFAULT FALSE;
   `);
 
   await pool.query(`
@@ -4215,6 +4216,7 @@ function normalizeAdminUser(user: any, extra?: {
     suspiciousFlag: Boolean(user?.suspicious ?? user?.suspiciousFlag),
     manualFlag: Boolean(user?.manual_review_required ?? user?.manualFlag),
     lockedFlag: Boolean(user?.payout_locked ?? user?.lockedFlag),
+    isTestUser: Boolean(user?.is_test_user ?? user?.isTestUser),
     updatedAt: user?.updated_at ?? user?.updatedAt ?? null,
   };
 }
@@ -4539,6 +4541,7 @@ export async function adminGetUser(uid: string) {
     coins: Number(user?.mc_balance ?? user?.coins ?? 0),
     score: Number(user?.rp_score ?? 0),
     dailyScore: Number(user?.daily_rp ?? 0),
+    isTestUser: Boolean(user?.is_test_user ?? false),
     currentRank: leaderboard?.currentRank ?? null,
     projectedTier: leaderboard?.projectedTierLabel ?? leaderboard?.projectedTierName ?? null,
     wallet: user?.pi_wallet_identifier ?? null,
@@ -4590,6 +4593,24 @@ export async function adminSetUserManualReview(uid: string, manualReview: boolea
   );
   if (!rows[0]) throw new Error("user_not_found");
   return { ok: true, row: rows[0] };
+}
+
+export async function adminSetUserTestFlag(uid: string, isTestUser: boolean) {
+  const { rows } = await pool.query(
+    `UPDATE public.users
+        SET is_test_user = $2,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING uid, is_test_user, updated_at`,
+    [uid, isTestUser]
+  );
+  if (!rows[0]) throw new Error("user_not_found");
+  return {
+    ok: true,
+    uid,
+    isTestUser: Boolean(rows[0].is_test_user),
+    row: rows[0],
+  };
 }
 
 export async function adminReevaluateUserFraud(uid: string) {
@@ -4651,7 +4672,7 @@ export async function adminResetUserState(opts: {
     await client.query("BEGIN");
 
     const userRes = await client.query(
-      `SELECT uid
+      `SELECT uid, COALESCE(is_test_user, FALSE) AS is_test_user
          FROM public.users
         WHERE uid = $1
         LIMIT 1
@@ -4660,6 +4681,9 @@ export async function adminResetUserState(opts: {
     );
     if (!userRes.rows[0]) {
       throw new Error("user_not_found");
+    }
+    if (!userRes.rows[0]?.is_test_user) {
+      throw new Error("Reset is allowed only for test users");
     }
 
     const userColumns = await existingColumns(client, "public.users", [
