@@ -9,6 +9,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import {
+  DAILY_LEVELS_MAX,
   DAILY_REWARD_COINS,
   FREE_HINTS_PER_ACCOUNT,
   FREE_RESTARTS_PER_ACCOUNT,
@@ -16,6 +17,7 @@ import {
   HINT_MC_COST,
   RESTART_MC_COST,
   SKIP_MC_COST,
+  SURPRISE_BOX_DAILY_MAX,
   getAdRewardCoinsForDailyCount,
   getDailyRewardCoinsForDay,
   getMysteryChestRewardFromRoll,
@@ -93,9 +95,13 @@ import {
   adminReevaluateUserFraud,
   adminAdjustUserEconomy,
   adminResetUserState,
+  claimDailyLevelAdUnlock,
+  getDailySurpriseBoxState,
+  openSurpriseBox,
   // âœ… charts1
   adminChartCoins,
   adminChartActiveUsers,
+  getDailyLevelAccessState,
 } from "./db";
 
 
@@ -126,6 +132,8 @@ app.get("/api/me", async (req, res) => {
 
   try {
     const { uid } = await requirePiUser(req);
+    const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
+    const surpriseBoxState = await getDailySurpriseBoxState(uid).catch(() => null);
 
     const userRes = await pool.query(
       `SELECT * FROM public.users WHERE uid = $1 LIMIT 1`,
@@ -301,7 +309,23 @@ if (firstRecoverableMissedDay) {
             invited_usernames: invitedUsernames,
             pi_wallet_identifier: user.pi_wallet_identifier ?? null,
             wallet_verified: Boolean(user.wallet_verified),
-            wallet_last_updated_at: user.wallet_last_updated_at ?? null,          }
+            wallet_last_updated_at: user.wallet_last_updated_at ?? null,
+            daily_levels_played: levelAccess?.dailyLevelsPlayed ?? user.daily_levels_played ?? 0,
+            daily_levels_unlocked: levelAccess?.dailyLevelsUnlocked ?? user.daily_levels_unlocked ?? levelAccess?.initialDailyUnlockedLevels ?? 10,
+            daily_levels_max: levelAccess?.dailyLevelsMax ?? DAILY_LEVELS_MAX,
+            initial_daily_unlocked_levels: levelAccess?.initialDailyUnlockedLevels ?? 10,
+            next_unlock_at: levelAccess?.nextUnlockAt ?? (user.next_unlock_at ? new Date(user.next_unlock_at).toISOString() : null),
+            can_watch_ad_to_unlock: levelAccess?.canWatchAdToUnlock ?? false,
+            can_unlock_with_ad: levelAccess?.canUnlockWithAd ?? false,
+            can_play_now: levelAccess?.canPlayNow ?? true,
+            is_daily_cap_reached: levelAccess?.isDailyCapReached ?? false,
+            is_waiting_for_unlock: levelAccess?.isWaitingForUnlock ?? false,
+            daily_limit_reached: levelAccess?.dailyLimitReached ?? false,
+            daily_surprise_boxes_opened: surpriseBoxState?.dailyBoxesOpened ?? user.daily_surprise_boxes_opened ?? 0,
+            daily_surprise_boxes_max: surpriseBoxState?.dailyBoxesMax ?? SURPRISE_BOX_DAILY_MAX,
+            daily_surprise_boxes_remaining: surpriseBoxState?.dailyBoxesRemaining ?? Math.max(0, SURPRISE_BOX_DAILY_MAX - Number(user.daily_surprise_boxes_opened ?? 0)),
+            can_open_surprise_box: surpriseBoxState?.canOpenNow ?? true,
+          }
         : null,
 
       progress: progress
@@ -317,6 +341,8 @@ if (firstRecoverableMissedDay) {
           }
         : null,
       dailyReward,
+      levelAccess,
+      surpriseBoxState,
       missedDay,
       mysteryChest,
     });
@@ -635,6 +661,23 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
   } catch (e: any) {
     await pool.query("ROLLBACK");
     res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/surprise-box/open", async (req, res) => {
+  let uid: string | null = null;
+  try {
+    const auth = await requirePiUser(req);
+    uid = auth.uid;
+    const out = await openSurpriseBox(uid);
+    res.json({ success: true, ...out });
+  } catch (e: any) {
+    const surpriseBoxState = uid ? await getDailySurpriseBoxState(uid).catch(() => null) : null;
+    res.status(400).json({
+      ok: false,
+      error: e.message,
+      surpriseBoxState,
+    });
   }
 });
 app.post("/api/daily-reward/recover", async (req, res) => {
@@ -1395,12 +1438,35 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
 
     const out = await claimLevelComplete(uid, level, { usedHint, usedSkip });
 
-    res.json({ ok:true, already:!!out?.already, user:out?.user, rewards: out?.rewards || null });
+    res.json({ ok:true, already:!!out?.already, user:out?.user, rewards: out?.rewards || null, levelAccess: out?.levelAccess || null });
 
   }catch(e:any){
-    res.status(400).json({ok:false,error:e.message});
+    try {
+      const { uid } = await requirePiUser(req);
+      const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
+      res.status(400).json({ok:false,error:e.message, levelAccess});
+    } catch {
+      res.status(400).json({ok:false,error:e.message});
+    }
   }
 })
+
+app.post("/api/levels/ad-unlock", async (req,res)=>{
+  try{
+    const { uid } = await requirePiUser(req);
+    const out = await claimDailyLevelAdUnlock(uid);
+    res.json({ ok: true, user: out.user, levelAccess: out.levelAccess });
+  }catch(e:any){
+    try {
+      const { uid } = await requirePiUser(req);
+      const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
+      res.status(400).json({ ok:false, error:e.message, levelAccess });
+    } catch {
+      res.status(400).json({ ok:false, error:e.message });
+    }
+  }
+})
+
 app.post("/api/restart", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);

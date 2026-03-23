@@ -3,6 +3,13 @@ import { sendPiPayout as sendPiPayoutAdapter, getSendingWalletAvailableBalancePi
 import { lookupIpRisk } from "./services/ipRisk";
 import { runtimeConfig, setPayoutSimulationMode } from "./config/runtime";
 import {
+  DAILY_LEVELS_MAX,
+  INITIAL_DAILY_UNLOCKED_LEVELS,
+  AD_UNLOCK_LEVELS,
+  SURPRISE_BOX_DAILY_MAX,
+  rollSurpriseBoxReward,
+  UNLOCK_INTERVAL_SECONDS,
+  UNLOCK_LEVELS_PER_INTERVAL,
   DAILY_RANKING_REWARD_TABLE,
   DAILY_SCORE_CAP as DAILY_RP_CAP,
   FREE_HINTS_PER_ACCOUNT,
@@ -219,6 +226,12 @@ await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_
       ADD COLUMN IF NOT EXISTS daily_rp INT NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS last_rp_reset TIMESTAMP DEFAULT NOW(),
       ADD COLUMN IF NOT EXISTS is_test_user BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS daily_surprise_boxes_opened INT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_surprise_box_day_key TEXT,
+      ADD COLUMN IF NOT EXISTS daily_levels_played INT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS daily_levels_unlocked INT NOT NULL DEFAULT 10,
+      ADD COLUMN IF NOT EXISTS last_level_reset_day_key TEXT,
+      ADD COLUMN IF NOT EXISTS next_unlock_at TIMESTAMP,
       ADD COLUMN IF NOT EXISTS economy_version INT NOT NULL DEFAULT 1;
   `);
 
@@ -249,6 +262,56 @@ await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_
       level_before INTEGER,
       level_after INTEGER
     );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.level_access_events (
+      id BIGSERIAL PRIMARY KEY,
+      uid TEXT NOT NULL,
+      day_key TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      levels_played INT,
+      levels_unlocked INT,
+      daily_levels_max INT,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS level_access_events_day_type_created_idx
+    ON public.level_access_events (day_key, event_type, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS level_access_events_uid_day_created_idx
+    ON public.level_access_events (uid, day_key, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS level_access_events_type_created_idx
+    ON public.level_access_events (event_type, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.surprise_box_rewards (
+      id BIGSERIAL PRIMARY KEY,
+      uid TEXT NOT NULL,
+      day_key TEXT NOT NULL,
+      reward_type TEXT NOT NULL,
+      reward_amount INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS surprise_box_rewards_uid_day_created_idx
+    ON public.surprise_box_rewards (uid, day_key, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS surprise_box_rewards_type_created_idx
+    ON public.surprise_box_rewards (reward_type, created_at DESC)
   `);
 
   await pool.query(`
@@ -717,6 +780,49 @@ export function monthKeyForDate(d: Date) {
 
 export function getMonthKey(date = new Date()) {
   return monthKeyForDate(date);
+}
+
+export function getDayKey(date = new Date()) {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(date.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+async function logLevelAccessEvent(
+  input: {
+    uid: string;
+    dayKey?: string | null;
+    eventType: string;
+    levelsPlayed?: number | null;
+    levelsUnlocked?: number | null;
+    dailyLevelsMax?: number | null;
+    metadata?: Record<string, any> | null;
+  },
+  client?: any
+) {
+  const queryable = client || pool;
+  const dayKey = input.dayKey || getDayKey();
+  const metadata = input.metadata && typeof input.metadata === "object" ? input.metadata : {};
+
+  try {
+    await queryable.query(
+      `INSERT INTO public.level_access_events
+         (uid, day_key, event_type, levels_played, levels_unlocked, daily_levels_max, metadata, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW())`,
+      [
+        input.uid,
+        dayKey,
+        input.eventType,
+        input.levelsPlayed ?? null,
+        input.levelsUnlocked ?? null,
+        input.dailyLevelsMax ?? null,
+        JSON.stringify(metadata),
+      ]
+    );
+  } catch {
+    // Analytics are observational only. Never block gameplay/admin flows.
+  }
 }
 
 export function clampRpAward(requestedAmount: number, currentDailyRp: number, cap: number = DAILY_RP_CAP) {
@@ -1404,6 +1510,425 @@ function calculateLevelRewardsForUser(user: any, params: { usedHint: boolean; us
 
   // Future economy versions can branch here without changing current v1 behavior.
   return calculateLevelRewardsV1(params);
+}
+
+function buildDailyLevelAccessState(user: any) {
+  const dailyLevelsPlayed = Math.max(0, Number(user?.daily_levels_played || 0));
+  const dailyLevelsUnlocked = Math.max(
+    INITIAL_DAILY_UNLOCKED_LEVELS,
+    Math.min(DAILY_LEVELS_MAX, Number(user?.daily_levels_unlocked || INITIAL_DAILY_UNLOCKED_LEVELS))
+  );
+  const dailyLevelsMax = DAILY_LEVELS_MAX;
+  const nextUnlockAt = user?.next_unlock_at ? new Date(user.next_unlock_at).toISOString() : null;
+  const canPlayNow = dailyLevelsPlayed < dailyLevelsUnlocked && dailyLevelsPlayed < dailyLevelsMax;
+  const waitingForUnlock = dailyLevelsPlayed >= dailyLevelsUnlocked && dailyLevelsUnlocked < dailyLevelsMax && dailyLevelsPlayed < dailyLevelsMax;
+  const dailyCapReached = dailyLevelsPlayed >= dailyLevelsMax;
+
+  return {
+    dailyLevelsPlayed,
+    dailyLevelsUnlocked,
+    dailyLevelsMax,
+    initialDailyUnlockedLevels: INITIAL_DAILY_UNLOCKED_LEVELS,
+    nextUnlockAt,
+    unlockIntervalSeconds: UNLOCK_INTERVAL_SECONDS,
+    unlockLevelsPerInterval: UNLOCK_LEVELS_PER_INTERVAL,
+    adUnlockLevels: AD_UNLOCK_LEVELS,
+    canPlayNow,
+    isDailyCapReached: dailyCapReached,
+    isWaitingForUnlock: waitingForUnlock,
+    canUnlockWithAd: waitingForUnlock,
+    canWatchAdToUnlock: waitingForUnlock,
+    dailyLimitReached: dailyCapReached,
+  };
+}
+
+function buildDailySurpriseBoxState(user: any) {
+  const dailyBoxesOpened = Math.max(0, Number(user?.daily_surprise_boxes_opened || 0));
+  const dailyBoxesMax = SURPRISE_BOX_DAILY_MAX;
+  const dailyBoxesRemaining = Math.max(0, dailyBoxesMax - dailyBoxesOpened);
+  const canOpenNow = dailyBoxesOpened < dailyBoxesMax;
+
+  return {
+    dailyBoxesOpened,
+    dailyBoxesMax,
+    dailyBoxesRemaining,
+    canOpenNow,
+    dailyLimitReached: !canOpenNow,
+  };
+}
+
+async function refreshDailySurpriseBoxStateWithClient(client: any, uid: string) {
+  const todayKey = getDayKey();
+
+  await client.query(
+    `UPDATE public.users
+        SET daily_surprise_boxes_opened = 0,
+            last_surprise_box_day_key = $2,
+            updated_at = NOW()
+      WHERE uid = $1
+        AND COALESCE(last_surprise_box_day_key, '') <> $2`,
+    [uid, todayKey]
+  );
+
+  const out = await client.query(
+    `SELECT uid,
+            mc_balance,
+            restarts_balance,
+            skips_balance,
+            hints_balance,
+            daily_surprise_boxes_opened,
+            last_surprise_box_day_key
+       FROM public.users
+      WHERE uid = $1
+      FOR UPDATE`,
+    [uid]
+  );
+
+  const user = out.rows[0];
+  if (!user) {
+    throw new Error("user_not_found");
+  }
+
+  return user;
+}
+
+async function refreshDailyLevelAccessWithClient(client: any, uid: string) {
+  const todayKey = getDayKey();
+
+  const resetRes = await client.query(
+    `UPDATE public.users
+        SET daily_levels_played = 0,
+            daily_levels_unlocked = $2,
+            last_level_reset_day_key = $3,
+            next_unlock_at = NULL,
+            updated_at = NOW()
+      WHERE uid = $1
+        AND COALESCE(last_level_reset_day_key, '') <> $3`,
+    [uid, INITIAL_DAILY_UNLOCKED_LEVELS, todayKey]
+  );
+
+  if ((resetRes.rowCount ?? 0) > 0) {
+    await logLevelAccessEvent(
+      {
+        uid,
+        dayKey: todayKey,
+        eventType: "daily_access_reset",
+        levelsPlayed: 0,
+        levelsUnlocked: INITIAL_DAILY_UNLOCKED_LEVELS,
+        dailyLevelsMax: DAILY_LEVELS_MAX,
+      },
+      client
+    );
+  }
+
+  const lockRes = await client.query(
+    `SELECT uid, daily_levels_played, daily_levels_unlocked, last_level_reset_day_key, next_unlock_at
+       FROM public.users
+      WHERE uid = $1
+      FOR UPDATE`,
+    [uid]
+  );
+
+  const user = lockRes.rows[0];
+  if (!user) {
+    throw new Error("user_not_found");
+  }
+
+  let played = Math.max(0, Number(user.daily_levels_played || 0));
+  let unlocked = Math.max(
+    INITIAL_DAILY_UNLOCKED_LEVELS,
+    Math.min(DAILY_LEVELS_MAX, Number(user.daily_levels_unlocked || INITIAL_DAILY_UNLOCKED_LEVELS))
+  );
+  let nextUnlockAt: Date | null = user.next_unlock_at ? new Date(user.next_unlock_at) : null;
+  const now = new Date();
+  const intervalMs = UNLOCK_INTERVAL_SECONDS * 1000;
+
+  if (unlocked < DAILY_LEVELS_MAX && played >= unlocked) {
+    if (!nextUnlockAt) {
+      nextUnlockAt = new Date(now.getTime() + intervalMs);
+    } else if (nextUnlockAt.getTime() <= now.getTime()) {
+      const elapsedIntervals = Math.floor((now.getTime() - nextUnlockAt.getTime()) / intervalMs) + 1;
+      unlocked = Math.min(DAILY_LEVELS_MAX, unlocked + (elapsedIntervals * UNLOCK_LEVELS_PER_INTERVAL));
+
+      const candidateNext = new Date(nextUnlockAt.getTime() + (elapsedIntervals * intervalMs));
+      nextUnlockAt = unlocked >= DAILY_LEVELS_MAX
+        ? null
+        : (played >= unlocked ? candidateNext : null);
+    }
+  } else if (played < unlocked || unlocked >= DAILY_LEVELS_MAX) {
+    nextUnlockAt = null;
+  }
+
+  const updatedRes = await client.query(
+    `UPDATE public.users
+        SET daily_levels_played = $2,
+            daily_levels_unlocked = $3,
+            last_level_reset_day_key = $4,
+            next_unlock_at = $5,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING *`,
+    [uid, played, unlocked, todayKey, nextUnlockAt]
+  );
+
+  return updatedRes.rows[0];
+}
+
+async function incrementDailyLevelsPlayedWithClient(
+  client: any,
+  uid: string,
+  metadata?: Record<string, any> | null
+) {
+  const refreshed = await refreshDailyLevelAccessWithClient(client, uid);
+  const access = buildDailyLevelAccessState(refreshed);
+
+  if (access.dailyLimitReached) {
+    await logLevelAccessEvent({
+      uid,
+      dayKey: getDayKey(),
+      eventType: "daily_cap_reached",
+      levelsPlayed: access.dailyLevelsPlayed,
+      levelsUnlocked: access.dailyLevelsUnlocked,
+      dailyLevelsMax: access.dailyLevelsMax,
+    });
+    throw new Error("daily_level_limit_reached");
+  }
+
+  if (!access.canPlayNow) {
+    await logLevelAccessEvent({
+      uid,
+      dayKey: getDayKey(),
+      eventType: "waiting_for_unlock",
+      levelsPlayed: access.dailyLevelsPlayed,
+      levelsUnlocked: access.dailyLevelsUnlocked,
+      dailyLevelsMax: access.dailyLevelsMax,
+      metadata: {
+        next_unlock_at: access.nextUnlockAt,
+      },
+    });
+    throw new Error("daily_levels_locked");
+  }
+
+  const played = Math.min(DAILY_LEVELS_MAX, access.dailyLevelsPlayed + 1);
+  const unlocked = access.dailyLevelsUnlocked;
+  const shouldQueueNextUnlock =
+    played >= unlocked &&
+    unlocked < DAILY_LEVELS_MAX;
+  const nextUnlockAt = shouldQueueNextUnlock
+    ? new Date(Date.now() + (UNLOCK_INTERVAL_SECONDS * 1000))
+    : null;
+
+  const out = await client.query(
+    `UPDATE public.users
+        SET daily_levels_played = $2,
+            next_unlock_at = $3,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING *`,
+    [uid, played, nextUnlockAt]
+  );
+
+  const updatedUser = out.rows[0];
+  await logLevelAccessEvent(
+    {
+      uid,
+      dayKey: getDayKey(),
+      eventType: "level_completed",
+      levelsPlayed: Math.max(0, Number(updatedUser?.daily_levels_played || played)),
+      levelsUnlocked: Math.max(0, Number(updatedUser?.daily_levels_unlocked || unlocked)),
+      dailyLevelsMax: DAILY_LEVELS_MAX,
+      metadata,
+    },
+    client
+  );
+
+  return updatedUser;
+}
+
+export async function getDailyLevelAccessState(uid: string) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const user = await refreshDailyLevelAccessWithClient(client, uid);
+    await client.query("COMMIT");
+    return buildDailyLevelAccessState(user);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function getDailySurpriseBoxState(uid: string) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const user = await refreshDailySurpriseBoxStateWithClient(client, uid);
+    await client.query("COMMIT");
+    return buildDailySurpriseBoxState(user);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function claimDailyLevelAdUnlock(uid: string) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const user = await refreshDailyLevelAccessWithClient(client, uid);
+    const access = buildDailyLevelAccessState(user);
+
+    if (access.dailyLimitReached) {
+      throw new Error("daily_level_limit_reached");
+    }
+
+    if (!access.canWatchAdToUnlock) {
+      throw new Error("daily_level_ad_unlock_not_available");
+    }
+
+    const nextUnlocked = Math.min(
+      DAILY_LEVELS_MAX,
+      access.dailyLevelsUnlocked + AD_UNLOCK_LEVELS
+    );
+
+    const out = await client.query(
+      `UPDATE public.users
+          SET daily_levels_unlocked = $2,
+              next_unlock_at = NULL,
+              updated_at = NOW()
+        WHERE uid = $1
+        RETURNING *`,
+      [uid, nextUnlocked]
+    );
+
+    const updatedUser = out.rows[0];
+    await logLevelAccessEvent(
+      {
+        uid,
+        dayKey: getDayKey(),
+        eventType: "ad_unlock_used",
+        levelsPlayed: Math.max(0, Number(updatedUser?.daily_levels_played || access.dailyLevelsPlayed)),
+        levelsUnlocked: Math.max(0, Number(updatedUser?.daily_levels_unlocked || nextUnlocked)),
+        dailyLevelsMax: DAILY_LEVELS_MAX,
+        metadata: {
+          unlock_levels_granted: AD_UNLOCK_LEVELS,
+        },
+      },
+      client
+    );
+
+    await client.query("COMMIT");
+
+    return {
+      ok: true,
+      user: updatedUser,
+      levelAccess: buildDailyLevelAccessState(updatedUser),
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function openSurpriseBox(uid: string) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const dayKey = getDayKey();
+    const user = await refreshDailySurpriseBoxStateWithClient(client, uid);
+    const surpriseState = buildDailySurpriseBoxState(user);
+
+    if (!surpriseState.canOpenNow) {
+      throw new Error("DAILY_SURPRISE_BOX_LIMIT_REACHED");
+    }
+
+    const reward = rollSurpriseBoxReward();
+    const assignments = [
+      `daily_surprise_boxes_opened = COALESCE(daily_surprise_boxes_opened, 0) + 1`,
+      `last_surprise_box_day_key = $2`,
+      `monthly_surprise_boxes_opened = COALESCE(monthly_surprise_boxes_opened, 0) + 1`,
+      `updated_at = NOW()`,
+    ];
+
+    if (reward.rewardType === "coins") assignments.push(`mc_balance = COALESCE(mc_balance, 0) + ${reward.coins}`);
+    if (reward.rewardType === "restart") assignments.push(`restarts_balance = COALESCE(restarts_balance, 0) + ${reward.restartCount}`);
+    if (reward.rewardType === "hint") assignments.push(`hints_balance = COALESCE(hints_balance, 0) + ${reward.hintCount}`);
+    if (reward.rewardType === "skip") assignments.push(`skips_balance = COALESCE(skips_balance, 0) + ${reward.skipCount}`);
+
+    const updatedRes = await client.query(
+      `UPDATE public.users
+          SET ${assignments.join(", ")}
+        WHERE uid = $1
+        RETURNING uid,
+                  mc_balance,
+                  restarts_balance,
+                  skips_balance,
+                  hints_balance,
+                  daily_surprise_boxes_opened,
+                  last_surprise_box_day_key`,
+      [uid, dayKey]
+    );
+
+    const updatedUser = updatedRes.rows[0];
+
+    await client.query("COMMIT");
+
+    try {
+      await pool.query(
+        `INSERT INTO public.surprise_box_rewards
+           (uid, day_key, reward_type, reward_amount, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [uid, dayKey, reward.rewardType, reward.rewardAmount]
+      );
+    } catch {}
+
+    try {
+      await auditRewardEvent({
+        uid,
+        eventType: "surprise_box_opened",
+        eventKey: `${dayKey}:${Date.now()}`,
+        amountCoins: reward.rewardType === "coins" ? reward.rewardAmount : 0,
+        accepted: true,
+      });
+    } catch {}
+
+    return {
+      ok: true,
+      rewardType: reward.rewardType,
+      rewardAmount: reward.rewardAmount,
+      reward,
+      dailyBoxesOpened: Number(updatedUser?.daily_surprise_boxes_opened || 0),
+      dailyBoxesMax: SURPRISE_BOX_DAILY_MAX,
+      dailyBoxesRemaining: Math.max(0, SURPRISE_BOX_DAILY_MAX - Number(updatedUser?.daily_surprise_boxes_opened || 0)),
+      coins: Number(updatedUser?.mc_balance || 0),
+      restarts: Number(updatedUser?.restarts_balance || 0),
+      hints: Number(updatedUser?.hints_balance || 0),
+      skips: Number(updatedUser?.skips_balance || 0),
+      surpriseBoxState: buildDailySurpriseBoxState(updatedUser),
+      user: {
+        coins: Number(updatedUser?.mc_balance || 0),
+        mc_balance: Number(updatedUser?.mc_balance || 0),
+        restarts_balance: Number(updatedUser?.restarts_balance || 0),
+        skips_balance: Number(updatedUser?.skips_balance || 0),
+        hints_balance: Number(updatedUser?.hints_balance || 0),
+        daily_surprise_boxes_opened: Number(updatedUser?.daily_surprise_boxes_opened || 0),
+        daily_surprise_boxes_max: SURPRISE_BOX_DAILY_MAX,
+        daily_surprise_boxes_remaining: Math.max(0, SURPRISE_BOX_DAILY_MAX - Number(updatedUser?.daily_surprise_boxes_opened || 0)),
+      },
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 function assertCycleStatus(status: string): MonthlyPayoutCycleStatus {
@@ -2294,7 +2819,7 @@ async function getExistingSettlementSummary(monthKey: string) {
     [monthKey]
   );
   const payoutRes = await pool.query(
-    `SELECT p.uid, u.username, p.rp_score, p.total_rp_score, p.pool_pi, p.payout_pi, p.tier_name, p.tier_label, p.leaderboard_rank, p.status, p.created_at
+    `SELECT p.uid, u.username, p.economy_version, p.rp_score, p.total_rp_score, p.pool_pi, p.payout_pi, p.tier_name, p.tier_label, p.leaderboard_rank, p.status, p.created_at
        FROM public.monthly_pi_payouts p
        LEFT JOIN public.users u ON u.uid = p.uid
       WHERE p.month_key = $1
@@ -2308,6 +2833,7 @@ async function getExistingSettlementSummary(monthKey: string) {
   const tierSummary = buildSettlementTierSummary(
     payoutRes.rows.map((row: any) => ({
       uid: String(row.uid),
+      economy_version: Number(row.economy_version || 1),
       rp_score: Number(row.rp_score || 0),
       total_rp_score: Number(row.total_rp_score || 0),
       pool_pi: String(row.pool_pi || 0),
@@ -3903,17 +4429,16 @@ export async function claimLevelComplete(
 
     const monthKey = getMonthKey();
     const levelId = String(level);
-    const userLockRes = await client.query(
-      `SELECT uid, economy_version
-         FROM public.users
-        WHERE uid = $1
-        FOR UPDATE`,
-      [uid]
-    );
-    const rewardUser = userLockRes.rows[0];
+    const rewardUser = await refreshDailyLevelAccessWithClient(client, uid);
     if (!rewardUser) {
       throw new Error("user_not_found");
     }
+
+    await incrementDailyLevelsPlayedWithClient(client, uid, {
+      used_hint: Boolean(opts?.usedHint),
+      used_skip: Boolean(opts?.usedSkip),
+      level_id: levelId,
+    });
 
     const lifetimeInsert = await client.query(
       `INSERT INTO public.level_rewards (uid, level, created_at)
@@ -3980,9 +4505,11 @@ export async function claimLevelComplete(
     });
 
     const user = await getUserByUid(uid);
+    const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
     return {
       already,
       user,
+      levelAccess,
       rewards: {
         mc: rewards.mc,
         rp: awardedRp,
@@ -4326,6 +4853,78 @@ function normalizeAdminStats(raw: any) {
     negativeBalanceAttemptsBlocked: raw?.negativeBalanceAttemptsBlocked ?? raw?.negative_balance_attempts_blocked ?? null,
     manualScoreAdjustmentsThisMonth: raw?.manualScoreAdjustmentsThisMonth ?? raw?.manual_score_adjustments_this_month ?? null,
     manualCoinsAdjustmentsThisMonth: raw?.manualCoinsAdjustmentsThisMonth ?? raw?.manual_coins_adjustments_this_month ?? null,
+    levelAccessDayKey: raw?.levelAccessDayKey ?? raw?.level_access_day_key ?? null,
+    levelAccessActiveUsers: raw?.levelAccessActiveUsers ?? raw?.level_access_active_users ?? null,
+    levelAccessAvgLevelsCompleted: raw?.levelAccessAvgLevelsCompleted ?? raw?.level_access_avg_levels_completed ?? null,
+    levelAccessWaitingUsers: raw?.levelAccessWaitingUsers ?? raw?.level_access_waiting_users ?? null,
+    levelAccessWaitingEvents: raw?.levelAccessWaitingEvents ?? raw?.level_access_waiting_events ?? null,
+    levelAccessAdUnlockUsers: raw?.levelAccessAdUnlockUsers ?? raw?.level_access_ad_unlock_users ?? null,
+    levelAccessAdUnlockEvents: raw?.levelAccessAdUnlockEvents ?? raw?.level_access_ad_unlock_events ?? null,
+    levelAccessCapReachedUsers: raw?.levelAccessCapReachedUsers ?? raw?.level_access_cap_reached_users ?? null,
+    levelAccessDistribution: raw?.levelAccessDistribution ?? raw?.level_access_distribution ?? null,
+  };
+}
+
+export async function getLevelAccessAnalyticsSummary({ dayKey = getDayKey() }: { dayKey?: string } = {}) {
+  const perUserLevelsRes = await pool.query(
+    `SELECT uid, MAX(levels_played)::int AS max_levels_played
+       FROM public.level_access_events
+      WHERE day_key = $1
+        AND event_type = 'level_completed'
+      GROUP BY uid`,
+    [dayKey]
+  );
+
+  const perUserLevels = perUserLevelsRes.rows || [];
+  const activeUsers = perUserLevels.length;
+  const totalLevelsCompleted = perUserLevels.reduce((sum, row) => sum + Number(row.max_levels_played || 0), 0);
+  const avgLevelsCompleted = activeUsers > 0
+    ? Number((totalLevelsCompleted / activeUsers).toFixed(2))
+    : 0;
+
+  const distribution = perUserLevels.reduce(
+    (acc, row) => {
+      const value = Number(row.max_levels_played || 0);
+      if (value < 10) acc.lt10 += 1;
+      else if (value === 10) acc.eq10 += 1;
+      else if (value <= 14) acc["11_14"] += 1;
+      else if (value <= 19) acc["15_19"] += 1;
+      else if (value <= 29) acc["20_29"] += 1;
+      else acc.eq30 += 1;
+      return acc;
+    },
+    { lt10: 0, eq10: 0, "11_14": 0, "15_19": 0, "20_29": 0, eq30: 0 }
+  );
+
+  const summaryCountsRes = await pool.query(
+    `SELECT event_type,
+            COUNT(*)::int AS event_count,
+            COUNT(DISTINCT uid)::int AS user_count
+       FROM public.level_access_events
+      WHERE day_key = $1
+        AND event_type IN ('waiting_for_unlock', 'ad_unlock_used', 'daily_cap_reached')
+      GROUP BY event_type`,
+    [dayKey]
+  );
+
+  const countsByType = (summaryCountsRes.rows || []).reduce((acc: Record<string, { eventCount: number; userCount: number }>, row: any) => {
+    acc[String(row.event_type || "")] = {
+      eventCount: Number(row.event_count || 0),
+      userCount: Number(row.user_count || 0),
+    };
+    return acc;
+  }, {});
+
+  return {
+    dayKey,
+    activeUsers,
+    avgLevelsCompleted,
+    distribution,
+    waitingUsers: countsByType.waiting_for_unlock?.userCount ?? 0,
+    waitingEvents: countsByType.waiting_for_unlock?.eventCount ?? 0,
+    adUnlockUsers: countsByType.ad_unlock_used?.userCount ?? 0,
+    adUnlockEvents: countsByType.ad_unlock_used?.eventCount ?? 0,
+    capReachedUsers: countsByType.daily_cap_reached?.userCount ?? 0,
   };
 }
 
@@ -4747,6 +5346,7 @@ export async function adminResetUserState(opts: {
       throw new Error("Reset is allowed only for test users");
     }
 
+    const resetDayKey = getDayKey();
     const userColumns = await existingColumns(client, "public.users", [
       "coins",
       "mc_balance",
@@ -4774,6 +5374,8 @@ export async function adminResetUserState(opts: {
       "monthly_rate_breakdown",
       "monthly_final_rate",
       "mystery_box_pending",
+      "daily_surprise_boxes_opened",
+      "last_surprise_box_day_key",
       "updated_at",
       "activity_streak",
       "last_active_day_key",
@@ -4805,6 +5407,12 @@ export async function adminResetUserState(opts: {
     if (userColumns.has("monthly_rate_breakdown")) userAssignments.push(`monthly_rate_breakdown = '{}'::jsonb`);
     if (userColumns.has("monthly_final_rate")) userAssignments.push(`monthly_final_rate = 50`);
     if (userColumns.has("mystery_box_pending")) userAssignments.push(`mystery_box_pending = FALSE`);
+    if (userColumns.has("daily_surprise_boxes_opened")) userAssignments.push(`daily_surprise_boxes_opened = 0`);
+    if (userColumns.has("last_surprise_box_day_key")) userAssignments.push(`last_surprise_box_day_key = '${resetDayKey}'`);
+    if (userColumns.has("daily_levels_played")) userAssignments.push(`daily_levels_played = 0`);
+    if (userColumns.has("daily_levels_unlocked")) userAssignments.push(`daily_levels_unlocked = ${INITIAL_DAILY_UNLOCKED_LEVELS}`);
+    if (userColumns.has("last_level_reset_day_key")) userAssignments.push(`last_level_reset_day_key = '${resetDayKey}'`);
+    if (userColumns.has("next_unlock_at")) userAssignments.push(`next_unlock_at = NULL`);
     if (userColumns.has("updated_at")) userAssignments.push(`updated_at = NOW()`);
     if (userColumns.has("activity_streak")) userAssignments.push(`activity_streak = 0`);
     if (userColumns.has("last_active_day_key")) userAssignments.push(`last_active_day_key = NULL`);
@@ -4826,6 +5434,9 @@ export async function adminResetUserState(opts: {
     }
     if (await tableExists(client, "public.monthly_pi_payouts")) {
       await client.query(`DELETE FROM public.monthly_pi_payouts WHERE uid = $1`, [uid]);
+    }
+    if (await tableExists(client, "public.surprise_box_rewards")) {
+      await client.query(`DELETE FROM public.surprise_box_rewards WHERE uid = $1`, [uid]);
     }
     if (await tableExists(client, "public.admin_adjustments")) {
       await client.query(`DELETE FROM public.admin_adjustments WHERE uid = $1`, [uid]);
@@ -4954,6 +5565,7 @@ export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }
       WHERE created_at >= date_trunc('month', NOW())
       GROUP BY target`
   );
+  const levelAccessAnalytics = await getLevelAccessAnalyticsSummary({ dayKey: getDayKey() }).catch(() => null);
 
   const eligibleUsers = eligibleLeaderboard.rows || [];
   const scoredUsers = scoredLeaderboard.rows || [];
@@ -5010,6 +5622,22 @@ export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }
     negative_balance_attempts_blocked: null,
     manual_score_adjustments_this_month: Number(adjustmentCounts.score || 0),
     manual_coins_adjustments_this_month: Number(adjustmentCounts.coins || 0),
+    level_access_day_key: levelAccessAnalytics?.dayKey ?? getDayKey(),
+    level_access_active_users: levelAccessAnalytics?.activeUsers ?? 0,
+    level_access_avg_levels_completed: levelAccessAnalytics?.avgLevelsCompleted ?? 0,
+    level_access_waiting_users: levelAccessAnalytics?.waitingUsers ?? 0,
+    level_access_waiting_events: levelAccessAnalytics?.waitingEvents ?? 0,
+    level_access_ad_unlock_users: levelAccessAnalytics?.adUnlockUsers ?? 0,
+    level_access_ad_unlock_events: levelAccessAnalytics?.adUnlockEvents ?? 0,
+    level_access_cap_reached_users: levelAccessAnalytics?.capReachedUsers ?? 0,
+    level_access_distribution: levelAccessAnalytics?.distribution ?? {
+      lt10: 0,
+      eq10: 0,
+      "11_14": 0,
+      "15_19": 0,
+      "20_29": 0,
+      eq30: 0,
+    },
     tierCounts,
   });
 }
