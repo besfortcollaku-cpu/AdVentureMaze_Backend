@@ -1,3 +1,5 @@
+import { runtimeConfig } from "../config/runtime";
+
 export type SendPiPayoutInput = {
   uid: string;
   walletIdentifier: string;
@@ -13,15 +15,10 @@ export type SendPiPayoutResult = {
   raw?: any;
 };
 
-function parseOptionalNumber(raw: string | undefined): number | null {
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : null;
-}
-
 export async function getSendingWalletAvailableBalancePi(): Promise<number | null> {
   const configured =
-    parseOptionalNumber(process.env.SENDING_WALLET_AVAILABLE_PI) ??
-    parseOptionalNumber(process.env.PAYOUT_TREASURY_AVAILABLE_PI);
+    runtimeConfig.payout.sendingWalletAvailablePi ??
+    runtimeConfig.payout.payoutTreasuryAvailablePi;
 
   if (configured !== null) return configured;
 
@@ -30,7 +27,7 @@ export async function getSendingWalletAvailableBalancePi(): Promise<number | nul
 }
 
 export async function sendPiPayout(input: SendPiPayoutInput): Promise<SendPiPayoutResult> {
-  if (process.env.PAYOUT_SIMULATE_SUCCESS === "true") {
+  if (runtimeConfig.payout.simulateSuccess) {
     return {
       ok: true,
       txid: `sim-${input.idempotencyKey}`,
@@ -39,7 +36,7 @@ export async function sendPiPayout(input: SendPiPayoutInput): Promise<SendPiPayo
     };
   }
 
-  if (process.env.PI_PAYOUT_ADAPTER_ENABLED !== "true") {
+  if (!runtimeConfig.payout.adapterEnabled) {
     return {
       ok: false,
       error: "adapter_not_configured",

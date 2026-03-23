@@ -1,16 +1,36 @@
-﻿import { Pool } from "pg";
+import { Pool } from "pg";
 import { sendPiPayout as sendPiPayoutAdapter, getSendingWalletAvailableBalancePi } from "./services/piPayoutSender";
 import { lookupIpRisk } from "./services/ipRisk";
+import { runtimeConfig, setPayoutSimulationMode } from "./config/runtime";
+import {
+  DAILY_RANKING_REWARD_TABLE,
+  DAILY_SCORE_CAP as DAILY_RP_CAP,
+  FREE_HINTS_PER_ACCOUNT,
+  FREE_RESTARTS_PER_ACCOUNT,
+  FREE_SKIPS_PER_ACCOUNT,
+  LEGACY_HINT_COST_COINS as HINT_COST_COINS,
+  LEGACY_RESTART_COST_COINS as RESTART_COST_COINS,
+  LEGACY_SKIP_COST_COINS as SKIP_COST_COINS,
+  LEVEL_MC_REWARD,
+  LEVEL_RP_CLEAN_REWARD,
+  LEVEL_RP_HINT_REWARD,
+  LEVEL_RP_SKIP_REWARD,
+  MONTHLY_ELIGIBILITY_MIN_SCORE,
+  MONTHLY_ELIGIBILITY_MIN_UNIQUE_LEVELS,
+  MONTHLY_PI_POOL,
+  REWARD_TIERS,
+  type RewardTierName,
+} from "./config/economy";
 console.log("Backend v2.0.1");
 export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === "true"
+  connectionString: runtimeConfig.database.url,
+  ssl: runtimeConfig.database.ssl
     ? { rejectUnauthorized: false }
     : undefined,
 });
 
 /* =====================================================
-   INIT  (âœ… Fix 1: auto-create core tables incl. sessions)
+   INIT  (✅ Fix 1: auto-create core tables incl. sessions)
 ===================================================== */
 
 export async function useNonce(uid: string, nonce: string) {
@@ -198,7 +218,14 @@ await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_
       ADD COLUMN IF NOT EXISTS rp_score INT NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS daily_rp INT NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS last_rp_reset TIMESTAMP DEFAULT NOW(),
-      ADD COLUMN IF NOT EXISTS is_test_user BOOLEAN NOT NULL DEFAULT FALSE;
+      ADD COLUMN IF NOT EXISTS is_test_user BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS economy_version INT NOT NULL DEFAULT 1;
+  `);
+
+  await pool.query(`
+    UPDATE public.users
+       SET economy_version = 1
+     WHERE economy_version IS NULL
   `);
 
   await pool.query(`
@@ -446,7 +473,8 @@ await pool.query(`
     ALTER TABLE public.monthly_pi_payouts
       ADD COLUMN IF NOT EXISTS tier_name TEXT,
       ADD COLUMN IF NOT EXISTS tier_label TEXT,
-      ADD COLUMN IF NOT EXISTS leaderboard_rank INT;
+      ADD COLUMN IF NOT EXISTS leaderboard_rank INT,
+      ADD COLUMN IF NOT EXISTS economy_version INT NOT NULL DEFAULT 1;
   `);
 
   await pool.query(`
@@ -608,16 +636,18 @@ await pool.query(`
 /* =====================================================
    CONSTANTS
 ===================================================== */
-export const FREE_RESTARTS_PER_ACCOUNT = 3;
-export const FREE_SKIPS_PER_ACCOUNT = 3;
-export const FREE_HINTS_PER_ACCOUNT = 3;
-export const RESTART_COST_COINS = 50;
-export const SKIP_COST_COINS = 50;
-export const HINT_COST_COINS = 50;
+export {
+  FREE_RESTARTS_PER_ACCOUNT,
+  FREE_SKIPS_PER_ACCOUNT,
+  FREE_HINTS_PER_ACCOUNT,
+  RESTART_COST_COINS,
+  SKIP_COST_COINS,
+  HINT_COST_COINS,
+};
 export const CONSUMABLES = {
-  restart: { coinCost: 50, freeLimit: 3 },
-  skip:    { coinCost: 50, freeLimit: 3 },
-  hint:    { coinCost: 50, freeLimit: 3 },
+  restart: { coinCost: RESTART_COST_COINS, freeLimit: FREE_RESTARTS_PER_ACCOUNT },
+  skip:    { coinCost: SKIP_COST_COINS, freeLimit: FREE_SKIPS_PER_ACCOUNT },
+  hint:    { coinCost: HINT_COST_COINS, freeLimit: FREE_HINTS_PER_ACCOUNT },
 } as const;
 
 export type ConsumableKey = keyof typeof CONSUMABLES;
@@ -724,6 +754,7 @@ export function verifyMonthlyPayoutRows(
 
 export type MonthlyPiPayoutRow = {
   uid: string;
+  economy_version: number;
   rp_score: number;
   total_rp_score: number;
   pool_pi: string;
@@ -735,6 +766,7 @@ export type MonthlyPiPayoutRow = {
 
 type LeaderboardUser = {
   uid: string;
+  economy_version: number;
   rp_score: number;
   monthly_skips_used: number;
   monthly_hints_used: number;
@@ -793,14 +825,6 @@ function envNumber(name: string, fallback: number) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-const MONTHLY_PI_POOL = envNumber("MONTHLY_PI_POOL", 300);
-const REWARD_TIERS = [
-  { name: "A", label: "Champion", percent: 1, poolShare: 40 },
-  { name: "B", label: "Elite", percent: 4, poolShare: 27 },
-  { name: "C", label: "Advanced", percent: 15, poolShare: 20 },
-  { name: "D", label: "Qualified", percent: 30, poolShare: 13 },
-] as const;
-type RewardTierName = (typeof REWARD_TIERS)[number]["name"];
 const MAX_USER_MONTHLY_PI = envNumber("MAX_USER_MONTHLY_PI", 100);
 const MAX_GLOBAL_MONTHLY_PI = envNumber("MAX_GLOBAL_MONTHLY_PI", 100000);
 const MIN_ACCOUNT_AGE_DAYS = envNumber("MIN_ACCOUNT_AGE_DAYS", 7);
@@ -823,7 +847,7 @@ let runtimePayoutSimulationMode: boolean | null = null;
 
 function isPayoutSimulationMode() {
   if (typeof runtimePayoutSimulationMode === "boolean") return runtimePayoutSimulationMode;
-  return process.env.PAYOUT_SIMULATE_SUCCESS === "true";
+  return runtimeConfig.payout.simulateSuccess;
 }
 
 export async function adminSyncPayoutSimulationModeFromDb() {
@@ -835,7 +859,7 @@ export async function adminSyncPayoutSimulationModeFromDb() {
     const raw = String(out.rows?.[0]?.value ?? "").trim().toLowerCase();
     if (raw === "true" || raw === "false") {
       runtimePayoutSimulationMode = raw === "true";
-      process.env.PAYOUT_SIMULATE_SUCCESS = runtimePayoutSimulationMode ? "true" : "false";
+      setPayoutSimulationMode(runtimePayoutSimulationMode);
     }
   } catch {
     // keep env/default mode if config table isn't ready yet
@@ -845,7 +869,7 @@ export async function adminSyncPayoutSimulationModeFromDb() {
 
 export async function adminSetPayoutSimulationMode(enabled: boolean) {
   runtimePayoutSimulationMode = Boolean(enabled);
-  process.env.PAYOUT_SIMULATE_SUCCESS = runtimePayoutSimulationMode ? "true" : "false";
+  setPayoutSimulationMode(runtimePayoutSimulationMode);
   await pool.query(
     `INSERT INTO public.admin_runtime_config (key, value, updated_at)
      VALUES ($1, $2, NOW())
@@ -992,14 +1016,14 @@ async function getTotalPaidPi(): Promise<number> {
 }
 
 async function assertTreasuryCanPayout(payoutPi: number): Promise<{ ok: boolean; reason?: string; availablePi?: number; paidPi?: number }> {
-  if (process.env.PAYOUT_SIMULATE_SUCCESS === "true") {
+  if (isPayoutSimulationMode()) {
     return { ok: true };
   }
   const availableFromAdapter = await getSendingWalletAvailableBalancePi();
   const available =
     (Number.isFinite(availableFromAdapter as number)
       ? Number(availableFromAdapter)
-      : Number(process.env.SENDING_WALLET_AVAILABLE_PI || process.env.PAYOUT_TREASURY_AVAILABLE_PI));
+      : Number(runtimeConfig.payout.sendingWalletAvailablePi ?? runtimeConfig.payout.payoutTreasuryAvailablePi));
 
   if (!Number.isFinite(available)) {
     return { ok: false, reason: 'treasury_guard' };
@@ -1345,6 +1369,43 @@ export async function resetDailyAdCounters() {
   return { ok: true, reset_users: Number(out.rowCount || 0) };
 }
 
+function getEconomyVersion(user: any) {
+  const version = Number(
+    user?.economy_version ??
+    user?.economyVersion ??
+    runtimeConfig.economy.defaultEconomyVersion
+  );
+  return Number.isInteger(version) && version > 0
+    ? version
+    : runtimeConfig.economy.defaultEconomyVersion;
+}
+
+function calculateLevelRewardsV1(params: { usedHint: boolean; usedSkip: boolean }) {
+  const mc = LEVEL_MC_REWARD;
+  let rp = LEVEL_RP_SKIP_REWARD;
+
+  if (params.usedSkip) {
+    rp = LEVEL_RP_SKIP_REWARD;
+  } else if (params.usedHint) {
+    rp = LEVEL_RP_HINT_REWARD;
+  } else {
+    rp = LEVEL_RP_CLEAN_REWARD;
+  }
+
+  return { mc, rp };
+}
+
+function calculateLevelRewardsForUser(user: any, params: { usedHint: boolean; usedSkip: boolean }) {
+  const version = getEconomyVersion(user);
+
+  if (version === 1) {
+    return calculateLevelRewardsV1(params);
+  }
+
+  // Future economy versions can branch here without changing current v1 behavior.
+  return calculateLevelRewardsV1(params);
+}
+
 function assertCycleStatus(status: string): MonthlyPayoutCycleStatus {
   const allowed: MonthlyPayoutCycleStatus[] = ["open", "closed", "payouts_generated", "processing", "completed"];
   if (!allowed.includes(status as MonthlyPayoutCycleStatus)) throw new Error("invalid_cycle_status");
@@ -1396,11 +1457,12 @@ async function resolveCycleForUpdate(
 
 async function getMonthlyLeaderboardUsers(opts?: { eligibleOnly?: boolean; monthKey?: string }) {
   const monthKey = normalizeMonthKey(opts?.monthKey);
-  const minRpClause = opts?.eligibleOnly ? `AND COALESCE(u.rp_score, 0) >= 150` : ``;
-  const uniqueLevelClause = opts?.eligibleOnly ? `AND COALESCE(ul.unique_rp_levels, 0) >= 10` : ``;
+  const minRpClause = opts?.eligibleOnly ? `AND COALESCE(u.rp_score, 0) >= ${MONTHLY_ELIGIBILITY_MIN_SCORE}` : ``;
+  const uniqueLevelClause = opts?.eligibleOnly ? `AND COALESCE(ul.unique_rp_levels, 0) >= ${MONTHLY_ELIGIBILITY_MIN_UNIQUE_LEVELS}` : ``;
 
   const out = await pool.query(
     `SELECT u.uid,
+            COALESCE(u.economy_version, 1)::int AS economy_version,
             COALESCE(u.rp_score, 0)::int AS rp_score,
             COALESCE(u.monthly_skips_used, 0)::int AS monthly_skips_used,
             COALESCE(u.monthly_hints_used, 0)::int AS monthly_hints_used,
@@ -1425,6 +1487,7 @@ async function getMonthlyLeaderboardUsers(opts?: { eligibleOnly?: boolean; month
 
   const rows: LeaderboardUser[] = out.rows.map((row: any) => ({
     uid: String(row.uid),
+    economy_version: Number(row.economy_version || 1),
     rp_score: Number(row.rp_score || 0),
     monthly_skips_used: Number(row.monthly_skips_used || 0),
     monthly_hints_used: Number(row.monthly_hints_used || 0),
@@ -1473,6 +1536,7 @@ export async function assignRewardTiers(users: LeaderboardUser[]) {
 
       assignments.push({
         uid: user.uid,
+        economy_version: user.economy_version,
         rp_score: user.rp_score,
         total_rp_score: users.reduce((sum, row) => sum + Math.max(0, Number(row.rp_score || 0)), 0),
         pool_pi: MONTHLY_PI_POOL.toFixed(8),
@@ -1489,6 +1553,7 @@ export async function assignRewardTiers(users: LeaderboardUser[]) {
   for (let i = cursor; i < users.length; i += 1) {
     assignments.push({
       uid: users[i].uid,
+      economy_version: users[i].economy_version,
       rp_score: users[i].rp_score,
       total_rp_score: users.reduce((sum, row) => sum + Math.max(0, Number(row.rp_score || 0)), 0),
       pool_pi: MONTHLY_PI_POOL.toFixed(8),
@@ -1786,12 +1851,13 @@ export async function closeMonthlyPayoutCycle(opts: {
     for (const row of payoutRows) {
       await client.query(
         `INSERT INTO public.monthly_pi_payouts (
-           uid, month_key, rp_score, total_rp_score, pool_pi, payout_pi, tier_name, tier_label, leaderboard_rank, status, created_at
-         ) VALUES ($1, $2, $3, $4, $5::numeric, $6::numeric, $7, $8, $9, $10, NOW())
+           uid, month_key, economy_version, rp_score, total_rp_score, pool_pi, payout_pi, tier_name, tier_label, leaderboard_rank, status, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8, $9, $10, $11, NOW())
          ON CONFLICT (uid, month_key) DO NOTHING`,
         [
           row.uid,
           monthKey,
+          row.economy_version,
           row.rp_score,
           row.total_rp_score,
           row.pool_pi,
@@ -2412,7 +2478,7 @@ export async function adminGetPayoutRuntimeConfig() {
     ok: true,
     simulation_mode: isPayoutSimulationMode(),
     payout_max_attempts: PAYOUT_MAX_ATTEMPTS,
-    pi_payout_adapter_enabled: process.env.PI_PAYOUT_ADAPTER_ENABLED === "true",
+    pi_payout_adapter_enabled: runtimeConfig.payout.adapterEnabled,
     max_user_monthly_pi: MAX_USER_MONTHLY_PI,
     max_global_monthly_pi: MAX_GLOBAL_MONTHLY_PI,
     min_account_age_days: MIN_ACCOUNT_AGE_DAYS,
@@ -3031,15 +3097,15 @@ export async function upsertUser({
 }: { uid: string; username: string; }) {
   const { rows } = await pool.query(
     `
-    INSERT INTO public.users (uid, username, updated_at)
-    VALUES ($1,$2,NOW())
+    INSERT INTO public.users (uid, username, economy_version, updated_at)
+    VALUES ($1,$2,$3,NOW())
     ON CONFLICT (uid)
     DO UPDATE SET
       username = EXCLUDED.username,
       updated_at = NOW()
     RETURNING *
   `,
-    [uid, username]
+    [uid, username, runtimeConfig.economy.defaultEconomyVersion]
   );
   return rows[0];
 }
@@ -3051,8 +3117,6 @@ export async function getUserByUid(uid: string) {
   );
   return rows[0] || null;
 }
-
-const DAILY_RP_CAP = 30;
 
 export async function syncMcBalanceFromLegacyCoins(uid: string) {
   const out = await pool.query(
@@ -3338,19 +3402,6 @@ export async function getDailyLeaderboardRaw(limit = 100) {
   );
   return { ok: true, rows: out.rows };
 }
-
-const DAILY_RANKING_REWARD_TABLE: Record<number, number> = {
-  1: 120,
-  2: 100,
-  3: 80,
-  4: 60,
-  5: 50,
-  6: 40,
-  7: 35,
-  8: 30,
-  9: 25,
- 10: 20,
-};
 
 function parseDateKey(input?: string | null) {
   const raw = String(input || "").trim();
@@ -3776,21 +3827,6 @@ export async function claimDailyLogin(uid: string) {
   return { user };
 }
 
-function calculateLevelRewards(params: { usedHint: boolean; usedSkip: boolean }) {
-  const mc = 2;
-  let rp = 0;
-
-  if (params.usedSkip) {
-    rp = 0;
-  } else if (params.usedHint) {
-    rp = 1;
-  } else {
-    rp = 2;
-  }
-
-  return { mc, rp };
-}
-
 async function addRPWithClient(client: any, uid: string, amount: number) {
   const requested = Math.max(0, Math.trunc(Number(amount || 0)));
   if (!requested) return { ok: true, added: 0, cap: DAILY_RP_CAP };
@@ -3841,6 +3877,17 @@ async function addRPWithClient(client: any, uid: string, amount: number) {
   return { ok: true, added: toAdd, cap: DAILY_RP_CAP, user: updated.rows[0] || null };
 }
 
+async function addRPForUserVersion(client: any, user: any, uid: string, amount: number) {
+  const version = getEconomyVersion(user);
+
+  if (version === 1) {
+    return addRPWithClient(client, uid, amount);
+  }
+
+  // Future economy versions can branch here without changing current v1 behavior.
+  return addRPWithClient(client, uid, amount);
+}
+
 export async function claimLevelComplete(
   uid: string,
   level: number,
@@ -3856,6 +3903,17 @@ export async function claimLevelComplete(
 
     const monthKey = getMonthKey();
     const levelId = String(level);
+    const userLockRes = await client.query(
+      `SELECT uid, economy_version
+         FROM public.users
+        WHERE uid = $1
+        FOR UPDATE`,
+      [uid]
+    );
+    const rewardUser = userLockRes.rows[0];
+    if (!rewardUser) {
+      throw new Error("user_not_found");
+    }
 
     const lifetimeInsert = await client.query(
       `INSERT INTO public.level_rewards (uid, level, created_at)
@@ -3879,7 +3937,7 @@ export async function claimLevelComplete(
       [uid, isFirstLifetimeCompletion ? 1 : 0]
     );
 
-    const rewards = calculateLevelRewards({
+    const rewards = calculateLevelRewardsForUser(rewardUser, {
       usedHint: Boolean(opts?.usedHint),
       usedSkip: Boolean(opts?.usedSkip),
     });
@@ -3899,7 +3957,7 @@ export async function claimLevelComplete(
     const already = (monthlyCredit.rowCount ?? 0) > 0;
 
     if (!already) {
-      const rpResult = await addRPWithClient(client, uid, rewards.rp);
+      const rpResult = await addRPForUserVersion(client, rewardUser, uid, rewards.rp);
       awardedRp = Number(rpResult.added || 0);
 
       await client.query(
@@ -4203,6 +4261,7 @@ function normalizeAdminUser(user: any, extra?: {
     ...user,
     uid: user?.uid ?? null,
     username: user?.username ?? null,
+    economyVersion: getEconomyVersion(user),
     coins,
     score,
     dailyScore,
@@ -4226,6 +4285,7 @@ function normalizeAdminPayoutRow(row: any) {
     ...row,
     uid: row?.uid ?? null,
     username: row?.username ?? null,
+    economyVersion: Number(row?.economy_version ?? row?.economyVersion ?? 1),
     monthKey: row?.month_key ?? row?.monthKey ?? null,
     poolPi: Number(row?.pool_pi ?? row?.poolPi ?? 0),
     payoutPi: Number(row?.payout_pi_amount ?? row?.payout_pi ?? row?.payoutPi ?? 0),
@@ -4512,7 +4572,7 @@ export async function adminGetUser(uid: string) {
   );
 
   const { rows: payoutRows } = await pool.query(
-    `SELECT month_key, rp_score, total_rp_score, pool_pi, payout_pi, tier_name, tier_label, leaderboard_rank, status, created_at
+    `SELECT month_key, economy_version, rp_score, total_rp_score, pool_pi, payout_pi, tier_name, tier_label, leaderboard_rank, status, created_at
        FROM public.monthly_pi_payouts
       WHERE uid = $1
       ORDER BY created_at DESC, id DESC
@@ -4541,6 +4601,7 @@ export async function adminGetUser(uid: string) {
     coins: Number(user?.mc_balance ?? user?.coins ?? 0),
     score: Number(user?.rp_score ?? 0),
     dailyScore: Number(user?.daily_rp ?? 0),
+    economyVersion: getEconomyVersion(user),
     isTestUser: Boolean(user?.is_test_user ?? false),
     currentRank: leaderboard?.currentRank ?? null,
     projectedTier: leaderboard?.projectedTierLabel ?? leaderboard?.projectedTierName ?? null,
@@ -4974,7 +5035,7 @@ export async function adminListOnlineUsers({
 
 
 /* ============================
-   Charts (Step 1 â€“ 7 days default)
+   Charts (Step 1 – 7 days default)
 ============================ */
 export async function adminChartCoins({ days }: { days: number }) {
   const d = Math.max(1, Math.min(90, Number(days || 7)));
@@ -5086,16 +5147,16 @@ function coinRewardForAd(adsForCoinsThisMonth: number) {
   return Math.max(reward, 2);
 }
 export async function claimCoinAd(uid: string) {
-  // 1ï¸âƒ£ Track ad view
+  // 1️⃣ Track ad view
   await trackAdView(uid, "coins");
 
-  // 2ï¸âƒ£ Read monthly ads
+  // 2️⃣ Read monthly ads
   const ads = await getMonthlyAds(uid);
 
   // ads_for_coins already incremented
   const coins = coinRewardForAd(ads.ads_for_coins - 1);
 
-  // 3ï¸âƒ£ Use EXISTING reward system
+  // 3️⃣ Use EXISTING reward system
   const nonce = `coin-ad-${currentMonthKey()}-${ads.ads_for_coins}`;
 
   return await claimReward({

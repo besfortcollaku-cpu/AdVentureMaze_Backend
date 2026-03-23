@@ -8,6 +8,19 @@ process.on("uncaughtException", (err) => {
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import {
+  DAILY_REWARD_COINS,
+  FREE_HINTS_PER_ACCOUNT,
+  FREE_RESTARTS_PER_ACCOUNT,
+  FREE_SKIPS_PER_ACCOUNT,
+  HINT_MC_COST,
+  RESTART_MC_COST,
+  SKIP_MC_COST,
+  getAdRewardCoinsForDailyCount,
+  getDailyRewardCoinsForDay,
+  getMysteryChestRewardFromRoll,
+} from "./config/economy";
+import { runtimeConfig } from "./config/runtime";
 
 import {
   initDB,
@@ -482,10 +495,10 @@ app.post("/api/progress", async (req, res) => {
 /* ---------------- PROGRESS ---------------- */
 
 
-const DAILY_REWARDS = [5,7,10,15,20,30,50];
+const DAILY_REWARDS = [...DAILY_REWARD_COINS];
 
 function rewardForDay(day:number){
-  return DAILY_REWARDS[Math.min(day-1, DAILY_REWARDS.length-1)];
+  return getDailyRewardCoinsForDay(day);
 }
 
 function isoDateUTC(input: Date | string) {
@@ -1017,18 +1030,10 @@ app.patch("/api/user/username", async (req, res) => {
 });
 /* ---------------- HELPERS ---------------- */
 function mysteryChestReward() {
-
-  const r = Math.random();
-
-  if (r < 0.4) return 50;
-  if (r < 0.7) return 100;
-  if (r < 0.9) return 150;
-  return 200;
-
+  return getMysteryChestRewardFromRoll(Math.random());
 }
 function dailyRewardCoinsForDay(day: number) {
-  const map = [5, 7, 10, 15, 20, 30, 50];
-  return map[Math.max(0, Math.min(map.length - 1, day - 1))];
+  return getDailyRewardCoinsForDay(day);
 }
 
 function nextDailyStreak(lastClaimDate: string | null, today: Date) {
@@ -1116,8 +1121,14 @@ app.post("/api/consume", async (req, res) => {
 /* ---------------- ADMIN AUTH ---------------- */
 function requireAdmin(req: express.Request) {
   const secret = String(req.headers["x-admin-secret"] || "");
-  if (!process.env.ADMIN_SECRET) throw new Error("ADMIN_SECRET missing");
-  if (secret !== process.env.ADMIN_SECRET) throw new Error("Unauthorized");
+  if (!runtimeConfig.admin.secret) throw new Error("ADMIN_SECRET missing");
+  if (secret !== runtimeConfig.admin.secret) throw new Error("Unauthorized");
+}
+
+function requireAdminSettlementEnabled() {
+  if (!runtimeConfig.admin.settlementEnabled) {
+    throw new Error("admin_settlement_disabled");
+  }
 }
 
 
@@ -1152,14 +1163,7 @@ function getAdRequestMeta(req: express.Request) {
 }
 
 function getAdRewardCoins(adsWatchedToday: number) {
-  if (adsWatchedToday < 10) {
-    return 50;
-  }
-
-  const extra = adsWatchedToday - 10;
-  const reward = 50 - (extra * 5);
-
-  return Math.max(reward, 5);
+  return getAdRewardCoinsForDailyCount(adsWatchedToday);
 }
 
 /* ---------------- PI VERIFY ---------------- */
@@ -1422,8 +1426,8 @@ app.post("/api/restart", async (req, res) => {
       throw new Error("User or progress not found");
     }
 
-    const FREE_RESTART_LIMIT = 3;
-    const RESTART_PRICE = 15;
+    const FREE_RESTART_LIMIT = FREE_RESTARTS_PER_ACCOUNT;
+    const RESTART_PRICE = RESTART_MC_COST;
 
     let usedFree = false;
     let usedAd = false;
@@ -1624,8 +1628,8 @@ app.post("/api/skip", async (req, res) => {
       throw new Error("User or progress not found");
     }
 
-    const FREE_SKIP_LIMIT = 3;
-    const SKIP_PRICE = 40;
+    const FREE_SKIP_LIMIT = FREE_SKIPS_PER_ACCOUNT;
+    const SKIP_PRICE = SKIP_MC_COST;
 
     let usedFree = false;
     let usedAd = false;
@@ -1757,8 +1761,8 @@ app.post("/api/hint", async (req, res) => {
       throw new Error("User or progress not found");
     }
 
-    const FREE_HINT_LIMIT = 3;
-    const HINT_PRICE = 15;
+    const FREE_HINT_LIMIT = FREE_HINTS_PER_ACCOUNT;
+    const HINT_PRICE = HINT_MC_COST;
 
     let usedFree = false;
     let usedAd = false;
@@ -1870,6 +1874,7 @@ app.post("/api/hint", async (req, res) => {
 app.get("/admin/settlement/preview", async (req,res)=>{
   try{
     requireAdmin(req);
+    requireAdminSettlementEnabled();
     const monthKey = req.query.month_key ? String(req.query.month_key) : undefined;
     const out = await adminPreviewSettlement({ monthKey });
     res.json(out);
@@ -1892,6 +1897,7 @@ app.get("/admin/settlement/status", async (req,res)=>{
 app.post("/admin/month-close", async (req,res)=>{
   try{
     requireAdmin(req);
+    requireAdminSettlementEnabled();
     const monthKey = req.body?.month_key ? String(req.body.month_key) : undefined;
     const conversionRateLocked = Number(req.body?.conversion_rate_locked);
     const minPayoutThresholdPi = Number(req.body?.min_payout_threshold_pi ?? 0);
@@ -2387,7 +2393,7 @@ async function maybeRunDailyAdReset() {
     console.error("daily_ad_reset_failed", e);
   }
 }
-const PORT = Number(process.env.PORT) || 8080;
+const PORT = runtimeConfig.server.port;
 
 async function start() {
   try {
