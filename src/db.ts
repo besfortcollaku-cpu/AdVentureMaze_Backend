@@ -4427,45 +4427,58 @@ export async function claimLevelComplete(
   try {
     await client.query("BEGIN");
 
-    const monthKey = getMonthKey();
-    const levelId = String(level);
-    const rewardUser = await refreshDailyLevelAccessWithClient(client, uid);
-    if (!rewardUser) {
-      throw new Error("user_not_found");
-    }
+      const monthKey = getMonthKey();
+      const levelId = String(level);
+      const rewardUser = await refreshDailyLevelAccessWithClient(client, uid);
+      if (!rewardUser) {
+        throw new Error("user_not_found");
+      }
 
-    await incrementDailyLevelsPlayedWithClient(client, uid, {
-      used_hint: Boolean(opts?.usedHint),
-      used_skip: Boolean(opts?.usedSkip),
-      level_id: levelId,
-    });
+      const lifetimeCompletion = await client.query(
+        `SELECT 1
+           FROM public.level_rewards
+          WHERE uid = $1
+            AND level = $2
+          LIMIT 1
+          FOR UPDATE`,
+        [uid, level]
+      );
+      const isReplay = (lifetimeCompletion.rowCount ?? 0) > 0;
 
-    const lifetimeInsert = await client.query(
-      `INSERT INTO public.level_rewards (uid, level, created_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (uid, level) DO NOTHING`,
+      if (!isReplay) {
+        await incrementDailyLevelsPlayedWithClient(client, uid, {
+          used_hint: Boolean(opts?.usedHint),
+          used_skip: Boolean(opts?.usedSkip),
+          level_id: levelId,
+        });
+      }
+
+      const lifetimeInsert = await client.query(
+        `INSERT INTO public.level_rewards (uid, level, created_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (uid, level) DO NOTHING`,
       [uid, level]
     );
 
-    const isFirstLifetimeCompletion = (lifetimeInsert.rowCount ?? 0) > 0;
+      const rewards = calculateLevelRewardsForUser(rewardUser, {
+        usedHint: Boolean(opts?.usedHint),
+        usedSkip: Boolean(opts?.usedSkip),
+      });
+      const isFirstLifetimeCompletion = (lifetimeInsert.rowCount ?? 0) > 0;
+      const awardedMc = isFirstLifetimeCompletion ? Math.max(0, Number(rewards.mc || 0)) : 0;
 
-    await client.query(
-      `UPDATE public.users
-          SET coins = COALESCE(coins, 0) + 1,
-              mc_balance = COALESCE(mc_balance, 0) + 2,
-              monthly_coins_earned = COALESCE(monthly_coins_earned, 0) + 1,
-              lifetime_coins_earned = COALESCE(lifetime_coins_earned, 0) + 1,
-              monthly_levels_completed = COALESCE(monthly_levels_completed,0) + 1,
-              lifetime_levels_completed = COALESCE(lifetime_levels_completed,0) + $2,
-              updated_at = NOW()
-        WHERE uid = $1`,
-      [uid, isFirstLifetimeCompletion ? 1 : 0]
-    );
-
-    const rewards = calculateLevelRewardsForUser(rewardUser, {
-      usedHint: Boolean(opts?.usedHint),
-      usedSkip: Boolean(opts?.usedSkip),
-    });
+      await client.query(
+        `UPDATE public.users
+            SET coins = COALESCE(coins, 0) + $2,
+                mc_balance = COALESCE(mc_balance, 0) + $2,
+                monthly_coins_earned = COALESCE(monthly_coins_earned, 0) + $2,
+                lifetime_coins_earned = COALESCE(lifetime_coins_earned, 0) + $2,
+                monthly_levels_completed = COALESCE(monthly_levels_completed,0) + $3,
+                lifetime_levels_completed = COALESCE(lifetime_levels_completed,0) + $3,
+                updated_at = NOW()
+          WHERE uid = $1`,
+        [uid, awardedMc, isFirstLifetimeCompletion ? 1 : 0]
+      );
 
     const monthlyCredit = await client.query(
       `SELECT id
@@ -4481,12 +4494,12 @@ export async function claimLevelComplete(
     let awardedRp = 0;
     const already = (monthlyCredit.rowCount ?? 0) > 0;
 
-    if (!already) {
-      const rpResult = await addRPForUserVersion(client, rewardUser, uid, rewards.rp);
-      awardedRp = Number(rpResult.added || 0);
+      if (!already && !isReplay) {
+        const rpResult = await addRPForUserVersion(client, rewardUser, uid, rewards.rp);
+        awardedRp = Number(rpResult.added || 0);
 
-      await client.query(
-        `INSERT INTO public.user_level_monthly_rp (uid, level_id, month_key, rp_awarded, first_completed_at)
+        await client.query(
+          `INSERT INTO public.user_level_monthly_rp (uid, level_id, month_key, rp_awarded, first_completed_at)
          VALUES ($1, $2, $3, $4, NOW())`,
         [uid, levelId, monthKey, awardedRp]
       );
@@ -4495,26 +4508,27 @@ export async function claimLevelComplete(
     await client.query("COMMIT");
 
     await recalcAndStoreMonthlyRate(uid);
-    await auditRewardEvent({
-      uid,
-      eventType: "level_complete",
-      eventKey: `${levelId}:${monthKey}`,
-      amountCoins: 1,
-      accepted: true,
-      rejectReason: already ? "monthly_rp_already_awarded" : undefined,
-    });
+      await auditRewardEvent({
+        uid,
+        eventType: "level_complete",
+        eventKey: `${levelId}:${monthKey}`,
+        amountCoins: awardedMc,
+        accepted: true,
+        rejectReason: isReplay ? "replay_no_rewards" : already ? "monthly_rp_already_awarded" : undefined,
+      });
 
-    const user = await getUserByUid(uid);
-    const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
-    return {
-      already,
-      user,
-      levelAccess,
-      rewards: {
-        mc: rewards.mc,
-        rp: awardedRp,
-      },
-    };
+      const user = await getUserByUid(uid);
+      const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
+      return {
+        already,
+        isReplay,
+        user,
+        levelAccess,
+        rewards: {
+          mc: awardedMc,
+          rp: awardedRp,
+        },
+      };
   } catch (e) {
     await client.query("ROLLBACK");
     throw e;
