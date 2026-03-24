@@ -67,6 +67,7 @@ import {
   getDailyLeaderboardMe,
   getMonthlyLeaderboard,
   getMonthlyLeaderboardMe,
+  getCompletedLevels,
   getDailyLeaderboardRaw,
   snapshotDailyLeaderboardRewards,
   getDailyLeaderboardRewardMe,
@@ -130,10 +131,11 @@ app.get("/", (_req, res) => res.send("backend up"));
 app.get("/api/me", async (req, res) => {
   res.set("Cache-Control", "no-store");
 
-  try {
-    const { uid } = await requirePiUser(req);
-    const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
-    const surpriseBoxState = await getDailySurpriseBoxState(uid).catch(() => null);
+    try {
+      const { uid } = await requirePiUser(req);
+      const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
+      const surpriseBoxState = await getDailySurpriseBoxState(uid).catch(() => null);
+      const completedLevels = await getCompletedLevels(uid).catch(() => []);
 
     const userRes = await pool.query(
       `SELECT * FROM public.users WHERE uid = $1 LIMIT 1`,
@@ -324,9 +326,11 @@ if (firstRecoverableMissedDay) {
             daily_surprise_boxes_opened: surpriseBoxState?.dailyBoxesOpened ?? user.daily_surprise_boxes_opened ?? 0,
             daily_surprise_boxes_max: surpriseBoxState?.dailyBoxesMax ?? SURPRISE_BOX_DAILY_MAX,
             daily_surprise_boxes_remaining: surpriseBoxState?.dailyBoxesRemaining ?? Math.max(0, SURPRISE_BOX_DAILY_MAX - Number(user.daily_surprise_boxes_opened ?? 0)),
-            can_open_surprise_box: surpriseBoxState?.canOpenNow ?? true,
-          }
-        : null,
+              can_open_surprise_box: surpriseBoxState?.canOpenNow ?? true,
+              completed_levels: completedLevels,
+              completedLevels,
+            }
+          : null,
 
       progress: progress
         ? {
@@ -342,10 +346,11 @@ if (firstRecoverableMissedDay) {
         : null,
       dailyReward,
       levelAccess,
-      surpriseBoxState,
-      missedDay,
-      mysteryChest,
-    });
+        surpriseBoxState,
+        completedLevels,
+        missedDay,
+        mysteryChest,
+      });
   } catch (e: any) {
     res.status(401).json({ ok: false, error: e.message });
   }
@@ -1438,7 +1443,7 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
 
     const out = await claimLevelComplete(uid, level, { usedHint, usedSkip });
 
-    res.json({ ok:true, already:!!out?.already, user:out?.user, rewards: out?.rewards || null, levelAccess: out?.levelAccess || null });
+    res.json({ ok:true, already:!!out?.already, isReplay: !!out?.isReplay, user:out?.user, rewards: out?.rewards || null, levelAccess: out?.levelAccess || null });
 
   }catch(e:any){
     try {
