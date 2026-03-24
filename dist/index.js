@@ -12,6 +12,8 @@ process.on("uncaughtException", (err) => {
 require("dotenv/config");
 const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
+const economy_1 = require("./config/economy");
+const runtime_1 = require("./config/runtime");
 const db_1 = require("./db");
 const app = (0, express_1.default)();
 const ALLOW_INFERRED_MISSED_FOR_TEST = true;
@@ -35,6 +37,9 @@ app.get("/api/me", async (req, res) => {
     res.set("Cache-Control", "no-store");
     try {
         const { uid } = await requirePiUser(req);
+        const levelAccess = await (0, db_1.getDailyLevelAccessState)(uid).catch(() => null);
+        const surpriseBoxState = await (0, db_1.getDailySurpriseBoxState)(uid).catch(() => null);
+        const completedLevels = await (0, db_1.getCompletedLevels)(uid).catch(() => []);
         const userRes = await db_1.pool.query(`SELECT * FROM public.users WHERE uid = $1 LIMIT 1`, [uid]);
         const user = userRes.rows[0] ?? null;
         const progress = await (0, db_1.getProgressByUid)(uid);
@@ -137,9 +142,11 @@ app.get("/api/me", async (req, res) => {
                     daily_rp: user.daily_rp ?? 0,
                     rpScore: user.rp_score ?? 0,
                     dailyRp: user.daily_rp ?? 0,
-                    currentRank: monthlyLeaderboardMe?.row?.rank ?? null,
-                    projectedTierName: monthlyLeaderboardMe?.row?.projectedTierName ?? null,
-                    projectedTierLabel: monthlyLeaderboardMe?.row?.projectedTierLabel ?? null,
+                    currentRank: monthlyLeaderboardMe?.currentRank ?? null,
+                    projectedTierName: monthlyLeaderboardMe?.projectedTierName ?? null,
+                    projectedTierLabel: monthlyLeaderboardMe?.projectedTierLabel ?? null,
+                    nextTierName: monthlyLeaderboardMe?.nextTierName ?? null,
+                    rpNeededForNextTier: monthlyLeaderboardMe?.rpNeededForNextTier ?? null,
                     last_rp_reset: user.last_rp_reset ?? null,
                     // ðŸ”¹ paid balances (wallet)
                     restarts_balance: user.restarts_balance ?? 0,
@@ -165,6 +172,23 @@ app.get("/api/me", async (req, res) => {
                     pi_wallet_identifier: user.pi_wallet_identifier ?? null,
                     wallet_verified: Boolean(user.wallet_verified),
                     wallet_last_updated_at: user.wallet_last_updated_at ?? null,
+                    daily_levels_played: levelAccess?.dailyLevelsPlayed ?? user.daily_levels_played ?? 0,
+                    daily_levels_unlocked: levelAccess?.dailyLevelsUnlocked ?? user.daily_levels_unlocked ?? levelAccess?.initialDailyUnlockedLevels ?? 10,
+                    daily_levels_max: levelAccess?.dailyLevelsMax ?? economy_1.DAILY_LEVELS_MAX,
+                    initial_daily_unlocked_levels: levelAccess?.initialDailyUnlockedLevels ?? 10,
+                    next_unlock_at: levelAccess?.nextUnlockAt ?? (user.next_unlock_at ? new Date(user.next_unlock_at).toISOString() : null),
+                    can_watch_ad_to_unlock: levelAccess?.canWatchAdToUnlock ?? false,
+                    can_unlock_with_ad: levelAccess?.canUnlockWithAd ?? false,
+                    can_play_now: levelAccess?.canPlayNow ?? true,
+                    is_daily_cap_reached: levelAccess?.isDailyCapReached ?? false,
+                    is_waiting_for_unlock: levelAccess?.isWaitingForUnlock ?? false,
+                    daily_limit_reached: levelAccess?.dailyLimitReached ?? false,
+                    daily_surprise_boxes_opened: surpriseBoxState?.dailyBoxesOpened ?? user.daily_surprise_boxes_opened ?? 0,
+                    daily_surprise_boxes_max: surpriseBoxState?.dailyBoxesMax ?? economy_1.SURPRISE_BOX_DAILY_MAX,
+                    daily_surprise_boxes_remaining: surpriseBoxState?.dailyBoxesRemaining ?? Math.max(0, economy_1.SURPRISE_BOX_DAILY_MAX - Number(user.daily_surprise_boxes_opened ?? 0)),
+                    can_open_surprise_box: surpriseBoxState?.canOpenNow ?? true,
+                    completed_levels: completedLevels,
+                    completedLevels,
                 }
                 : null,
             progress: progress
@@ -180,6 +204,9 @@ app.get("/api/me", async (req, res) => {
                 }
                 : null,
             dailyReward,
+            levelAccess,
+            surpriseBoxState,
+            completedLevels,
             missedDay,
             mysteryChest,
         });
@@ -315,9 +342,9 @@ app.post("/api/progress", async (req, res) => {
     }
 });
 /* ---------------- PROGRESS ---------------- */
-const DAILY_REWARDS = [5, 7, 10, 15, 20, 30, 50];
+const DAILY_REWARDS = [...economy_1.DAILY_REWARD_COINS];
 function rewardForDay(day) {
-    return DAILY_REWARDS[Math.min(day - 1, DAILY_REWARDS.length - 1)];
+    return (0, economy_1.getDailyRewardCoinsForDay)(day);
 }
 function isoDateUTC(input) {
     return new Date(input).toISOString().slice(0, 10);
@@ -424,6 +451,23 @@ app.post("/api/rewards/mystery-chest", async (req, res) => {
     catch (e) {
         await db_1.pool.query("ROLLBACK");
         res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/api/surprise-box/open", async (req, res) => {
+    let uid = null;
+    try {
+        const auth = await requirePiUser(req);
+        uid = auth.uid;
+        const out = await (0, db_1.openSurpriseBox)(uid);
+        res.json({ success: true, ...out });
+    }
+    catch (e) {
+        const surpriseBoxState = uid ? await (0, db_1.getDailySurpriseBoxState)(uid).catch(() => null) : null;
+        res.status(400).json({
+            ok: false,
+            error: e.message,
+            surpriseBoxState,
+        });
     }
 });
 app.post("/api/daily-reward/recover", async (req, res) => {
@@ -705,18 +749,10 @@ app.patch("/api/user/username", async (req, res) => {
 });
 /* ---------------- HELPERS ---------------- */
 function mysteryChestReward() {
-    const r = Math.random();
-    if (r < 0.4)
-        return 50;
-    if (r < 0.7)
-        return 100;
-    if (r < 0.9)
-        return 150;
-    return 200;
+    return (0, economy_1.getMysteryChestRewardFromRoll)(Math.random());
 }
 function dailyRewardCoinsForDay(day) {
-    const map = [5, 7, 10, 15, 20, 30, 50];
-    return map[Math.max(0, Math.min(map.length - 1, day - 1))];
+    return (0, economy_1.getDailyRewardCoinsForDay)(day);
 }
 function nextDailyStreak(lastClaimDate, today) {
     const todayStr = today.toISOString().slice(0, 10);
@@ -788,10 +824,15 @@ app.post("/api/consume", async (req, res) => {
 /* ---------------- ADMIN AUTH ---------------- */
 function requireAdmin(req) {
     const secret = String(req.headers["x-admin-secret"] || "");
-    if (!process.env.ADMIN_SECRET)
+    if (!runtime_1.runtimeConfig.admin.secret)
         throw new Error("ADMIN_SECRET missing");
-    if (secret !== process.env.ADMIN_SECRET)
+    if (secret !== runtime_1.runtimeConfig.admin.secret)
         throw new Error("Unauthorized");
+}
+function requireAdminSettlementEnabled() {
+    if (!runtime_1.runtimeConfig.admin.settlementEnabled) {
+        throw new Error("admin_settlement_disabled");
+    }
 }
 function requestIp(req) {
     const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
@@ -821,12 +862,7 @@ function getAdRequestMeta(req) {
     };
 }
 function getAdRewardCoins(adsWatchedToday) {
-    if (adsWatchedToday < 10) {
-        return 50;
-    }
-    const extra = adsWatchedToday - 10;
-    const reward = 50 - (extra * 5);
-    return Math.max(reward, 5);
+    return (0, economy_1.getAdRewardCoinsForDailyCount)(adsWatchedToday);
 }
 /* ---------------- PI VERIFY ---------------- */
 app.post("/api/pi/verify", async (req, res) => {
@@ -860,6 +896,27 @@ app.post("/api/monthly/claim", async (req, res) => {
     }
     catch (e) {
         res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/api/leaderboard", async (req, res) => {
+    try {
+        const limit = req.query.limit ? Number(req.query.limit) : undefined;
+        const offset = req.query.offset ? Number(req.query.offset) : undefined;
+        const out = await (0, db_1.getMonthlyLeaderboard)({ limit, offset });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.get("/api/leaderboard/me", async (req, res) => {
+    try {
+        const { uid } = await requirePiUser(req);
+        const out = await (0, db_1.getMonthlyLeaderboardMe)(uid);
+        res.json(out);
+    }
+    catch (e) {
+        res.status(401).json({ ok: false, error: e.message });
     }
 });
 app.get("/api/leaderboard/monthly", async (req, res) => {
@@ -1022,10 +1079,34 @@ app.post("/api/rewards/level-complete", async (req, res) => {
         const usedHint = req.body?.usedHint === true;
         const usedSkip = req.body?.usedSkip === true;
         const out = await (0, db_1.claimLevelComplete)(uid, level, { usedHint, usedSkip });
-        res.json({ ok: true, already: !!out?.already, user: out?.user, rewards: out?.rewards || null });
+        res.json({ ok: true, already: !!out?.already, isReplay: !!out?.isReplay, user: out?.user, rewards: out?.rewards || null, levelAccess: out?.levelAccess || null });
     }
     catch (e) {
-        res.status(400).json({ ok: false, error: e.message });
+        try {
+            const { uid } = await requirePiUser(req);
+            const levelAccess = await (0, db_1.getDailyLevelAccessState)(uid).catch(() => null);
+            res.status(400).json({ ok: false, error: e.message, levelAccess });
+        }
+        catch {
+            res.status(400).json({ ok: false, error: e.message });
+        }
+    }
+});
+app.post("/api/levels/ad-unlock", async (req, res) => {
+    try {
+        const { uid } = await requirePiUser(req);
+        const out = await (0, db_1.claimDailyLevelAdUnlock)(uid);
+        res.json({ ok: true, user: out.user, levelAccess: out.levelAccess });
+    }
+    catch (e) {
+        try {
+            const { uid } = await requirePiUser(req);
+            const levelAccess = await (0, db_1.getDailyLevelAccessState)(uid).catch(() => null);
+            res.status(400).json({ ok: false, error: e.message, levelAccess });
+        }
+        catch {
+            res.status(400).json({ ok: false, error: e.message });
+        }
     }
 });
 app.post("/api/restart", async (req, res) => {
@@ -1041,8 +1122,8 @@ app.post("/api/restart", async (req, res) => {
         if (!user || !progress) {
             throw new Error("User or progress not found");
         }
-        const FREE_RESTART_LIMIT = 3;
-        const RESTART_PRICE = 15;
+        const FREE_RESTART_LIMIT = economy_1.FREE_RESTARTS_PER_ACCOUNT;
+        const RESTART_PRICE = economy_1.RESTART_MC_COST;
         let usedFree = false;
         let usedAd = false;
         const adLevelBefore = Number(progress?.level ?? 1);
@@ -1079,7 +1160,7 @@ app.post("/api/restart", async (req, res) => {
                 cooldownSeconds: 30,
             });
             if (reward?.already) {
-                throw new Error("Ad already claimed");
+                throw new Error("Ad reward already used");
             }
             usedAd = true;
         }
@@ -1189,8 +1270,8 @@ app.post("/api/skip", async (req, res) => {
         if (!user || !progress) {
             throw new Error("User or progress not found");
         }
-        const FREE_SKIP_LIMIT = 3;
-        const SKIP_PRICE = 40;
+        const FREE_SKIP_LIMIT = economy_1.FREE_SKIPS_PER_ACCOUNT;
+        const SKIP_PRICE = economy_1.SKIP_MC_COST;
         let usedFree = false;
         let usedAd = false;
         const adLevelBefore = Number(progress?.level ?? 1);
@@ -1227,7 +1308,7 @@ app.post("/api/skip", async (req, res) => {
                 cooldownSeconds: 30,
             });
             if (reward?.already) {
-                throw new Error("Ad already claimed");
+                throw new Error("Ad reward already used");
             }
             usedAd = true;
         }
@@ -1285,8 +1366,8 @@ app.post("/api/hint", async (req, res) => {
         if (!user || !progress) {
             throw new Error("User or progress not found");
         }
-        const FREE_HINT_LIMIT = 3;
-        const HINT_PRICE = 15;
+        const FREE_HINT_LIMIT = economy_1.FREE_HINTS_PER_ACCOUNT;
+        const HINT_PRICE = economy_1.HINT_MC_COST;
         let usedFree = false;
         let usedAd = false;
         const adLevelBefore = Number(progress?.level ?? 1);
@@ -1323,7 +1404,7 @@ app.post("/api/hint", async (req, res) => {
                 cooldownSeconds: 30,
             });
             if (reward?.already) {
-                throw new Error("Ad already claimed");
+                throw new Error("Ad reward already used");
             }
             usedAd = true;
         }
@@ -1369,9 +1450,50 @@ app.post("/api/hint", async (req, res) => {
     }
 });
 /* ---------------- ADMIN: month close ---------------- */
+app.get("/admin/settlement/preview", async (req, res) => {
+    try {
+        requireAdmin(req);
+        requireAdminSettlementEnabled();
+        const monthKey = req.query.month_key ? String(req.query.month_key) : undefined;
+        const out = await (0, db_1.adminPreviewSettlement)({ monthKey });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/api/levels/coins-unlock", async (req, res) => {
+    try {
+        const { uid } = await requirePiUser(req);
+        const out = await (0, db_1.claimDailyLevelCoinUnlock)(uid);
+        res.json({ ok: true, user: out.user, levelAccess: out.levelAccess, unlockCostCoins: out.unlockCostCoins });
+    }
+    catch (e) {
+        try {
+            const { uid } = await requirePiUser(req);
+            const levelAccess = await (0, db_1.getDailyLevelAccessState)(uid).catch(() => null);
+            res.status(400).json({ ok: false, error: e.message, levelAccess });
+        }
+        catch {
+            res.status(400).json({ ok: false, error: e.message });
+        }
+    }
+});
+app.get("/admin/settlement/status", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const monthKey = req.query.month_key ? String(req.query.month_key) : undefined;
+        const out = await (0, db_1.adminGetSettlementStatus)({ monthKey });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
 app.post("/admin/month-close", async (req, res) => {
     try {
         requireAdmin(req);
+        requireAdminSettlementEnabled();
         const monthKey = req.body?.month_key ? String(req.body.month_key) : undefined;
         const conversionRateLocked = Number(req.body?.conversion_rate_locked);
         const minPayoutThresholdPi = Number(req.body?.min_payout_threshold_pi ?? 0);
@@ -1606,6 +1728,7 @@ app.get("/admin/users", async (req, res) => {
             search,
             limit,
             offset,
+            order,
             suspiciousOnly,
             vpnOnly,
             manualReviewOnly,
@@ -1658,10 +1781,155 @@ app.post("/admin/users/:uid/manual-review", async (req, res) => {
         res.status(400).json({ ok: false, error: e.message });
     }
 });
+app.post("/admin/set-test-user", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const uid = String(req.body?.uid || "").trim();
+        if (!uid)
+            throw new Error("missing_uid");
+        if (typeof req.body?.isTestUser !== "boolean")
+            throw new Error("missing_is_test_user");
+        const out = await (0, db_1.adminSetUserTestFlag)(uid, Boolean(req.body.isTestUser));
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
 app.post("/admin/users/:uid/fraud-recompute", async (req, res) => {
     try {
         requireAdmin(req);
         const out = await (0, db_1.adminReevaluateUserFraud)(String(req.params.uid));
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/reset-user", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const uid = String(req.body?.uid || "").trim();
+        const reason = String(req.body?.reason || "").trim();
+        if (!uid)
+            throw new Error("missing_uid");
+        if (!reason)
+            throw new Error("missing_reason");
+        const out = await (0, db_1.adminResetUserState)({
+            uid,
+            reason,
+            adminIdentity: null,
+        });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/users/:uid/economy-adjust", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const out = await (0, db_1.adminAdjustUserEconomy)({
+            uid: String(req.params.uid),
+            target: String(req.body?.target || ""),
+            operation: String(req.body?.operation || ""),
+            amount: Number(req.body?.amount),
+            reason: String(req.body?.reason || ""),
+            adminIdentity: null,
+        });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/users/:uid/coins/add", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const delta = Number(req.body?.delta);
+        if (!Number.isFinite(delta) || delta === 0)
+            throw new Error("invalid_adjustment_amount");
+        const out = await (0, db_1.adminAdjustUserEconomy)({
+            uid: String(req.params.uid),
+            target: "coins",
+            operation: delta >= 0 ? "add" : "sub",
+            amount: Math.abs(Math.trunc(delta)),
+            reason: String(req.body?.reason || "legacy_admin_coins_add"),
+            adminIdentity: null,
+        });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/users/:uid/coins/set", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const coins = Number(req.body?.coins);
+        const out = await (0, db_1.adminAdjustUserEconomy)({
+            uid: String(req.params.uid),
+            target: "coins",
+            operation: "set",
+            amount: Math.trunc(coins),
+            reason: String(req.body?.reason || "legacy_admin_coins_set"),
+            adminIdentity: null,
+        });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/users/:uid/coins/reset", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const out = await (0, db_1.adminAdjustUserEconomy)({
+            uid: String(req.params.uid),
+            target: "coins",
+            operation: "set",
+            amount: 0,
+            reason: String(req.body?.reason || "legacy_admin_coins_reset"),
+            adminIdentity: null,
+        });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/users/:uid/score/add", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const delta = Number(req.body?.delta);
+        if (!Number.isFinite(delta) || delta === 0)
+            throw new Error("invalid_adjustment_amount");
+        const out = await (0, db_1.adminAdjustUserEconomy)({
+            uid: String(req.params.uid),
+            target: "score",
+            operation: delta >= 0 ? "add" : "sub",
+            amount: Math.abs(Math.trunc(delta)),
+            reason: String(req.body?.reason || ""),
+            adminIdentity: null,
+        });
+        res.json(out);
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+app.post("/admin/users/:uid/score/set", async (req, res) => {
+    try {
+        requireAdmin(req);
+        const score = Number(req.body?.score);
+        const out = await (0, db_1.adminAdjustUserEconomy)({
+            uid: String(req.params.uid),
+            target: "score",
+            operation: "set",
+            amount: Math.trunc(score),
+            reason: String(req.body?.reason || ""),
+            adminIdentity: null,
+        });
         res.json(out);
     }
     catch (e) {
@@ -1716,7 +1984,7 @@ async function maybeRunDailyAdReset() {
         console.error("daily_ad_reset_failed", e);
     }
 }
-const PORT = Number(process.env.PORT) || 8080;
+const PORT = runtime_1.runtimeConfig.server.port;
 async function start() {
     try {
         await (0, db_1.initDB)();

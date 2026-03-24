@@ -481,6 +481,31 @@ await pool.query(`
   ON public.user_level_monthly_rp (uid, level_id, month_key)
 `);
 
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.level_reward_events (
+    id BIGSERIAL PRIMARY KEY,
+    uid TEXT NOT NULL,
+    level_id TEXT NOT NULL,
+    is_replay BOOLEAN NOT NULL DEFAULT FALSE,
+    used_hint BOOLEAN NOT NULL DEFAULT FALSE,
+    used_skip BOOLEAN NOT NULL DEFAULT FALSE,
+    used_restart BOOLEAN NOT NULL DEFAULT FALSE,
+    coins_awarded INT NOT NULL DEFAULT 0,
+    score_awarded INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS level_reward_events_uid_created_idx
+  ON public.level_reward_events (uid, created_at DESC)
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS level_reward_events_level_created_idx
+  ON public.level_reward_events (level_id, created_at DESC)
+`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       uid TEXT PRIMARY KEY,
@@ -4577,6 +4602,30 @@ export async function claimLevelComplete(
       );
     }
 
+    await client.query(
+      `INSERT INTO public.level_reward_events (
+         uid,
+         level_id,
+         is_replay,
+         used_hint,
+         used_skip,
+         used_restart,
+         coins_awarded,
+         score_awarded,
+         created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+      [
+        uid,
+        levelId,
+        isReplay,
+        Boolean(opts?.usedHint),
+        Boolean(opts?.usedSkip),
+        false,
+        awardedMc,
+        awardedRp,
+      ]
+    );
+
     await client.query("COMMIT");
 
     await recalcAndStoreMonthlyRate(uid);
@@ -5274,6 +5323,22 @@ export async function adminGetUser(uid: string) {
     [uid]
   ).catch(() => ({ rows: [] as any[] }));
 
+  const { rows: levelRewardRows } = await pool.query(
+    `SELECT level_id,
+            is_replay,
+            used_hint,
+            used_skip,
+            used_restart,
+            coins_awarded,
+            score_awarded,
+            created_at
+       FROM public.level_reward_events
+      WHERE uid = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT 10`,
+    [uid]
+  ).catch(() => ({ rows: [] as any[] }));
+
   return {
     user: normalizeAdminUser(user, {
       currentRank: leaderboard?.currentRank ?? null,
@@ -5298,6 +5363,16 @@ export async function adminGetUser(uid: string) {
     last_session: session[0] || null,
     recentPayouts: payoutRows.map((row) => normalizeAdminPayoutRow(row)),
     recentRewards: rewardRows,
+    recentRewardEvents: levelRewardRows.map((row: any) => ({
+      levelId: String(row.level_id || ""),
+      isReplay: Boolean(row.is_replay),
+      usedHint: Boolean(row.used_hint),
+      usedSkip: Boolean(row.used_skip),
+      usedRestart: Boolean(row.used_restart),
+      coinsAwarded: Number(row.coins_awarded || 0),
+      scoreAwarded: Number(row.score_awarded || 0),
+      createdAt: row.created_at || null,
+    })),
     recentAdjustments,
   };
 }

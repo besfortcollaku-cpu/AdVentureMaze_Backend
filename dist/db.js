@@ -9,6 +9,10 @@ exports.getFreeHintsLeft = getFreeHintsLeft;
 exports.ensureMonthlyKey = ensureMonthlyKey;
 exports.monthKeyForDate = monthKeyForDate;
 exports.getMonthKey = getMonthKey;
+exports.getDayKey = getDayKey;
+exports.clampRpAward = clampRpAward;
+exports.sumMonthlyPayoutPi = sumMonthlyPayoutPi;
+exports.verifyMonthlyPayoutRows = verifyMonthlyPayoutRows;
 exports.adminSyncPayoutSimulationModeFromDb = adminSyncPayoutSimulationModeFromDb;
 exports.adminSetPayoutSimulationMode = adminSetPayoutSimulationMode;
 exports.evaluateUserPayoutRisk = evaluateUserPayoutRisk;
@@ -16,6 +20,11 @@ exports.calculateFraudScore = calculateFraudScore;
 exports.evaluateUserFraud = evaluateUserFraud;
 exports.trackRewardedAdActivity = trackRewardedAdActivity;
 exports.resetDailyAdCounters = resetDailyAdCounters;
+exports.getDailyLevelAccessState = getDailyLevelAccessState;
+exports.getDailySurpriseBoxState = getDailySurpriseBoxState;
+exports.claimDailyLevelAdUnlock = claimDailyLevelAdUnlock;
+exports.claimDailyLevelCoinUnlock = claimDailyLevelCoinUnlock;
+exports.openSurpriseBox = openSurpriseBox;
 exports.getEligibleLeaderboardUsers = getEligibleLeaderboardUsers;
 exports.assignRewardTiers = assignRewardTiers;
 exports.calculateMonthlyPiPayouts = calculateMonthlyPiPayouts;
@@ -24,6 +33,8 @@ exports.getMonthlyLeaderboardMe = getMonthlyLeaderboardMe;
 exports.closeMonthlyPayoutCycle = closeMonthlyPayoutCycle;
 exports.generatePayoutJobs = generatePayoutJobs;
 exports.adminListPayoutJobs = adminListPayoutJobs;
+exports.adminPreviewSettlement = adminPreviewSettlement;
+exports.adminGetSettlementStatus = adminGetSettlementStatus;
 exports.adminListPayoutTransferLogs = adminListPayoutTransferLogs;
 exports.adminListPayoutCycles = adminListPayoutCycles;
 exports.adminGetPayoutSnapshotSummary = adminGetPayoutSnapshotSummary;
@@ -66,12 +77,17 @@ exports.touchUserOnline = touchUserOnline;
 exports.startSession = startSession;
 exports.pingSession = pingSession;
 exports.endSession = endSession;
+exports.getLevelAccessAnalyticsSummary = getLevelAccessAnalyticsSummary;
+exports.adminAdjustUserEconomy = adminAdjustUserEconomy;
+exports.adminListUserAdjustments = adminListUserAdjustments;
 exports.adminListUsers = adminListUsers;
 exports.adminGetUser = adminGetUser;
 exports.adminSetUserPayoutLock = adminSetUserPayoutLock;
 exports.adminSetUserSuspicious = adminSetUserSuspicious;
 exports.adminSetUserManualReview = adminSetUserManualReview;
+exports.adminSetUserTestFlag = adminSetUserTestFlag;
 exports.adminReevaluateUserFraud = adminReevaluateUserFraud;
+exports.adminResetUserState = adminResetUserState;
 exports.adminResetFreeCounters = adminResetFreeCounters;
 exports.adminDeleteUser = adminDeleteUser;
 exports.adminGetStats = adminGetStats;
@@ -91,15 +107,23 @@ exports.claimInviteCode = claimInviteCode;
 const pg_1 = require("pg");
 const piPayoutSender_1 = require("./services/piPayoutSender");
 const ipRisk_1 = require("./services/ipRisk");
+const runtime_1 = require("./config/runtime");
+const economy_1 = require("./config/economy");
+Object.defineProperty(exports, "FREE_HINTS_PER_ACCOUNT", { enumerable: true, get: function () { return economy_1.FREE_HINTS_PER_ACCOUNT; } });
+Object.defineProperty(exports, "FREE_RESTARTS_PER_ACCOUNT", { enumerable: true, get: function () { return economy_1.FREE_RESTARTS_PER_ACCOUNT; } });
+Object.defineProperty(exports, "FREE_SKIPS_PER_ACCOUNT", { enumerable: true, get: function () { return economy_1.FREE_SKIPS_PER_ACCOUNT; } });
+Object.defineProperty(exports, "HINT_COST_COINS", { enumerable: true, get: function () { return economy_1.LEGACY_HINT_COST_COINS; } });
+Object.defineProperty(exports, "RESTART_COST_COINS", { enumerable: true, get: function () { return economy_1.LEGACY_RESTART_COST_COINS; } });
+Object.defineProperty(exports, "SKIP_COST_COINS", { enumerable: true, get: function () { return economy_1.LEGACY_SKIP_COST_COINS; } });
 console.log("Backend v2.0.1");
 exports.pool = new pg_1.Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_SSL === "true"
+    connectionString: runtime_1.runtimeConfig.database.url,
+    ssl: runtime_1.runtimeConfig.database.ssl
         ? { rejectUnauthorized: false }
         : undefined,
 });
 /* =====================================================
-   INIT  (âœ… Fix 1: auto-create core tables incl. sessions)
+   INIT  (✅ Fix 1: auto-create core tables incl. sessions)
 ===================================================== */
 async function useNonce(uid, nonce) {
     if (!nonce)
@@ -265,7 +289,20 @@ async function initDB() {
       ADD COLUMN IF NOT EXISTS mc_balance INT NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS rp_score INT NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS daily_rp INT NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS last_rp_reset TIMESTAMP DEFAULT NOW();
+      ADD COLUMN IF NOT EXISTS last_rp_reset TIMESTAMP DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS is_test_user BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS daily_surprise_boxes_opened INT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_surprise_box_day_key TEXT,
+      ADD COLUMN IF NOT EXISTS daily_levels_played INT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS daily_levels_unlocked INT NOT NULL DEFAULT 10,
+      ADD COLUMN IF NOT EXISTS last_level_reset_day_key TEXT,
+      ADD COLUMN IF NOT EXISTS next_unlock_at TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS economy_version INT NOT NULL DEFAULT 1;
+  `);
+    await exports.pool.query(`
+    UPDATE public.users
+       SET economy_version = 1
+     WHERE economy_version IS NULL
   `);
     await exports.pool.query(`
     UPDATE public.users
@@ -287,6 +324,49 @@ async function initDB() {
       level_before INTEGER,
       level_after INTEGER
     );
+  `);
+    await exports.pool.query(`
+    CREATE TABLE IF NOT EXISTS public.level_access_events (
+      id BIGSERIAL PRIMARY KEY,
+      uid TEXT NOT NULL,
+      day_key TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      levels_played INT,
+      levels_unlocked INT,
+      daily_levels_max INT,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+    await exports.pool.query(`
+    CREATE INDEX IF NOT EXISTS level_access_events_day_type_created_idx
+    ON public.level_access_events (day_key, event_type, created_at DESC)
+  `);
+    await exports.pool.query(`
+    CREATE INDEX IF NOT EXISTS level_access_events_uid_day_created_idx
+    ON public.level_access_events (uid, day_key, created_at DESC)
+  `);
+    await exports.pool.query(`
+    CREATE INDEX IF NOT EXISTS level_access_events_type_created_idx
+    ON public.level_access_events (event_type, created_at DESC)
+  `);
+    await exports.pool.query(`
+    CREATE TABLE IF NOT EXISTS public.surprise_box_rewards (
+      id BIGSERIAL PRIMARY KEY,
+      uid TEXT NOT NULL,
+      day_key TEXT NOT NULL,
+      reward_type TEXT NOT NULL,
+      reward_amount INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+    await exports.pool.query(`
+    CREATE INDEX IF NOT EXISTS surprise_box_rewards_uid_day_created_idx
+    ON public.surprise_box_rewards (uid, day_key, created_at DESC)
+  `);
+    await exports.pool.query(`
+    CREATE INDEX IF NOT EXISTS surprise_box_rewards_type_created_idx
+    ON public.surprise_box_rewards (reward_type, created_at DESC)
   `);
     await exports.pool.query(`
     CREATE INDEX IF NOT EXISTS user_ad_activity_uid_created_idx
@@ -437,6 +517,28 @@ async function initDB() {
   ON public.user_level_monthly_rp (uid, level_id, month_key)
 `);
     await exports.pool.query(`
+  CREATE TABLE IF NOT EXISTS public.level_reward_events (
+    id BIGSERIAL PRIMARY KEY,
+    uid TEXT NOT NULL,
+    level_id TEXT NOT NULL,
+    is_replay BOOLEAN NOT NULL DEFAULT FALSE,
+    used_hint BOOLEAN NOT NULL DEFAULT FALSE,
+    used_skip BOOLEAN NOT NULL DEFAULT FALSE,
+    used_restart BOOLEAN NOT NULL DEFAULT FALSE,
+    coins_awarded INT NOT NULL DEFAULT 0,
+    score_awarded INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+  );
+`);
+    await exports.pool.query(`
+  CREATE INDEX IF NOT EXISTS level_reward_events_uid_created_idx
+  ON public.level_reward_events (uid, created_at DESC)
+`);
+    await exports.pool.query(`
+  CREATE INDEX IF NOT EXISTS level_reward_events_level_created_idx
+  ON public.level_reward_events (level_id, created_at DESC)
+`);
+    await exports.pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       uid TEXT PRIMARY KEY,
       session_id TEXT,
@@ -488,7 +590,8 @@ async function initDB() {
     ALTER TABLE public.monthly_pi_payouts
       ADD COLUMN IF NOT EXISTS tier_name TEXT,
       ADD COLUMN IF NOT EXISTS tier_label TEXT,
-      ADD COLUMN IF NOT EXISTS leaderboard_rank INT;
+      ADD COLUMN IF NOT EXISTS leaderboard_rank INT,
+      ADD COLUMN IF NOT EXISTS economy_version INT NOT NULL DEFAULT 1;
   `);
     await exports.pool.query(`
     CREATE TABLE IF NOT EXISTS public.monthly_payout_snapshots (
@@ -566,6 +669,42 @@ async function initDB() {
     );
   `);
     await exports.pool.query(`
+    CREATE TABLE IF NOT EXISTS public.admin_adjustments (
+      id BIGSERIAL PRIMARY KEY,
+      uid TEXT NOT NULL,
+      target TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      amount INT NOT NULL,
+      before_value INT,
+      after_value INT,
+      reason TEXT NOT NULL,
+      admin_identity TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+    await exports.pool.query(`
+    CREATE INDEX IF NOT EXISTS admin_adjustments_uid_created_idx
+      ON public.admin_adjustments (uid, created_at DESC);
+  `);
+    await exports.pool.query(`
+    CREATE INDEX IF NOT EXISTS admin_adjustments_target_created_idx
+      ON public.admin_adjustments (target, created_at DESC);
+  `);
+    await exports.pool.query(`
+    CREATE TABLE IF NOT EXISTS public.monthly_settlement_runs (
+      id BIGSERIAL PRIMARY KEY,
+      month_key TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL,
+      pool_pi NUMERIC,
+      eligible_users INT,
+      total_score INT,
+      total_payout_pi NUMERIC,
+      notes TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+    await exports.pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS pi_payout_jobs_idempotency_key_uniq
       ON public.pi_payout_jobs (idempotency_key)
       WHERE idempotency_key IS NOT NULL;
@@ -593,27 +732,18 @@ async function initDB() {
     ADD COLUMN IF NOT EXISTS ads_for_restarts INT DEFAULT 0
   `);
 }
-/* =====================================================
-   CONSTANTS
-===================================================== */
-exports.FREE_RESTARTS_PER_ACCOUNT = 3;
-exports.FREE_SKIPS_PER_ACCOUNT = 3;
-exports.FREE_HINTS_PER_ACCOUNT = 3;
-exports.RESTART_COST_COINS = 50;
-exports.SKIP_COST_COINS = 50;
-exports.HINT_COST_COINS = 50;
 exports.CONSUMABLES = {
-    restart: { coinCost: 50, freeLimit: 3 },
-    skip: { coinCost: 50, freeLimit: 3 },
-    hint: { coinCost: 50, freeLimit: 3 },
+    restart: { coinCost: economy_1.LEGACY_RESTART_COST_COINS, freeLimit: economy_1.FREE_RESTARTS_PER_ACCOUNT },
+    skip: { coinCost: economy_1.LEGACY_SKIP_COST_COINS, freeLimit: economy_1.FREE_SKIPS_PER_ACCOUNT },
+    hint: { coinCost: economy_1.LEGACY_HINT_COST_COINS, freeLimit: economy_1.FREE_HINTS_PER_ACCOUNT },
 };
 function getFreeSkipsLeft(u) {
     const used = Number(u?.free_skips_used || 0);
-    return Math.max(0, exports.FREE_SKIPS_PER_ACCOUNT - used);
+    return Math.max(0, economy_1.FREE_SKIPS_PER_ACCOUNT - used);
 }
 function getFreeHintsLeft(u) {
     const used = Number(u?.free_hints_used || 0);
-    return Math.max(0, exports.FREE_HINTS_PER_ACCOUNT - used);
+    return Math.max(0, economy_1.FREE_HINTS_PER_ACCOUNT - used);
 }
 /* =====================================================
    USERS
@@ -658,6 +788,57 @@ function monthKeyForDate(d) {
 function getMonthKey(date = new Date()) {
     return monthKeyForDate(date);
 }
+function getDayKey(date = new Date()) {
+    const y = date.getUTCFullYear();
+    const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(date.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+}
+async function logLevelAccessEvent(input, client) {
+    const queryable = client || exports.pool;
+    const dayKey = input.dayKey || getDayKey();
+    const metadata = input.metadata && typeof input.metadata === "object" ? input.metadata : {};
+    try {
+        await queryable.query(`INSERT INTO public.level_access_events
+         (uid, day_key, event_type, levels_played, levels_unlocked, daily_levels_max, metadata, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW())`, [
+            input.uid,
+            dayKey,
+            input.eventType,
+            input.levelsPlayed ?? null,
+            input.levelsUnlocked ?? null,
+            input.dailyLevelsMax ?? null,
+            JSON.stringify(metadata),
+        ]);
+    }
+    catch {
+        // Analytics are observational only. Never block gameplay/admin flows.
+    }
+}
+function clampRpAward(requestedAmount, currentDailyRp, cap = economy_1.DAILY_SCORE_CAP) {
+    const requested = Math.max(0, Math.trunc(Number(requestedAmount || 0)));
+    const current = Math.max(0, Math.trunc(Number(currentDailyRp || 0)));
+    const limit = Math.max(0, Math.trunc(Number(cap || 0)));
+    if (!requested || !limit)
+        return 0;
+    const remaining = Math.max(0, limit - current);
+    return Math.min(requested, remaining);
+}
+function sumMonthlyPayoutPi(rows) {
+    return rows.reduce((sum, row) => sum + Math.max(0, Number(row?.payout_pi || 0)), 0);
+}
+function verifyMonthlyPayoutRows(rows, totalPoolPi, tolerance = 0.000001) {
+    const safePool = Math.max(0, Number(totalPoolPi || 0));
+    const safeTolerance = Math.max(0, Number(tolerance || 0));
+    const totalPayoutPi = sumMonthlyPayoutPi(rows);
+    if (rows.some((row) => Number(row?.payout_pi || 0) < 0)) {
+        throw new Error("invalid_negative_payout");
+    }
+    if (totalPayoutPi - safePool > safeTolerance) {
+        throw new Error("invalid_payout_total_exceeds_pool");
+    }
+    return { totalPayoutPi };
+}
 const MONTH_KEY_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 function normalizeMonthKey(input) {
     const key = String(input || currentMonthKey()).trim();
@@ -682,13 +863,6 @@ function envNumber(name, fallback) {
     const n = Number(raw);
     return Number.isFinite(n) ? n : fallback;
 }
-const MONTHLY_PI_POOL = envNumber("MONTHLY_PI_POOL", 300);
-const REWARD_TIERS = [
-    { name: "A", label: "Champion", percent: 1, poolShare: 40 },
-    { name: "B", label: "Elite", percent: 4, poolShare: 27 },
-    { name: "C", label: "Advanced", percent: 15, poolShare: 20 },
-    { name: "D", label: "Qualified", percent: 30, poolShare: 13 },
-];
 const MAX_USER_MONTHLY_PI = envNumber("MAX_USER_MONTHLY_PI", 100);
 const MAX_GLOBAL_MONTHLY_PI = envNumber("MAX_GLOBAL_MONTHLY_PI", 100000);
 const MIN_ACCOUNT_AGE_DAYS = envNumber("MIN_ACCOUNT_AGE_DAYS", 7);
@@ -711,7 +885,7 @@ let runtimePayoutSimulationMode = null;
 function isPayoutSimulationMode() {
     if (typeof runtimePayoutSimulationMode === "boolean")
         return runtimePayoutSimulationMode;
-    return process.env.PAYOUT_SIMULATE_SUCCESS === "true";
+    return runtime_1.runtimeConfig.payout.simulateSuccess;
 }
 async function adminSyncPayoutSimulationModeFromDb() {
     try {
@@ -719,7 +893,7 @@ async function adminSyncPayoutSimulationModeFromDb() {
         const raw = String(out.rows?.[0]?.value ?? "").trim().toLowerCase();
         if (raw === "true" || raw === "false") {
             runtimePayoutSimulationMode = raw === "true";
-            process.env.PAYOUT_SIMULATE_SUCCESS = runtimePayoutSimulationMode ? "true" : "false";
+            (0, runtime_1.setPayoutSimulationMode)(runtimePayoutSimulationMode);
         }
     }
     catch {
@@ -729,7 +903,7 @@ async function adminSyncPayoutSimulationModeFromDb() {
 }
 async function adminSetPayoutSimulationMode(enabled) {
     runtimePayoutSimulationMode = Boolean(enabled);
-    process.env.PAYOUT_SIMULATE_SUCCESS = runtimePayoutSimulationMode ? "true" : "false";
+    (0, runtime_1.setPayoutSimulationMode)(runtimePayoutSimulationMode);
     await exports.pool.query(`INSERT INTO public.admin_runtime_config (key, value, updated_at)
      VALUES ($1, $2, NOW())
      ON CONFLICT (key)
@@ -844,13 +1018,13 @@ async function getTotalPaidPi() {
     return Number(out.rows[0]?.total || 0);
 }
 async function assertTreasuryCanPayout(payoutPi) {
-    if (process.env.PAYOUT_SIMULATE_SUCCESS === "true") {
+    if (isPayoutSimulationMode()) {
         return { ok: true };
     }
     const availableFromAdapter = await (0, piPayoutSender_1.getSendingWalletAvailableBalancePi)();
     const available = (Number.isFinite(availableFromAdapter)
         ? Number(availableFromAdapter)
-        : Number(process.env.SENDING_WALLET_AVAILABLE_PI || process.env.PAYOUT_TREASURY_AVAILABLE_PI));
+        : Number(runtime_1.runtimeConfig.payout.sendingWalletAvailablePi ?? runtime_1.runtimeConfig.payout.payoutTreasuryAvailablePi));
     if (!Number.isFinite(available)) {
         return { ok: false, reason: 'treasury_guard' };
     }
@@ -1114,6 +1288,423 @@ async function resetDailyAdCounters() {
       WHERE COALESCE(ads_watched_today, 0) <> 0`);
     return { ok: true, reset_users: Number(out.rowCount || 0) };
 }
+function getEconomyVersion(user) {
+    const version = Number(user?.economy_version ??
+        user?.economyVersion ??
+        runtime_1.runtimeConfig.economy.defaultEconomyVersion);
+    return Number.isInteger(version) && version > 0
+        ? version
+        : runtime_1.runtimeConfig.economy.defaultEconomyVersion;
+}
+function calculateLevelRewardsV1(input) {
+    if (input.isReplay) {
+        return { coins: 0, score: 0 };
+    }
+    if (input.usedHint || input.usedSkip) {
+        return {
+            coins: economy_1.LEVEL_MC_REWARD,
+            score: economy_1.LEVEL_RP_HINT_REWARD,
+        };
+    }
+    return {
+        coins: economy_1.LEVEL_MC_REWARD,
+        score: economy_1.LEVEL_RP_CLEAN_REWARD,
+    };
+}
+function calculateLevelRewardsForUser(user, input) {
+    const version = getEconomyVersion(user);
+    if (version === 1) {
+        return calculateLevelRewardsV1(input);
+    }
+    // Future economy versions can branch here without changing current v1 behavior.
+    return calculateLevelRewardsV1(input);
+}
+function buildDailyLevelAccessState(user) {
+    const dailyLevelsPlayed = Math.max(0, Number(user?.daily_levels_played || 0));
+    const dailyLevelsUnlocked = Math.max(economy_1.INITIAL_DAILY_UNLOCKED_LEVELS, Math.min(economy_1.DAILY_LEVELS_MAX, Number(user?.daily_levels_unlocked || economy_1.INITIAL_DAILY_UNLOCKED_LEVELS)));
+    const dailyLevelsMax = economy_1.DAILY_LEVELS_MAX;
+    const nextUnlockAt = user?.next_unlock_at ? new Date(user.next_unlock_at).toISOString() : null;
+    const canPlayNow = dailyLevelsPlayed < dailyLevelsUnlocked && dailyLevelsPlayed < dailyLevelsMax;
+    const waitingForUnlock = dailyLevelsPlayed >= dailyLevelsUnlocked && dailyLevelsUnlocked < dailyLevelsMax && dailyLevelsPlayed < dailyLevelsMax;
+    const dailyCapReached = dailyLevelsPlayed >= dailyLevelsMax;
+    return {
+        dailyLevelsPlayed,
+        dailyLevelsUnlocked,
+        dailyLevelsMax,
+        initialDailyUnlockedLevels: economy_1.INITIAL_DAILY_UNLOCKED_LEVELS,
+        nextUnlockAt,
+        unlockIntervalSeconds: economy_1.UNLOCK_INTERVAL_SECONDS,
+        unlockLevelsPerInterval: economy_1.UNLOCK_LEVELS_PER_INTERVAL,
+        adUnlockLevels: economy_1.AD_UNLOCK_LEVELS,
+        canPlayNow,
+        isDailyCapReached: dailyCapReached,
+        isWaitingForUnlock: waitingForUnlock,
+        canUnlockWithAd: waitingForUnlock,
+        canWatchAdToUnlock: waitingForUnlock,
+        dailyLimitReached: dailyCapReached,
+    };
+}
+function buildDailySurpriseBoxState(user) {
+    const dailyBoxesOpened = Math.max(0, Number(user?.daily_surprise_boxes_opened || 0));
+    const dailyBoxesMax = economy_1.SURPRISE_BOX_DAILY_MAX;
+    const dailyBoxesRemaining = Math.max(0, dailyBoxesMax - dailyBoxesOpened);
+    const canOpenNow = dailyBoxesOpened < dailyBoxesMax;
+    return {
+        dailyBoxesOpened,
+        dailyBoxesMax,
+        dailyBoxesRemaining,
+        canOpenNow,
+        dailyLimitReached: !canOpenNow,
+    };
+}
+async function refreshDailySurpriseBoxStateWithClient(client, uid) {
+    const todayKey = getDayKey();
+    await client.query(`UPDATE public.users
+        SET daily_surprise_boxes_opened = 0,
+            last_surprise_box_day_key = $2,
+            updated_at = NOW()
+      WHERE uid = $1
+        AND COALESCE(last_surprise_box_day_key, '') <> $2`, [uid, todayKey]);
+    const out = await client.query(`SELECT uid,
+            mc_balance,
+            restarts_balance,
+            skips_balance,
+            hints_balance,
+            daily_surprise_boxes_opened,
+            last_surprise_box_day_key
+       FROM public.users
+      WHERE uid = $1
+      FOR UPDATE`, [uid]);
+    const user = out.rows[0];
+    if (!user) {
+        throw new Error("user_not_found");
+    }
+    return user;
+}
+async function refreshDailyLevelAccessWithClient(client, uid) {
+    const todayKey = getDayKey();
+    const resetRes = await client.query(`UPDATE public.users
+        SET daily_levels_played = 0,
+            daily_levels_unlocked = $2,
+            last_level_reset_day_key = $3,
+            next_unlock_at = NULL,
+            updated_at = NOW()
+      WHERE uid = $1
+        AND COALESCE(last_level_reset_day_key, '') <> $3`, [uid, economy_1.INITIAL_DAILY_UNLOCKED_LEVELS, todayKey]);
+    if ((resetRes.rowCount ?? 0) > 0) {
+        await logLevelAccessEvent({
+            uid,
+            dayKey: todayKey,
+            eventType: "daily_access_reset",
+            levelsPlayed: 0,
+            levelsUnlocked: economy_1.INITIAL_DAILY_UNLOCKED_LEVELS,
+            dailyLevelsMax: economy_1.DAILY_LEVELS_MAX,
+        }, client);
+    }
+    const lockRes = await client.query(`SELECT uid, daily_levels_played, daily_levels_unlocked, last_level_reset_day_key, next_unlock_at
+       FROM public.users
+      WHERE uid = $1
+      FOR UPDATE`, [uid]);
+    const user = lockRes.rows[0];
+    if (!user) {
+        throw new Error("user_not_found");
+    }
+    let played = Math.max(0, Number(user.daily_levels_played || 0));
+    let unlocked = Math.max(economy_1.INITIAL_DAILY_UNLOCKED_LEVELS, Math.min(economy_1.DAILY_LEVELS_MAX, Number(user.daily_levels_unlocked || economy_1.INITIAL_DAILY_UNLOCKED_LEVELS)));
+    let nextUnlockAt = user.next_unlock_at ? new Date(user.next_unlock_at) : null;
+    const now = new Date();
+    const intervalMs = economy_1.UNLOCK_INTERVAL_SECONDS * 1000;
+    if (unlocked < economy_1.DAILY_LEVELS_MAX && played >= unlocked) {
+        if (!nextUnlockAt) {
+            nextUnlockAt = new Date(now.getTime() + intervalMs);
+        }
+        else if (nextUnlockAt.getTime() <= now.getTime()) {
+            const elapsedIntervals = Math.floor((now.getTime() - nextUnlockAt.getTime()) / intervalMs) + 1;
+            unlocked = Math.min(economy_1.DAILY_LEVELS_MAX, unlocked + (elapsedIntervals * economy_1.UNLOCK_LEVELS_PER_INTERVAL));
+            const candidateNext = new Date(nextUnlockAt.getTime() + (elapsedIntervals * intervalMs));
+            nextUnlockAt = unlocked >= economy_1.DAILY_LEVELS_MAX
+                ? null
+                : (played >= unlocked ? candidateNext : null);
+        }
+    }
+    else if (played < unlocked || unlocked >= economy_1.DAILY_LEVELS_MAX) {
+        nextUnlockAt = null;
+    }
+    const updatedRes = await client.query(`UPDATE public.users
+        SET daily_levels_played = $2,
+            daily_levels_unlocked = $3,
+            last_level_reset_day_key = $4,
+            next_unlock_at = $5,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING *`, [uid, played, unlocked, todayKey, nextUnlockAt]);
+    return updatedRes.rows[0];
+}
+async function incrementDailyLevelsPlayedWithClient(client, uid, metadata) {
+    const refreshed = await refreshDailyLevelAccessWithClient(client, uid);
+    const access = buildDailyLevelAccessState(refreshed);
+    if (access.dailyLimitReached) {
+        await logLevelAccessEvent({
+            uid,
+            dayKey: getDayKey(),
+            eventType: "daily_cap_reached",
+            levelsPlayed: access.dailyLevelsPlayed,
+            levelsUnlocked: access.dailyLevelsUnlocked,
+            dailyLevelsMax: access.dailyLevelsMax,
+        });
+        throw new Error("daily_level_limit_reached");
+    }
+    if (!access.canPlayNow) {
+        await logLevelAccessEvent({
+            uid,
+            dayKey: getDayKey(),
+            eventType: "waiting_for_unlock",
+            levelsPlayed: access.dailyLevelsPlayed,
+            levelsUnlocked: access.dailyLevelsUnlocked,
+            dailyLevelsMax: access.dailyLevelsMax,
+            metadata: {
+                next_unlock_at: access.nextUnlockAt,
+            },
+        });
+        throw new Error("daily_levels_locked");
+    }
+    const played = Math.min(economy_1.DAILY_LEVELS_MAX, access.dailyLevelsPlayed + 1);
+    const unlocked = access.dailyLevelsUnlocked;
+    const shouldQueueNextUnlock = played >= unlocked &&
+        unlocked < economy_1.DAILY_LEVELS_MAX;
+    const nextUnlockAt = shouldQueueNextUnlock
+        ? new Date(Date.now() + (economy_1.UNLOCK_INTERVAL_SECONDS * 1000))
+        : null;
+    const out = await client.query(`UPDATE public.users
+        SET daily_levels_played = $2,
+            next_unlock_at = $3,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING *`, [uid, played, nextUnlockAt]);
+    const updatedUser = out.rows[0];
+    await logLevelAccessEvent({
+        uid,
+        dayKey: getDayKey(),
+        eventType: "level_completed",
+        levelsPlayed: Math.max(0, Number(updatedUser?.daily_levels_played || played)),
+        levelsUnlocked: Math.max(0, Number(updatedUser?.daily_levels_unlocked || unlocked)),
+        dailyLevelsMax: economy_1.DAILY_LEVELS_MAX,
+        metadata,
+    }, client);
+    return updatedUser;
+}
+async function getDailyLevelAccessState(uid) {
+    const client = await exports.pool.connect();
+    try {
+        await client.query("BEGIN");
+        const user = await refreshDailyLevelAccessWithClient(client, uid);
+        await client.query("COMMIT");
+        return buildDailyLevelAccessState(user);
+    }
+    catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+    }
+    finally {
+        client.release();
+    }
+}
+async function getDailySurpriseBoxState(uid) {
+    const client = await exports.pool.connect();
+    try {
+        await client.query("BEGIN");
+        const user = await refreshDailySurpriseBoxStateWithClient(client, uid);
+        await client.query("COMMIT");
+        return buildDailySurpriseBoxState(user);
+    }
+    catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+    }
+    finally {
+        client.release();
+    }
+}
+async function claimDailyLevelAdUnlock(uid) {
+    const client = await exports.pool.connect();
+    try {
+        await client.query("BEGIN");
+        const user = await refreshDailyLevelAccessWithClient(client, uid);
+        const access = buildDailyLevelAccessState(user);
+        if (access.dailyLimitReached) {
+            throw new Error("daily_level_limit_reached");
+        }
+        if (!access.canWatchAdToUnlock) {
+            throw new Error("daily_level_ad_unlock_not_available");
+        }
+        const nextUnlocked = Math.min(economy_1.DAILY_LEVELS_MAX, access.dailyLevelsUnlocked + economy_1.AD_UNLOCK_LEVELS);
+        const out = await client.query(`UPDATE public.users
+          SET daily_levels_unlocked = $2,
+              next_unlock_at = NULL,
+              updated_at = NOW()
+        WHERE uid = $1
+        RETURNING *`, [uid, nextUnlocked]);
+        const updatedUser = out.rows[0];
+        await logLevelAccessEvent({
+            uid,
+            dayKey: getDayKey(),
+            eventType: "ad_unlock_used",
+            levelsPlayed: Math.max(0, Number(updatedUser?.daily_levels_played || access.dailyLevelsPlayed)),
+            levelsUnlocked: Math.max(0, Number(updatedUser?.daily_levels_unlocked || nextUnlocked)),
+            dailyLevelsMax: economy_1.DAILY_LEVELS_MAX,
+            metadata: {
+                unlock_levels_granted: economy_1.AD_UNLOCK_LEVELS,
+            },
+        }, client);
+        await client.query("COMMIT");
+        return {
+            ok: true,
+            user: updatedUser,
+            levelAccess: buildDailyLevelAccessState(updatedUser),
+        };
+    }
+    catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+    }
+    finally {
+        client.release();
+    }
+}
+async function claimDailyLevelCoinUnlock(uid) {
+    const client = await exports.pool.connect();
+    try {
+        await client.query("BEGIN");
+        const user = await refreshDailyLevelAccessWithClient(client, uid);
+        const access = buildDailyLevelAccessState(user);
+        if (access.dailyLimitReached) {
+            throw new Error("daily_level_limit_reached");
+        }
+        if (!access.canWatchAdToUnlock) {
+            throw new Error("daily_level_coin_unlock_not_available");
+        }
+        const spendRes = await client.query(`UPDATE public.users
+          SET mc_balance = COALESCE(mc_balance, 0) - $2,
+              updated_at = NOW()
+        WHERE uid = $1
+          AND COALESCE(mc_balance, 0) >= $2
+        RETURNING *`, [uid, economy_1.LEVEL_UNLOCK_MC_COST]);
+        if (!(spendRes.rowCount ?? 0)) {
+            throw new Error("NOT_ENOUGH_COINS");
+        }
+        const nextUnlocked = Math.min(economy_1.DAILY_LEVELS_MAX, access.dailyLevelsUnlocked + economy_1.AD_UNLOCK_LEVELS);
+        const out = await client.query(`UPDATE public.users
+          SET daily_levels_unlocked = $2,
+              next_unlock_at = NULL,
+              updated_at = NOW()
+        WHERE uid = $1
+        RETURNING *`, [uid, nextUnlocked]);
+        const updatedUser = out.rows[0];
+        await client.query("COMMIT");
+        return {
+            ok: true,
+            user: {
+                ...updatedUser,
+                coins: Number(updatedUser?.mc_balance || 0),
+            },
+            levelAccess: buildDailyLevelAccessState(updatedUser),
+            unlockCostCoins: economy_1.LEVEL_UNLOCK_MC_COST,
+        };
+    }
+    catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+    }
+    finally {
+        client.release();
+    }
+}
+async function openSurpriseBox(uid) {
+    const client = await exports.pool.connect();
+    try {
+        await client.query("BEGIN");
+        const dayKey = getDayKey();
+        const user = await refreshDailySurpriseBoxStateWithClient(client, uid);
+        const surpriseState = buildDailySurpriseBoxState(user);
+        if (!surpriseState.canOpenNow) {
+            throw new Error("DAILY_SURPRISE_BOX_LIMIT_REACHED");
+        }
+        const reward = (0, economy_1.rollSurpriseBoxReward)();
+        const assignments = [
+            `daily_surprise_boxes_opened = COALESCE(daily_surprise_boxes_opened, 0) + 1`,
+            `last_surprise_box_day_key = $2`,
+            `monthly_surprise_boxes_opened = COALESCE(monthly_surprise_boxes_opened, 0) + 1`,
+            `updated_at = NOW()`,
+        ];
+        if (reward.rewardType === "coins")
+            assignments.push(`mc_balance = COALESCE(mc_balance, 0) + ${reward.coins}`);
+        if (reward.rewardType === "restart")
+            assignments.push(`restarts_balance = COALESCE(restarts_balance, 0) + ${reward.restartCount}`);
+        if (reward.rewardType === "hint")
+            assignments.push(`hints_balance = COALESCE(hints_balance, 0) + ${reward.hintCount}`);
+        if (reward.rewardType === "skip")
+            assignments.push(`skips_balance = COALESCE(skips_balance, 0) + ${reward.skipCount}`);
+        const updatedRes = await client.query(`UPDATE public.users
+          SET ${assignments.join(", ")}
+        WHERE uid = $1
+        RETURNING uid,
+                  mc_balance,
+                  restarts_balance,
+                  skips_balance,
+                  hints_balance,
+                  daily_surprise_boxes_opened,
+                  last_surprise_box_day_key`, [uid, dayKey]);
+        const updatedUser = updatedRes.rows[0];
+        await client.query("COMMIT");
+        try {
+            await exports.pool.query(`INSERT INTO public.surprise_box_rewards
+           (uid, day_key, reward_type, reward_amount, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`, [uid, dayKey, reward.rewardType, reward.rewardAmount]);
+        }
+        catch { }
+        try {
+            await auditRewardEvent({
+                uid,
+                eventType: "surprise_box_opened",
+                eventKey: `${dayKey}:${Date.now()}`,
+                amountCoins: reward.rewardType === "coins" ? reward.rewardAmount : 0,
+                accepted: true,
+            });
+        }
+        catch { }
+        return {
+            ok: true,
+            rewardType: reward.rewardType,
+            rewardAmount: reward.rewardAmount,
+            reward,
+            dailyBoxesOpened: Number(updatedUser?.daily_surprise_boxes_opened || 0),
+            dailyBoxesMax: economy_1.SURPRISE_BOX_DAILY_MAX,
+            dailyBoxesRemaining: Math.max(0, economy_1.SURPRISE_BOX_DAILY_MAX - Number(updatedUser?.daily_surprise_boxes_opened || 0)),
+            coins: Number(updatedUser?.mc_balance || 0),
+            restarts: Number(updatedUser?.restarts_balance || 0),
+            hints: Number(updatedUser?.hints_balance || 0),
+            skips: Number(updatedUser?.skips_balance || 0),
+            surpriseBoxState: buildDailySurpriseBoxState(updatedUser),
+            user: {
+                coins: Number(updatedUser?.mc_balance || 0),
+                mc_balance: Number(updatedUser?.mc_balance || 0),
+                restarts_balance: Number(updatedUser?.restarts_balance || 0),
+                skips_balance: Number(updatedUser?.skips_balance || 0),
+                hints_balance: Number(updatedUser?.hints_balance || 0),
+                daily_surprise_boxes_opened: Number(updatedUser?.daily_surprise_boxes_opened || 0),
+                daily_surprise_boxes_max: economy_1.SURPRISE_BOX_DAILY_MAX,
+                daily_surprise_boxes_remaining: Math.max(0, economy_1.SURPRISE_BOX_DAILY_MAX - Number(updatedUser?.daily_surprise_boxes_opened || 0)),
+            },
+        };
+    }
+    catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+    }
+    finally {
+        client.release();
+    }
+}
 function assertCycleStatus(status) {
     const allowed = ["open", "closed", "payouts_generated", "processing", "completed"];
     if (!allowed.includes(status))
@@ -1153,9 +1744,10 @@ async function resolveCycleForUpdate(client, opts) {
 }
 async function getMonthlyLeaderboardUsers(opts) {
     const monthKey = normalizeMonthKey(opts?.monthKey);
-    const minRpClause = opts?.eligibleOnly ? `AND COALESCE(u.rp_score, 0) >= 150` : ``;
-    const uniqueLevelClause = opts?.eligibleOnly ? `AND COALESCE(ul.unique_rp_levels, 0) >= 10` : ``;
+    const minRpClause = opts?.eligibleOnly ? `AND COALESCE(u.rp_score, 0) >= ${economy_1.MONTHLY_ELIGIBILITY_MIN_SCORE}` : ``;
+    const uniqueLevelClause = opts?.eligibleOnly ? `AND COALESCE(ul.unique_rp_levels, 0) >= ${economy_1.MONTHLY_ELIGIBILITY_MIN_UNIQUE_LEVELS}` : ``;
     const out = await exports.pool.query(`SELECT u.uid,
+            COALESCE(u.economy_version, 1)::int AS economy_version,
             COALESCE(u.rp_score, 0)::int AS rp_score,
             COALESCE(u.monthly_skips_used, 0)::int AS monthly_skips_used,
             COALESCE(u.monthly_hints_used, 0)::int AS monthly_hints_used,
@@ -1177,6 +1769,7 @@ async function getMonthlyLeaderboardUsers(opts) {
                u.uid ASC`, [monthKey]);
     const rows = out.rows.map((row) => ({
         uid: String(row.uid),
+        economy_version: Number(row.economy_version || 1),
         rp_score: Number(row.rp_score || 0),
         monthly_skips_used: Number(row.monthly_skips_used || 0),
         monthly_hints_used: Number(row.monthly_hints_used || 0),
@@ -1191,7 +1784,7 @@ async function assignRewardTiers(users) {
     const totalEligible = users.length;
     if (!totalEligible)
         return [];
-    const counts = REWARD_TIERS.map((tier, index) => {
+    const counts = economy_1.REWARD_TIERS.map((tier, index) => {
         const raw = Math.ceil(totalEligible * (tier.percent / 100));
         return index === 0 ? Math.max(1, raw) : raw;
     });
@@ -1203,12 +1796,12 @@ async function assignRewardTiers(users) {
     });
     const assignments = [];
     let cursor = 0;
-    for (let i = 0; i < REWARD_TIERS.length; i += 1) {
-        const tier = REWARD_TIERS[i];
+    for (let i = 0; i < economy_1.REWARD_TIERS.length; i += 1) {
+        const tier = economy_1.REWARD_TIERS[i];
         const tierCount = clampedCounts[i] || 0;
         const tierUsers = users.slice(cursor, cursor + tierCount);
         const tierRpTotal = tierUsers.reduce((sum, user) => sum + Math.max(0, Number(user.rp_score || 0)), 0);
-        const tierPoolPi = (MONTHLY_PI_POOL * tier.poolShare) / 100;
+        const tierPoolPi = (economy_1.MONTHLY_PI_POOL * tier.poolShare) / 100;
         for (let j = 0; j < tierUsers.length; j += 1) {
             const user = tierUsers[j];
             const leaderboardRank = cursor + j + 1;
@@ -1217,9 +1810,10 @@ async function assignRewardTiers(users) {
                 : 0;
             assignments.push({
                 uid: user.uid,
+                economy_version: user.economy_version,
                 rp_score: user.rp_score,
                 total_rp_score: users.reduce((sum, row) => sum + Math.max(0, Number(row.rp_score || 0)), 0),
-                pool_pi: MONTHLY_PI_POOL.toFixed(8),
+                pool_pi: economy_1.MONTHLY_PI_POOL.toFixed(8),
                 payout_pi: payoutPi.toFixed(8),
                 tier_name: tier.name,
                 tier_label: tier.label,
@@ -1231,9 +1825,10 @@ async function assignRewardTiers(users) {
     for (let i = cursor; i < users.length; i += 1) {
         assignments.push({
             uid: users[i].uid,
+            economy_version: users[i].economy_version,
             rp_score: users[i].rp_score,
             total_rp_score: users.reduce((sum, row) => sum + Math.max(0, Number(row.rp_score || 0)), 0),
-            pool_pi: MONTHLY_PI_POOL.toFixed(8),
+            pool_pi: economy_1.MONTHLY_PI_POOL.toFixed(8),
             payout_pi: '0.00000000',
             tier_name: null,
             tier_label: null,
@@ -1250,7 +1845,7 @@ async function calculateMonthlyPiPayouts(opts) {
         return {
             ok: true,
             totalRp: 0,
-            totalPoolPi: MONTHLY_PI_POOL,
+            totalPoolPi: economy_1.MONTHLY_PI_POOL,
             rows: [],
         };
     }
@@ -1258,45 +1853,97 @@ async function calculateMonthlyPiPayouts(opts) {
     return {
         ok: true,
         totalRp,
-        totalPoolPi: MONTHLY_PI_POOL,
+        totalPoolPi: economy_1.MONTHLY_PI_POOL,
         rows,
     };
+}
+function buildLeaderboardTierCutoffs(assignments) {
+    return economy_1.REWARD_TIERS.map((tier) => {
+        const tierRows = assignments.filter((row) => row.tier_name === tier.name);
+        const lastRow = tierRows.length ? tierRows[tierRows.length - 1] : null;
+        return {
+            tierName: tier.name,
+            tierLabel: tier.label,
+            minRank: tierRows.length ? Number(tierRows[0].leaderboard_rank || 0) : null,
+            maxRank: tierRows.length ? Number(lastRow?.leaderboard_rank || 0) : null,
+            minRpScore: lastRow ? Number(lastRow.rp_score || 0) : null,
+        };
+    });
+}
+function getNextTierCutoff(tierName, tierCutoffs) {
+    const tierOrder = economy_1.REWARD_TIERS.map((tier) => tier.name);
+    if (!tierName) {
+        return tierCutoffs[tierCutoffs.length - 1] || null;
+    }
+    const currentIndex = tierOrder.indexOf(tierName);
+    if (currentIndex <= 0)
+        return null;
+    return tierCutoffs[currentIndex - 1] || null;
 }
 async function getMonthlyLeaderboard(opts) {
-    const limit = Math.max(1, Math.min(200, Number(opts?.limit || 50)));
+    const monthKey = normalizeMonthKey(opts?.monthKey);
+    const limit = Math.max(1, Math.min(100, Number(opts?.limit || 50)));
     const offset = Math.max(0, Number(opts?.offset || 0));
-    const leaderboard = await getMonthlyLeaderboardUsers();
-    const assignments = await assignRewardTiers(leaderboard.rows || []);
-    const rows = assignments.slice(offset, offset + limit).map((row) => ({
-        rank: Number(row.leaderboard_rank || 0),
-        uid: row.uid,
-        rpScore: Number(row.rp_score || 0),
-        projectedTierName: row.tier_name,
-        projectedTierLabel: row.tier_label,
-    }));
+    const leaderboard = await getMonthlyLeaderboardUsers({ monthKey });
+    const users = leaderboard.rows || [];
+    const assignments = await assignRewardTiers(users);
+    const userByUid = new Map(users.map((row) => [row.uid, row]));
+    const items = assignments.slice(offset, offset + limit).map((row) => {
+        const user = userByUid.get(row.uid);
+        return {
+            rank: Number(row.leaderboard_rank || 0),
+            uid: row.uid,
+            rpScore: Number(row.rp_score || 0),
+            projectedTierName: row.tier_name,
+            projectedTierLabel: row.tier_label,
+            monthlyHintCount: Number(user?.monthly_hints_used || 0),
+            monthlySkipCount: Number(user?.monthly_skips_used || 0),
+        };
+    });
     return {
         ok: true,
-        count: assignments.length,
+        monthKey,
+        totalEligibleUsers: assignments.length,
         limit,
         offset,
-        rows,
+        tierCutoffs: buildLeaderboardTierCutoffs(assignments),
+        items,
     };
 }
-async function getMonthlyLeaderboardMe(uid) {
-    const leaderboard = await getMonthlyLeaderboardUsers();
-    const assignments = await assignRewardTiers(leaderboard.rows || []);
+async function getMonthlyLeaderboardMe(uid, opts) {
+    const monthKey = normalizeMonthKey(opts?.monthKey);
+    const leaderboard = await getMonthlyLeaderboardUsers({ monthKey });
+    const users = leaderboard.rows || [];
+    const assignments = await assignRewardTiers(users);
+    const tierCutoffs = buildLeaderboardTierCutoffs(assignments);
     const row = assignments.find((entry) => String(entry.uid) === String(uid)) || null;
+    const user = users.find((entry) => String(entry.uid) === String(uid)) || null;
+    const userRes = await exports.pool.query(`SELECT COALESCE(rp_score, 0)::int AS rp_score,
+            COALESCE(daily_rp, 0)::int AS daily_rp,
+            COALESCE(monthly_hints_used, 0)::int AS monthly_hints_used,
+            COALESCE(monthly_skips_used, 0)::int AS monthly_skips_used
+       FROM public.users
+      WHERE uid = $1
+      LIMIT 1`, [uid]);
+    const userRow = userRes.rows[0] || null;
+    const effectiveRp = Number(user?.rp_score ?? userRow?.rp_score ?? 0);
+    const nextTier = getNextTierCutoff(row?.tier_name || null, tierCutoffs);
     return {
         ok: true,
-        row: row
-            ? {
-                rank: Number(row.leaderboard_rank || 0),
-                uid: row.uid,
-                rpScore: Number(row.rp_score || 0),
-                projectedTierName: row.tier_name,
-                projectedTierLabel: row.tier_label,
-            }
+        monthKey,
+        uid,
+        rpScore: effectiveRp,
+        dailyRp: Number(userRow?.daily_rp || 0),
+        currentRank: row ? Number(row.leaderboard_rank || 0) : null,
+        projectedTierName: row?.tier_name || null,
+        projectedTierLabel: row?.tier_label || null,
+        nextTierName: nextTier?.tierName || null,
+        rpNeededForNextTier: nextTier?.minRpScore != null
+            ? Math.max(0, Number(nextTier.minRpScore || 0) - effectiveRp)
             : null,
+        monthlyHintCount: Number(user?.monthly_hints_used ?? userRow?.monthly_hints_used ?? 0),
+        monthlySkipCount: Number(user?.monthly_skips_used ?? userRow?.monthly_skips_used ?? 0),
+        tierCutoffs,
     };
 }
 async function closeMonthlyPayoutCycle(opts) {
@@ -1306,6 +1953,42 @@ async function closeMonthlyPayoutCycle(opts) {
     const client = await exports.pool.connect();
     try {
         await client.query("BEGIN");
+        await client.query(`INSERT INTO public.monthly_settlement_runs (
+         month_key, status, pool_pi, created_at, updated_at
+       ) VALUES ($1, 'previewed', $2::numeric, NOW(), NOW())
+       ON CONFLICT (month_key) DO NOTHING`, [monthKey, economy_1.MONTHLY_PI_POOL]);
+        const existingSettlementRunRes = await client.query(`SELECT *
+         FROM public.monthly_settlement_runs
+        WHERE month_key = $1
+        FOR UPDATE`, [monthKey]);
+        const existingSettlementRun = existingSettlementRunRes.rows[0] || null;
+        const existingPayoutRowsRes = await client.query(`SELECT COUNT(*)::int AS c,
+              COALESCE(SUM(payout_pi), 0)::numeric(20,8) AS total_payout_pi,
+              COALESCE(MAX(total_rp_score), 0)::int AS total_rp
+         FROM public.monthly_pi_payouts
+        WHERE month_key = $1`, [monthKey]);
+        const existingPayoutRowCount = Number(existingPayoutRowsRes.rows[0]?.c || 0);
+        if (String(existingSettlementRun?.status || "") === "completed" || existingPayoutRowCount > 0) {
+            await client.query("COMMIT");
+            return {
+                ok: true,
+                cycle_id: null,
+                month_key: monthKey,
+                monthKey,
+                action: "run",
+                status: String(existingSettlementRun?.status || "completed"),
+                alreadySettled: true,
+                eligibleUsers: Number(existingSettlementRun?.eligible_users || existingPayoutRowCount || 0),
+                totalRp: Number(existingSettlementRun?.total_score || existingPayoutRowsRes.rows[0]?.total_rp || 0),
+                totalScore: Number(existingSettlementRun?.total_score || existingPayoutRowsRes.rows[0]?.total_rp || 0),
+                totalPoolPi: Number(existingSettlementRun?.pool_pi || economy_1.MONTHLY_PI_POOL),
+                poolPi: Number(existingSettlementRun?.pool_pi || economy_1.MONTHLY_PI_POOL),
+                totalPayoutPi: Number(existingSettlementRun?.total_payout_pi || existingPayoutRowsRes.rows[0]?.total_payout_pi || 0),
+                payoutsCreated: existingPayoutRowCount,
+                payoutRowCount: existingPayoutRowCount,
+                idempotent: true,
+            };
+        }
         await client.query(`INSERT INTO public.monthly_payout_cycles (
          month_key,
          conversion_rate_locked,
@@ -1352,6 +2035,13 @@ async function closeMonthlyPayoutCycle(opts) {
               closed_at = NOW()
         WHERE id = $1`, [cycle.id, conversionRateLocked, minPayoutThresholdPi]);
         if (totalRp <= 0) {
+            await client.query(`UPDATE public.monthly_settlement_runs
+            SET status = 'completed',
+                eligible_users = 0,
+                total_score = 0,
+                total_payout_pi = 0,
+                updated_at = NOW()
+          WHERE month_key = $1`, [monthKey]);
             await client.query(`UPDATE public.monthly_payout_cycles
             SET total_payout_pi = 0,
                 capped_total_payout_pi = 0
@@ -1365,7 +2055,7 @@ async function closeMonthlyPayoutCycle(opts) {
                 status: "closed",
                 eligibleUsers: 0,
                 totalRp: 0,
-                totalPoolPi: MONTHLY_PI_POOL,
+                totalPoolPi: economy_1.MONTHLY_PI_POOL,
                 payoutsCreated: 0,
                 idempotent: false,
             };
@@ -1374,11 +2064,12 @@ async function closeMonthlyPayoutCycle(opts) {
         const payoutRows = payoutCalc.rows || [];
         for (const row of payoutRows) {
             await client.query(`INSERT INTO public.monthly_pi_payouts (
-           uid, month_key, rp_score, total_rp_score, pool_pi, payout_pi, tier_name, tier_label, leaderboard_rank, status, created_at
-         ) VALUES ($1, $2, $3, $4, $5::numeric, $6::numeric, $7, $8, $9, $10, NOW())
+           uid, month_key, economy_version, rp_score, total_rp_score, pool_pi, payout_pi, tier_name, tier_label, leaderboard_rank, status, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8, $9, $10, $11, NOW())
          ON CONFLICT (uid, month_key) DO NOTHING`, [
                 row.uid,
                 monthKey,
+                row.economy_version,
                 row.rp_score,
                 row.total_rp_score,
                 row.pool_pi,
@@ -1411,6 +2102,8 @@ async function closeMonthlyPayoutCycle(opts) {
         await client.query(`UPDATE public.users
           SET rp_score = 0,
               daily_rp = 0,
+              monthly_hints_used = 0,
+              monthly_skips_used = 0,
               last_rp_reset = NOW(),
               updated_at = NOW()
         WHERE COALESCE(rp_score, 0) > 0`);
@@ -1422,22 +2115,48 @@ async function closeMonthlyPayoutCycle(opts) {
           SET total_payout_pi = $2::numeric,
               capped_total_payout_pi = $2::numeric
         WHERE id = $1`, [cycle.id, String(totalsRes.rows[0]?.total_pool_pi || 0)]);
+        await client.query(`UPDATE public.monthly_settlement_runs
+          SET status = 'completed',
+              pool_pi = $2::numeric,
+              eligible_users = $3,
+              total_score = $4,
+              total_payout_pi = $5::numeric,
+              updated_at = NOW()
+        WHERE month_key = $1`, [
+            monthKey,
+            String(economy_1.MONTHLY_PI_POOL),
+            eligibleUsers.length,
+            totalRp,
+            String(totalsRes.rows[0]?.total_pool_pi || 0),
+        ]);
         await client.query("COMMIT");
         return {
             ok: true,
             cycle_id: Number(cycle.id),
             month_key: monthKey,
             monthKey: monthKey,
+            action: "run",
             status: "closed",
+            alreadySettled: false,
             eligibleUsers: eligibleUsers.length,
             totalRp,
+            totalScore: totalRp,
             totalPoolPi: Number(totalsRes.rows[0]?.total_pool_pi || 0),
+            poolPi: economy_1.MONTHLY_PI_POOL,
+            totalPayoutPi: Number(totalsRes.rows[0]?.total_pool_pi || 0),
             payoutsCreated: Number(totalsRes.rows[0]?.payouts_created || 0),
+            payoutRowCount: Number(totalsRes.rows[0]?.payouts_created || 0),
             idempotent: false,
         };
     }
     catch (e) {
         await client.query("ROLLBACK");
+        await exports.pool.query(`INSERT INTO public.monthly_settlement_runs (month_key, status, notes, created_at, updated_at)
+       VALUES ($1, 'failed', $2, NOW(), NOW())
+       ON CONFLICT (month_key) DO UPDATE
+         SET status = 'failed',
+             notes = EXCLUDED.notes,
+             updated_at = NOW()`, [normalizeMonthKey(opts.monthKey), String(e?.message || "settlement_failed")]).catch(() => { });
         throw e;
     }
     finally {
@@ -1631,6 +2350,7 @@ async function adminListPayoutJobs(opts) {
        j.cycle_id,
        c.month_key,
        j.uid,
+       u.username,
        j.payout_pi_amount,
        j.wallet_identifier,
        j.status,
@@ -1649,13 +2369,105 @@ async function adminListPayoutJobs(opts) {
        j.updated_at
      FROM public.pi_payout_jobs j
      JOIN public.monthly_payout_cycles c ON c.id = j.cycle_id
+     LEFT JOIN public.users u ON u.uid = j.uid
      ${whereSql}
      ORDER BY j.created_at DESC, j.id DESC
      LIMIT $${limitIndex} OFFSET $${offsetIndex}`, values);
     return {
         ok: true,
-        rows: out.rows,
+        monthKey: opts?.monthKey ? normalizeMonthKey(opts.monthKey) : null,
+        rows: out.rows.map((row) => normalizeAdminPayoutRow(row)),
+        payoutRows: out.rows.map((row) => normalizeAdminPayoutRow(row)),
         count: Number(countRes.rows[0]?.c || 0),
+    };
+}
+function buildSettlementTierSummary(rows) {
+    return economy_1.REWARD_TIERS.map((tier) => {
+        const tierRows = rows.filter((row) => row.tier_name === tier.name);
+        return {
+            tierName: tier.name,
+            tierLabel: tier.label,
+            userCount: tierRows.length,
+            totalScore: tierRows.reduce((sum, row) => sum + Number(row.rp_score || 0), 0),
+            poolPi: Number(tierRows.length > 0 ? tierRows[0].pool_pi || 0 : ((economy_1.MONTHLY_PI_POOL * tier.poolShare) / 100)),
+        };
+    });
+}
+async function getExistingSettlementSummary(monthKey) {
+    const runRes = await exports.pool.query(`SELECT id, month_key, status, pool_pi, eligible_users, total_score, total_payout_pi, notes, created_at, updated_at
+       FROM public.monthly_settlement_runs
+      WHERE month_key = $1
+      LIMIT 1`, [monthKey]);
+    const payoutRes = await exports.pool.query(`SELECT p.uid, u.username, p.economy_version, p.rp_score, p.total_rp_score, p.pool_pi, p.payout_pi, p.tier_name, p.tier_label, p.leaderboard_rank, p.status, p.created_at
+       FROM public.monthly_pi_payouts p
+       LEFT JOIN public.users u ON u.uid = p.uid
+      WHERE p.month_key = $1
+      ORDER BY p.leaderboard_rank ASC, p.uid ASC`, [monthKey]);
+    const rows = payoutRes.rows.map((row) => normalizeAdminPayoutRow(row));
+    const totalPayoutPi = rows.reduce((sum, row) => sum + Number(row.payoutPi || 0), 0);
+    const totalScore = rows.reduce((sum, row) => sum + Number(row.score || 0), 0);
+    const tierSummary = buildSettlementTierSummary(payoutRes.rows.map((row) => ({
+        uid: String(row.uid),
+        economy_version: Number(row.economy_version || 1),
+        rp_score: Number(row.rp_score || 0),
+        total_rp_score: Number(row.total_rp_score || 0),
+        pool_pi: String(row.pool_pi || 0),
+        payout_pi: String(row.payout_pi || 0),
+        tier_name: row.tier_name ?? null,
+        tier_label: row.tier_label ?? null,
+        leaderboard_rank: Number(row.leaderboard_rank || 0),
+    })));
+    return {
+        run: runRes.rows[0] || null,
+        payoutRows: rows,
+        payoutRowCount: rows.length,
+        totalPayoutPi,
+        totalScore,
+        eligibleUsers: rows.filter((row) => Number(row.payoutPi || 0) > 0 || row.tierName).length,
+        tierSummary,
+    };
+}
+async function adminPreviewSettlement(opts) {
+    const monthKey = normalizeMonthKey(opts?.monthKey);
+    const existing = await getExistingSettlementSummary(monthKey);
+    const calc = await calculateMonthlyPiPayouts({ monthKey });
+    const rows = (calc.rows || []).map((row) => normalizeAdminPayoutRow(row)).slice(0, 20);
+    return {
+        ok: true,
+        action: "preview",
+        monthKey,
+        alreadySettled: Boolean(existing.run && String(existing.run.status) === "completed") || existing.payoutRowCount > 0,
+        status: existing.run?.status || "preview",
+        poolPi: Number(calc.totalPoolPi || economy_1.MONTHLY_PI_POOL),
+        eligibleUsers: (calc.rows || []).length,
+        totalScore: Number(calc.totalRp || 0),
+        payoutRowCount: (calc.rows || []).length,
+        totalProjectedPayoutPi: (calc.rows || []).reduce((sum, row) => sum + Number(row.payout_pi || 0), 0),
+        totalPayoutPi: existing.totalPayoutPi || 0,
+        tierSummary: buildSettlementTierSummary(calc.rows || []),
+        projectedPayoutRows: rows,
+        rows,
+    };
+}
+async function adminGetSettlementStatus(opts) {
+    const monthKey = normalizeMonthKey(opts?.monthKey);
+    const existing = await getExistingSettlementSummary(monthKey);
+    return {
+        ok: true,
+        action: "status",
+        monthKey,
+        status: existing.run?.status || "not_started",
+        alreadySettled: Boolean(existing.run && String(existing.run.status) === "completed") || existing.payoutRowCount > 0,
+        poolPi: Number(existing.run?.pool_pi ?? economy_1.MONTHLY_PI_POOL),
+        eligibleUsers: Number(existing.run?.eligible_users ?? existing.eligibleUsers ?? 0),
+        totalScore: Number(existing.run?.total_score ?? existing.totalScore ?? 0),
+        payoutRowCount: existing.payoutRowCount,
+        totalPayoutPi: Number(existing.run?.total_payout_pi ?? existing.totalPayoutPi ?? 0),
+        tierSummary: existing.tierSummary,
+        createdAt: existing.run?.created_at ?? null,
+        updatedAt: existing.run?.updated_at ?? null,
+        rows: existing.payoutRows.slice(0, 20),
+        projectedPayoutRows: existing.payoutRows.slice(0, 20),
     };
 }
 async function adminListPayoutTransferLogs(jobId, limit = 50) {
@@ -1684,7 +2496,16 @@ async function adminListPayoutCycles(opts) {
      GROUP BY c.id, c.month_key, c.conversion_rate_locked, c.min_payout_threshold_pi, c.status, c.created_at, c.closed_at
      ORDER BY c.created_at DESC
      LIMIT $1`, [limit]);
-    return { ok: true, rows: out.rows };
+    return {
+        ok: true,
+        rows: out.rows.map((row) => ({
+            ...row,
+            monthKey: row.month_key,
+            poolPi: Number(row.total_payout_pi || 0),
+            eligibleUsers: Number(row.total_users || 0),
+            status: row.status,
+        })),
+    };
 }
 async function adminGetPayoutSnapshotSummary(opts) {
     const values = [];
@@ -1711,7 +2532,19 @@ async function adminGetPayoutSnapshotSummary(opts) {
      FROM public.monthly_payout_snapshots s
      JOIN public.monthly_payout_cycles c ON c.id = s.cycle_id
      ${whereSql}`, values);
-    return { ok: true, summary: out.rows[0] || null };
+    const summary = out.rows[0] || null;
+    return {
+        ok: true,
+        monthKey: opts?.monthKey ? normalizeMonthKey(opts.monthKey) : null,
+        summary: summary
+            ? {
+                ...summary,
+                eligibleUsers: Number(summary.eligible_count || 0),
+                status: "snapshot_ready",
+                tierSummary: null,
+            }
+            : null,
+    };
 }
 async function adminGetPayoutRuntimeConfig() {
     await adminSyncPayoutSimulationModeFromDb();
@@ -1719,7 +2552,7 @@ async function adminGetPayoutRuntimeConfig() {
         ok: true,
         simulation_mode: isPayoutSimulationMode(),
         payout_max_attempts: PAYOUT_MAX_ATTEMPTS,
-        pi_payout_adapter_enabled: process.env.PI_PAYOUT_ADAPTER_ENABLED === "true",
+        pi_payout_adapter_enabled: runtime_1.runtimeConfig.payout.adapterEnabled,
         max_user_monthly_pi: MAX_USER_MONTHLY_PI,
         max_global_monthly_pi: MAX_GLOBAL_MONTHLY_PI,
         min_account_age_days: MIN_ACCOUNT_AGE_DAYS,
@@ -1763,13 +2596,26 @@ async function adminListPayoutSnapshots(opts) {
     const limitIndex = values.length;
     values.push(offset);
     const offsetIndex = values.length;
-    const out = await exports.pool.query(`SELECT s.*, c.month_key
+    const out = await exports.pool.query(`SELECT s.*, c.month_key, u.username
      FROM public.monthly_payout_snapshots s
      JOIN public.monthly_payout_cycles c ON c.id = s.cycle_id
+     LEFT JOIN public.users u ON u.uid = s.uid
      ${whereSql}
      ORDER BY s.created_at DESC, s.id DESC
      LIMIT $${limitIndex} OFFSET $${offsetIndex}`, values);
-    return { ok: true, rows: out.rows, summary: summaryRes.rows[0] || null };
+    const summary = summaryRes.rows[0] || null;
+    const rows = out.rows.map((row) => normalizeAdminPayoutRow(row));
+    return {
+        ok: true,
+        monthKey: opts?.monthKey ? normalizeMonthKey(opts.monthKey) : null,
+        status: "snapshot_ready",
+        rows,
+        payoutRows: rows,
+        eligibleUsers: Number(summary?.eligible_count || 0),
+        totalScore: null,
+        tierSummary: null,
+        summary,
+    };
 }
 async function adminRetryFailedPayouts(opts) {
     const values = [];
@@ -2189,21 +3035,20 @@ async function ensureUserAdsRow(uid) {
 }
 async function upsertUser({ uid, username, }) {
     const { rows } = await exports.pool.query(`
-    INSERT INTO public.users (uid, username, updated_at)
-    VALUES ($1,$2,NOW())
+    INSERT INTO public.users (uid, username, economy_version, updated_at)
+    VALUES ($1,$2,$3,NOW())
     ON CONFLICT (uid)
     DO UPDATE SET
       username = EXCLUDED.username,
       updated_at = NOW()
     RETURNING *
-  `, [uid, username]);
+  `, [uid, username, runtime_1.runtimeConfig.economy.defaultEconomyVersion]);
     return rows[0];
 }
 async function getUserByUid(uid) {
     const { rows } = await exports.pool.query(`SELECT * FROM public.users WHERE uid=$1`, [uid]);
     return rows[0] || null;
 }
-const DAILY_RP_CAP = 30;
 async function syncMcBalanceFromLegacyCoins(uid) {
     const out = await exports.pool.query(`UPDATE public.users
         SET mc_balance = COALESCE(coins, 0)
@@ -2265,7 +3110,7 @@ async function spendMC(uid, amount) {
 async function addRP(uid, amount) {
     const requested = Math.max(0, Math.trunc(Number(amount || 0)));
     if (!requested)
-        return { ok: true, added: 0, cap: DAILY_RP_CAP };
+        return { ok: true, added: 0, cap: economy_1.DAILY_SCORE_CAP };
     const client = await exports.pool.connect();
     try {
         await client.query('BEGIN');
@@ -2287,11 +3132,11 @@ async function addRP(uid, amount) {
             await client.query('ROLLBACK');
             return { ok: false, error: 'user_not_found' };
         }
-        const remaining = Math.max(0, DAILY_RP_CAP - Number(user.daily_rp || 0));
+        const remaining = Math.max(0, economy_1.DAILY_SCORE_CAP - Number(user.daily_rp || 0));
         const toAdd = Math.min(requested, remaining);
         if (toAdd <= 0) {
             await client.query('COMMIT');
-            return { ok: true, added: 0, cap: DAILY_RP_CAP };
+            return { ok: true, added: 0, cap: economy_1.DAILY_SCORE_CAP };
         }
         const updated = await client.query(`UPDATE public.users
           SET rp_score = COALESCE(rp_score, 0) + $2,
@@ -2300,7 +3145,7 @@ async function addRP(uid, amount) {
         WHERE uid = $1
         RETURNING uid, rp_score, daily_rp`, [uid, toAdd]);
         await client.query('COMMIT');
-        return { ok: true, added: toAdd, cap: DAILY_RP_CAP, user: updated.rows[0] || null };
+        return { ok: true, added: toAdd, cap: economy_1.DAILY_SCORE_CAP, user: updated.rows[0] || null };
     }
     catch (e) {
         await client.query('ROLLBACK');
@@ -2416,18 +3261,6 @@ async function getDailyLeaderboardRaw(limit = 100) {
      LIMIT $1`, [safeLimit]);
     return { ok: true, rows: out.rows };
 }
-const DAILY_RANKING_REWARD_TABLE = {
-    1: 120,
-    2: 100,
-    3: 80,
-    4: 60,
-    5: 50,
-    6: 40,
-    7: 35,
-    8: 30,
-    9: 25,
-    10: 20,
-};
 function parseDateKey(input) {
     const raw = String(input || "").trim();
     if (!raw)
@@ -2746,24 +3579,10 @@ async function claimDailyLogin(uid) {
     await auditRewardEvent({ uid, eventType: "daily_login", eventKey: dayKey, amountCoins: 5, accepted: true });
     return { user };
 }
-function calculateLevelRewards(params) {
-    const mc = 2;
-    let rp = 0;
-    if (params.usedSkip) {
-        rp = 0;
-    }
-    else if (params.usedHint) {
-        rp = 1;
-    }
-    else {
-        rp = 2;
-    }
-    return { mc, rp };
-}
 async function addRPWithClient(client, uid, amount) {
     const requested = Math.max(0, Math.trunc(Number(amount || 0)));
     if (!requested)
-        return { ok: true, added: 0, cap: DAILY_RP_CAP };
+        return { ok: true, added: 0, cap: economy_1.DAILY_SCORE_CAP };
     await client.query(`UPDATE public.users
         SET daily_rp = 0,
             last_rp_reset = NOW(),
@@ -2781,10 +3600,10 @@ async function addRPWithClient(client, uid, amount) {
     if (!user) {
         throw new Error("user_not_found");
     }
-    const remaining = Math.max(0, DAILY_RP_CAP - Number(user.daily_rp || 0));
+    const remaining = Math.max(0, economy_1.DAILY_SCORE_CAP - Number(user.daily_rp || 0));
     const toAdd = Math.min(requested, remaining);
     if (toAdd <= 0) {
-        return { ok: true, added: 0, cap: DAILY_RP_CAP };
+        return { ok: true, added: 0, cap: economy_1.DAILY_SCORE_CAP };
     }
     const updated = await client.query(`UPDATE public.users
         SET rp_score = COALESCE(rp_score, 0) + $2,
@@ -2792,7 +3611,15 @@ async function addRPWithClient(client, uid, amount) {
             updated_at = NOW()
       WHERE uid = $1
       RETURNING uid, rp_score, daily_rp`, [uid, toAdd]);
-    return { ok: true, added: toAdd, cap: DAILY_RP_CAP, user: updated.rows[0] || null };
+    return { ok: true, added: toAdd, cap: economy_1.DAILY_SCORE_CAP, user: updated.rows[0] || null };
+}
+async function addRPForUserVersion(client, user, uid, amount) {
+    const version = getEconomyVersion(user);
+    if (version === 1) {
+        return addRPWithClient(client, uid, amount);
+    }
+    // Future economy versions can branch here without changing current v1 behavior.
+    return addRPWithClient(client, uid, amount);
 }
 async function claimLevelComplete(uid, level, opts) {
     if (!Number.isInteger(level) || level < 1) {
@@ -2803,23 +3630,38 @@ async function claimLevelComplete(uid, level, opts) {
         await client.query("BEGIN");
         const monthKey = getMonthKey();
         const levelId = String(level);
+        const rewardUser = await refreshDailyLevelAccessWithClient(client, uid);
+        if (!rewardUser) {
+            throw new Error("user_not_found");
+        }
         const lifetimeInsert = await client.query(`INSERT INTO public.level_rewards (uid, level, created_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (uid, level) DO NOTHING`, [uid, level]);
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (uid, level) DO NOTHING`, [uid, level]);
         const isFirstLifetimeCompletion = (lifetimeInsert.rowCount ?? 0) > 0;
-        await client.query(`UPDATE public.users
-          SET coins = COALESCE(coins, 0) + 1,
-              mc_balance = COALESCE(mc_balance, 0) + 2,
-              monthly_coins_earned = COALESCE(monthly_coins_earned, 0) + 1,
-              lifetime_coins_earned = COALESCE(lifetime_coins_earned, 0) + 1,
-              monthly_levels_completed = COALESCE(monthly_levels_completed,0) + 1,
-              lifetime_levels_completed = COALESCE(lifetime_levels_completed,0) + $2,
-              updated_at = NOW()
-        WHERE uid = $1`, [uid, isFirstLifetimeCompletion ? 1 : 0]);
-        const rewards = calculateLevelRewards({
+        const isReplay = !isFirstLifetimeCompletion;
+        if (isFirstLifetimeCompletion) {
+            await incrementDailyLevelsPlayedWithClient(client, uid, {
+                used_hint: Boolean(opts?.usedHint),
+                used_skip: Boolean(opts?.usedSkip),
+                level_id: levelId,
+            });
+        }
+        const rewards = calculateLevelRewardsForUser(rewardUser, {
+            isReplay,
             usedHint: Boolean(opts?.usedHint),
             usedSkip: Boolean(opts?.usedSkip),
+            usedRestart: false,
         });
+        const awardedMc = Math.max(0, Number(rewards.coins || 0));
+        await client.query(`UPDATE public.users
+            SET coins = COALESCE(coins, 0) + $2,
+                mc_balance = COALESCE(mc_balance, 0) + $2,
+                monthly_coins_earned = COALESCE(monthly_coins_earned, 0) + $2,
+                lifetime_coins_earned = COALESCE(lifetime_coins_earned, 0) + $2,
+                monthly_levels_completed = COALESCE(monthly_levels_completed,0) + $3,
+                lifetime_levels_completed = COALESCE(lifetime_levels_completed,0) + $3,
+                updated_at = NOW()
+          WHERE uid = $1`, [uid, awardedMc, isFirstLifetimeCompletion ? 1 : 0]);
         const monthlyCredit = await client.query(`SELECT id
          FROM public.user_level_monthly_rp
         WHERE uid = $1
@@ -2829,28 +3671,51 @@ async function claimLevelComplete(uid, level, opts) {
         FOR UPDATE`, [uid, levelId, monthKey]);
         let awardedRp = 0;
         const already = (monthlyCredit.rowCount ?? 0) > 0;
-        if (!already) {
-            const rpResult = await addRPWithClient(client, uid, rewards.rp);
+        if (!already && !isReplay) {
+            const rpResult = await addRPForUserVersion(client, rewardUser, uid, rewards.score);
             awardedRp = Number(rpResult.added || 0);
             await client.query(`INSERT INTO public.user_level_monthly_rp (uid, level_id, month_key, rp_awarded, first_completed_at)
          VALUES ($1, $2, $3, $4, NOW())`, [uid, levelId, monthKey, awardedRp]);
         }
+        await client.query(`INSERT INTO public.level_reward_events (
+         uid,
+         level_id,
+         is_replay,
+         used_hint,
+         used_skip,
+         used_restart,
+         coins_awarded,
+         score_awarded,
+         created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`, [
+            uid,
+            levelId,
+            isReplay,
+            Boolean(opts?.usedHint),
+            Boolean(opts?.usedSkip),
+            false,
+            awardedMc,
+            awardedRp,
+        ]);
         await client.query("COMMIT");
         await recalcAndStoreMonthlyRate(uid);
         await auditRewardEvent({
             uid,
             eventType: "level_complete",
             eventKey: `${levelId}:${monthKey}`,
-            amountCoins: 1,
+            amountCoins: awardedMc,
             accepted: true,
-            rejectReason: already ? "monthly_rp_already_awarded" : undefined,
+            rejectReason: isReplay ? "replay_no_rewards" : already ? "monthly_rp_already_awarded" : undefined,
         });
         const user = await getUserByUid(uid);
+        const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
         return {
             already,
+            isReplay,
             user,
+            levelAccess,
             rewards: {
-                mc: rewards.mc,
+                mc: awardedMc,
                 rp: awardedRp,
             },
         };
@@ -2884,9 +3749,9 @@ async function useRestarts(uid, mode, nonce) {
     }
     // ---- COINS ----
     if (mode === "coins") {
-        const u = await spendCoins(uid, exports.RESTART_COST_COINS);
+        const u = await spendCoins(uid, economy_1.LEGACY_RESTART_COST_COINS);
         await exports.pool.query(`INSERT INTO reward_claims (uid,type,amount,created_at)
-       VALUES ($1,'restart_coin',-$2,NOW())`, [uid, exports.RESTART_COST_COINS]);
+       VALUES ($1,'restart_coin',-$2,NOW())`, [uid, economy_1.LEGACY_RESTART_COST_COINS]);
         return { ok: true, user: u };
     }
 }
@@ -2914,9 +3779,9 @@ async function useSkip(uid, mode, nonce) {
     }
     // ---- COINS ----
     if (mode === "coins") {
-        const u = await spendCoins(uid, exports.SKIP_COST_COINS);
+        const u = await spendCoins(uid, economy_1.LEGACY_SKIP_COST_COINS);
         await exports.pool.query(`INSERT INTO reward_claims (uid,type,amount,created_at)
-       VALUES ($1,'skip_coin',-$2,NOW())`, [uid, exports.SKIP_COST_COINS]);
+       VALUES ($1,'skip_coin',-$2,NOW())`, [uid, economy_1.LEGACY_SKIP_COST_COINS]);
         await exports.pool.query(`
     UPDATE public.users
     SET monthly_skips_used = COALESCE(monthly_skips_used,0) + 1
@@ -2964,9 +3829,9 @@ async function useHint(uid, mode, nonce) {
         return { ok: true, user: rows[0] };
     }
     if (mode === "coins") {
-        const u = await spendCoins(uid, exports.HINT_COST_COINS);
+        const u = await spendCoins(uid, economy_1.LEGACY_HINT_COST_COINS);
         await exports.pool.query(`INSERT INTO reward_claims (uid,type,amount,created_at)
-       VALUES ($1,'hint_coin',-$2,NOW())`, [uid, exports.HINT_COST_COINS]);
+       VALUES ($1,'hint_coin',-$2,NOW())`, [uid, economy_1.LEGACY_HINT_COST_COINS]);
         return { ok: true, user: u };
     }
     // mode === "ad"
@@ -3017,7 +3882,271 @@ async function endSession(uid) {
 /* =====================================================
    ADMIN
 ===================================================== */
-async function adminListUsers({ search, limit, offset, suspiciousOnly, vpnOnly, manualReviewOnly, payoutLockedOnly, }) {
+function normalizeAdminUser(user, extra) {
+    const coins = Number(user?.mc_balance ?? user?.coins ?? 0);
+    const score = Number(user?.rp_score ?? user?.score ?? user?.rpScore ?? 0);
+    const dailyScore = Number(user?.daily_rp ?? user?.dailyScore ?? user?.dailyRp ?? 0);
+    const wallet = user?.pi_wallet_identifier ?? user?.wallet ?? null;
+    const projectedTier = extra?.projectedTier ??
+        user?.projectedTier ??
+        extra?.projectedTierLabel ??
+        extra?.projectedTierName ??
+        user?.projectedTierLabel ??
+        user?.projectedTierName ??
+        user?.tier_label ??
+        user?.tier_name ??
+        null;
+    return {
+        ...user,
+        uid: user?.uid ?? null,
+        username: user?.username ?? null,
+        economyVersion: getEconomyVersion(user),
+        coins,
+        score,
+        dailyScore,
+        currentRank: extra?.currentRank ?? user?.currentRank ?? user?.current_rank ?? null,
+        projectedTier,
+        wallet,
+        hintCount: Number(user?.free_hints_used ?? user?.hintCount ?? 0),
+        skipCount: Number(user?.free_skips_used ?? user?.skipCount ?? 0),
+        fraudFlag: Boolean(user?.fraud_score > 0 || user?.fraudFlag),
+        vpnFlag: Boolean(user?.vpn_flag ?? user?.vpnFlag),
+        suspiciousFlag: Boolean(user?.suspicious ?? user?.suspiciousFlag),
+        manualFlag: Boolean(user?.manual_review_required ?? user?.manualFlag),
+        lockedFlag: Boolean(user?.payout_locked ?? user?.lockedFlag),
+        isTestUser: Boolean(user?.is_test_user ?? user?.isTestUser),
+        updatedAt: user?.updated_at ?? user?.updatedAt ?? null,
+    };
+}
+function normalizeAdminPayoutRow(row) {
+    return {
+        ...row,
+        uid: row?.uid ?? null,
+        username: row?.username ?? null,
+        economyVersion: Number(row?.economy_version ?? row?.economyVersion ?? 1),
+        monthKey: row?.month_key ?? row?.monthKey ?? null,
+        poolPi: Number(row?.pool_pi ?? row?.poolPi ?? 0),
+        payoutPi: Number(row?.payout_pi_amount ?? row?.payout_pi ?? row?.payoutPi ?? 0),
+        score: Number(row?.rp_score ?? row?.score ?? 0),
+        tierName: row?.tier_name ?? row?.tierName ?? null,
+        tierLabel: row?.tier_label ?? row?.tierLabel ?? null,
+        leaderboardRank: row?.leaderboard_rank ?? row?.leaderboardRank ?? null,
+        eligibleUsers: row?.eligible_users ?? row?.total_users ?? null,
+        totalScore: Number(row?.total_rp_score ?? row?.totalScore ?? 0),
+    };
+}
+function normalizeAdminStats(raw) {
+    return {
+        ...raw,
+        totalUsers: raw?.totalUsers ?? raw?.users_total ?? null,
+        totalCoins: raw?.totalCoins ?? raw?.coins_total ?? null,
+        totalScore: raw?.totalScore ?? raw?.score_total ?? null,
+        onlineNow: raw?.onlineNow ?? raw?.online_now ?? null,
+        payoutEligibleUsers: raw?.payoutEligibleUsers ?? raw?.payout_eligible_users ?? null,
+        currentSeasonPool: raw?.currentSeasonPool ?? raw?.current_season_pool ?? null,
+        currentMonthPayoutRows: raw?.currentMonthPayoutRows ?? raw?.current_month_payout_rows ?? null,
+        levelsCompleted: raw?.levelsCompleted ?? raw?.level_complete_count ?? null,
+        currentMonthKey: raw?.currentMonthKey ?? raw?.current_month_key ?? null,
+        totalUsersWithScore: raw?.totalUsersWithScore ?? raw?.total_users_with_score ?? null,
+        totalCurrentScore: raw?.totalCurrentScore ?? raw?.total_current_score ?? raw?.score_total ?? null,
+        alreadySettledCurrentMonth: raw?.alreadySettledCurrentMonth ?? raw?.already_settled_current_month ?? null,
+        lastSettlementMonthKey: raw?.lastSettlementMonthKey ?? raw?.last_settlement_month_key ?? null,
+        lastSettlementTotalPayoutPi: raw?.lastSettlementTotalPayoutPi ?? raw?.last_settlement_total_payout_pi ?? null,
+        lastSettlementEligibleUsers: raw?.lastSettlementEligibleUsers ?? raw?.last_settlement_eligible_users ?? null,
+        settlementStatus: raw?.settlementStatus ?? raw?.settlement_status ?? null,
+        duplicateSettlementRisk: raw?.duplicateSettlementRisk ?? raw?.duplicate_settlement_risk ?? null,
+        poolMismatchWarning: raw?.poolMismatchWarning ?? raw?.pool_mismatch_warning ?? null,
+        orphanPayoutRowsWarning: raw?.orphanPayoutRowsWarning ?? raw?.orphan_payout_rows_warning ?? null,
+        usersAtDailyCap: raw?.usersAtDailyCap ?? raw?.users_at_daily_cap ?? null,
+        usersWithScoreButNotEligible: raw?.usersWithScoreButNotEligible ?? raw?.users_with_score_but_not_eligible ?? null,
+        repeatLevelRpBlocksToday: raw?.repeatLevelRpBlocksToday ?? raw?.repeat_level_rp_blocks_today ?? null,
+        negativeBalanceAttemptsBlocked: raw?.negativeBalanceAttemptsBlocked ?? raw?.negative_balance_attempts_blocked ?? null,
+        manualScoreAdjustmentsThisMonth: raw?.manualScoreAdjustmentsThisMonth ?? raw?.manual_score_adjustments_this_month ?? null,
+        manualCoinsAdjustmentsThisMonth: raw?.manualCoinsAdjustmentsThisMonth ?? raw?.manual_coins_adjustments_this_month ?? null,
+        levelAccessDayKey: raw?.levelAccessDayKey ?? raw?.level_access_day_key ?? null,
+        levelAccessActiveUsers: raw?.levelAccessActiveUsers ?? raw?.level_access_active_users ?? null,
+        levelAccessAvgLevelsCompleted: raw?.levelAccessAvgLevelsCompleted ?? raw?.level_access_avg_levels_completed ?? null,
+        levelAccessWaitingUsers: raw?.levelAccessWaitingUsers ?? raw?.level_access_waiting_users ?? null,
+        levelAccessWaitingEvents: raw?.levelAccessWaitingEvents ?? raw?.level_access_waiting_events ?? null,
+        levelAccessAdUnlockUsers: raw?.levelAccessAdUnlockUsers ?? raw?.level_access_ad_unlock_users ?? null,
+        levelAccessAdUnlockEvents: raw?.levelAccessAdUnlockEvents ?? raw?.level_access_ad_unlock_events ?? null,
+        levelAccessCapReachedUsers: raw?.levelAccessCapReachedUsers ?? raw?.level_access_cap_reached_users ?? null,
+        levelAccessDistribution: raw?.levelAccessDistribution ?? raw?.level_access_distribution ?? null,
+    };
+}
+async function getLevelAccessAnalyticsSummary({ dayKey = getDayKey() } = {}) {
+    const perUserLevelsRes = await exports.pool.query(`SELECT uid, MAX(levels_played)::int AS max_levels_played
+       FROM public.level_access_events
+      WHERE day_key = $1
+        AND event_type = 'level_completed'
+      GROUP BY uid`, [dayKey]);
+    const perUserLevels = perUserLevelsRes.rows || [];
+    const activeUsers = perUserLevels.length;
+    const totalLevelsCompleted = perUserLevels.reduce((sum, row) => sum + Number(row.max_levels_played || 0), 0);
+    const avgLevelsCompleted = activeUsers > 0
+        ? Number((totalLevelsCompleted / activeUsers).toFixed(2))
+        : 0;
+    const distribution = perUserLevels.reduce((acc, row) => {
+        const value = Number(row.max_levels_played || 0);
+        if (value < 10)
+            acc.lt10 += 1;
+        else if (value === 10)
+            acc.eq10 += 1;
+        else if (value <= 14)
+            acc["11_14"] += 1;
+        else if (value <= 19)
+            acc["15_19"] += 1;
+        else if (value <= 29)
+            acc["20_29"] += 1;
+        else
+            acc.eq30 += 1;
+        return acc;
+    }, { lt10: 0, eq10: 0, "11_14": 0, "15_19": 0, "20_29": 0, eq30: 0 });
+    const summaryCountsRes = await exports.pool.query(`SELECT event_type,
+            COUNT(*)::int AS event_count,
+            COUNT(DISTINCT uid)::int AS user_count
+       FROM public.level_access_events
+      WHERE day_key = $1
+        AND event_type IN ('waiting_for_unlock', 'ad_unlock_used', 'daily_cap_reached')
+      GROUP BY event_type`, [dayKey]);
+    const countsByType = (summaryCountsRes.rows || []).reduce((acc, row) => {
+        acc[String(row.event_type || "")] = {
+            eventCount: Number(row.event_count || 0),
+            userCount: Number(row.user_count || 0),
+        };
+        return acc;
+    }, {});
+    return {
+        dayKey,
+        activeUsers,
+        avgLevelsCompleted,
+        distribution,
+        waitingUsers: countsByType.waiting_for_unlock?.userCount ?? 0,
+        waitingEvents: countsByType.waiting_for_unlock?.eventCount ?? 0,
+        adUnlockUsers: countsByType.ad_unlock_used?.userCount ?? 0,
+        adUnlockEvents: countsByType.ad_unlock_used?.eventCount ?? 0,
+        capReachedUsers: countsByType.daily_cap_reached?.userCount ?? 0,
+    };
+}
+function normalizeAdminAdjustmentInput(input) {
+    const target = String(input?.target || "").trim().toLowerCase();
+    const operation = String(input?.operation || "").trim().toLowerCase();
+    const amount = Number(input?.amount);
+    const reason = String(input?.reason || "").trim();
+    if (target !== "coins" && target !== "score") {
+        throw new Error("invalid_adjustment_target");
+    }
+    if (operation !== "add" && operation !== "sub" && operation !== "set") {
+        throw new Error("invalid_adjustment_operation");
+    }
+    if (!Number.isFinite(amount) || !Number.isInteger(amount) || amount < 0) {
+        throw new Error("invalid_adjustment_amount");
+    }
+    if (!reason) {
+        throw new Error("adjustment_reason_required");
+    }
+    return {
+        target: target,
+        operation: operation,
+        amount,
+        reason,
+    };
+}
+async function adminAdjustUserEconomy(opts) {
+    const normalized = normalizeAdminAdjustmentInput(opts);
+    const field = normalized.target === "coins" ? "mc_balance" : "rp_score";
+    const client = await exports.pool.connect();
+    try {
+        await client.query("BEGIN");
+        const currentRes = await client.query(`SELECT uid,
+              COALESCE(mc_balance, 0)::int AS mc_balance,
+              COALESCE(rp_score, 0)::int AS rp_score,
+              COALESCE(daily_rp, 0)::int AS daily_rp
+         FROM public.users
+        WHERE uid = $1
+        LIMIT 1
+        FOR UPDATE`, [opts.uid]);
+        const user = currentRes.rows[0];
+        if (!user)
+            throw new Error("user_not_found");
+        const beforeValue = Number(user[field] || 0);
+        let afterValue = beforeValue;
+        if (normalized.operation === "add") {
+            afterValue = beforeValue + normalized.amount;
+        }
+        else if (normalized.operation === "sub") {
+            afterValue = beforeValue - normalized.amount;
+        }
+        else {
+            afterValue = normalized.amount;
+        }
+        if (afterValue < 0) {
+            throw new Error(normalized.target === "coins" ? "coins_balance_negative" : "score_balance_negative");
+        }
+        const updateRes = await client.query(`UPDATE public.users
+          SET ${field} = $2,
+              updated_at = NOW()
+        WHERE uid = $1
+        RETURNING uid,
+                  COALESCE(mc_balance, 0)::int AS mc_balance,
+                  COALESCE(rp_score, 0)::int AS rp_score,
+                  COALESCE(daily_rp, 0)::int AS daily_rp,
+                  updated_at`, [opts.uid, afterValue]);
+        await client.query(`INSERT INTO public.admin_adjustments
+         (uid, target, operation, amount, before_value, after_value, reason, admin_identity, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`, [
+            opts.uid,
+            normalized.target,
+            normalized.operation,
+            normalized.amount,
+            beforeValue,
+            afterValue,
+            normalized.reason,
+            opts.adminIdentity ?? null,
+        ]);
+        await client.query("COMMIT");
+        const updatedUser = updateRes.rows[0];
+        return {
+            ok: true,
+            uid: opts.uid,
+            target: normalized.target,
+            operation: normalized.operation,
+            amount: normalized.amount,
+            reason: normalized.reason,
+            beforeValue,
+            afterValue,
+            user: {
+                coins: Number(updatedUser?.mc_balance || 0),
+                score: Number(updatedUser?.rp_score || 0),
+                dailyScore: Number(updatedUser?.daily_rp || 0),
+                mc_balance: Number(updatedUser?.mc_balance || 0),
+                rp_score: Number(updatedUser?.rp_score || 0),
+                daily_rp: Number(updatedUser?.daily_rp || 0),
+            },
+        };
+    }
+    catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+    }
+    finally {
+        client.release();
+    }
+}
+async function adminListUserAdjustments(uid, limit = 20) {
+    const out = await exports.pool.query(`SELECT id, uid, target, operation, amount,
+            before_value AS "beforeValue",
+            after_value AS "afterValue",
+            reason,
+            admin_identity AS "adminIdentity",
+            created_at AS "createdAt"
+       FROM public.admin_adjustments
+      WHERE uid = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT $2`, [uid, Math.max(1, Math.min(100, Number(limit || 20)))]);
+    return out.rows;
+}
+async function adminListUsers({ search, limit, offset, order, suspiciousOnly, vpnOnly, manualReviewOnly, payoutLockedOnly, }) {
     const values = [];
     const where = [];
     if (search) {
@@ -3034,6 +4163,13 @@ async function adminListUsers({ search, limit, offset, suspiciousOnly, vpnOnly, 
     if (payoutLockedOnly)
         where.push(`COALESCE(payout_locked, FALSE) = TRUE`);
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const orderBy = String(order || "").toLowerCase() === "coins_desc"
+        ? `COALESCE(mc_balance, coins, 0) DESC, updated_at DESC`
+        : String(order || "").toLowerCase() === "score_desc"
+            ? `COALESCE(rp_score, 0) DESC, updated_at DESC`
+            : String(order || "").toLowerCase() === "created_at_desc"
+                ? `created_at DESC, updated_at DESC`
+                : `updated_at DESC`;
     values.push(limit);
     const limitIdx = values.length;
     values.push(offset);
@@ -3042,23 +4178,77 @@ async function adminListUsers({ search, limit, offset, suspiciousOnly, vpnOnly, 
     SELECT *
     FROM public.users
     ${whereSql}
-    ORDER BY updated_at DESC
+    ORDER BY ${orderBy}
     LIMIT $${limitIdx} OFFSET $${offsetIdx}
   `, values);
     const countValues = values.slice(0, values.length - 2);
     const { rows: c } = await exports.pool.query(`SELECT COUNT(*) FROM public.users ${whereSql}`, countValues);
-    return { rows, count: Number(c[0].count) };
+    return { rows: rows.map((row) => normalizeAdminUser(row)), count: Number(c[0].count) };
 }
 async function adminGetUser(uid) {
     const user = await getUserByUid(uid);
     const progress = await getProgressByUid(uid);
+    const leaderboard = await getMonthlyLeaderboardMe(uid).catch(() => null);
+    const recentAdjustments = await adminListUserAdjustments(uid, 20).catch(() => []);
     const { rows: stats } = await exports.pool.query(`SELECT type,COUNT(*) FROM reward_claims WHERE uid=$1 GROUP BY type`, [uid]);
     const { rows: session } = await exports.pool.query(`SELECT * FROM sessions WHERE uid=$1`, [uid]);
+    const { rows: payoutRows } = await exports.pool.query(`SELECT month_key, economy_version, rp_score, total_rp_score, pool_pi, payout_pi, tier_name, tier_label, leaderboard_rank, status, created_at
+       FROM public.monthly_pi_payouts
+      WHERE uid = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT 10`, [uid]);
+    const { rows: rewardRows } = await exports.pool.query(`SELECT event_type, event_key, amount_coins, accepted, reject_reason, created_at
+       FROM public.reward_event_audit
+      WHERE uid = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT 20`, [uid]).catch(() => ({ rows: [] }));
+    const { rows: levelRewardRows } = await exports.pool.query(`SELECT level_id,
+            is_replay,
+            used_hint,
+            used_skip,
+            used_restart,
+            coins_awarded,
+            score_awarded,
+            created_at
+       FROM public.level_reward_events
+      WHERE uid = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT 10`, [uid]).catch(() => ({ rows: [] }));
     return {
-        user,
+        user: normalizeAdminUser(user, {
+            currentRank: leaderboard?.currentRank ?? null,
+            projectedTier: leaderboard?.projectedTierLabel ?? leaderboard?.projectedTierName ?? null,
+            projectedTierName: leaderboard?.projectedTierName ?? null,
+            projectedTierLabel: leaderboard?.projectedTierLabel ?? null,
+        }),
+        uid,
+        username: user?.username ?? null,
+        coins: Number(user?.mc_balance ?? user?.coins ?? 0),
+        score: Number(user?.rp_score ?? 0),
+        dailyScore: Number(user?.daily_rp ?? 0),
+        economyVersion: getEconomyVersion(user),
+        isTestUser: Boolean(user?.is_test_user ?? false),
+        currentRank: leaderboard?.currentRank ?? null,
+        projectedTier: leaderboard?.projectedTierLabel ?? leaderboard?.projectedTierName ?? null,
+        wallet: user?.pi_wallet_identifier ?? null,
+        hintCount: Number(user?.free_hints_used ?? 0),
+        skipCount: Number(user?.free_skips_used ?? 0),
         progress,
         stats,
         last_session: session[0] || null,
+        recentPayouts: payoutRows.map((row) => normalizeAdminPayoutRow(row)),
+        recentRewards: rewardRows,
+        recentRewardEvents: levelRewardRows.map((row) => ({
+            levelId: String(row.level_id || ""),
+            isReplay: Boolean(row.is_replay),
+            usedHint: Boolean(row.used_hint),
+            usedSkip: Boolean(row.used_skip),
+            usedRestart: Boolean(row.used_restart),
+            coinsAwarded: Number(row.coins_awarded || 0),
+            scoreAwarded: Number(row.score_awarded || 0),
+            createdAt: row.created_at || null,
+        })),
+        recentAdjustments,
     };
 }
 async function adminSetUserPayoutLock(uid, locked) {
@@ -3091,8 +4281,245 @@ async function adminSetUserManualReview(uid, manualReview) {
         throw new Error("user_not_found");
     return { ok: true, row: rows[0] };
 }
+async function adminSetUserTestFlag(uid, isTestUser) {
+    const { rows } = await exports.pool.query(`UPDATE public.users
+        SET is_test_user = $2,
+            updated_at = NOW()
+      WHERE uid = $1
+      RETURNING uid, is_test_user, updated_at`, [uid, isTestUser]);
+    if (!rows[0])
+        throw new Error("user_not_found");
+    return {
+        ok: true,
+        uid,
+        isTestUser: Boolean(rows[0].is_test_user),
+        row: rows[0],
+    };
+}
 async function adminReevaluateUserFraud(uid) {
     return evaluateUserFraud(uid);
+}
+async function tableExists(client, tableName) {
+    const out = await client.query(`SELECT to_regclass($1) IS NOT NULL AS exists`, [tableName]);
+    return out.rows[0]?.exists === true;
+}
+async function columnExists(client, tableName, columnName) {
+    const [schema, table] = tableName.includes(".")
+        ? tableName.split(".", 2)
+        : ["public", tableName];
+    const out = await client.query(`SELECT EXISTS (
+       SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema = $1
+          AND table_name = $2
+          AND column_name = $3
+     ) AS exists`, [schema, table, columnName]);
+    return out.rows[0]?.exists === true;
+}
+async function existingColumns(client, tableName, columnNames) {
+    const [schema, table] = tableName.includes(".")
+        ? tableName.split(".", 2)
+        : ["public", tableName];
+    const out = await client.query(`SELECT column_name
+       FROM information_schema.columns
+      WHERE table_schema = $1
+        AND table_name = $2
+        AND column_name = ANY($3::text[])`, [schema, table, columnNames]);
+    return new Set(out.rows.map((row) => String(row.column_name)));
+}
+async function adminResetUserState(opts) {
+    const uid = String(opts.uid || "").trim();
+    const reason = String(opts.reason || "").trim();
+    if (!uid)
+        throw new Error("missing_uid");
+    if (!reason)
+        throw new Error("missing_reason");
+    const client = await exports.pool.connect();
+    try {
+        await client.query("BEGIN");
+        const userRes = await client.query(`SELECT uid, COALESCE(is_test_user, FALSE) AS is_test_user
+         FROM public.users
+        WHERE uid = $1
+        LIMIT 1
+        FOR UPDATE`, [uid]);
+        if (!userRes.rows[0]) {
+            throw new Error("user_not_found");
+        }
+        if (!userRes.rows[0]?.is_test_user) {
+            throw new Error("Reset is allowed only for test users");
+        }
+        const resetDayKey = getDayKey();
+        const userColumns = await existingColumns(client, "public.users", [
+            "coins",
+            "mc_balance",
+            "rp_score",
+            "daily_rp",
+            "free_restarts_used",
+            "free_skips_used",
+            "free_hints_used",
+            "restarts_balance",
+            "skips_balance",
+            "hints_balance",
+            "daily_streak",
+            "last_daily_claim_date",
+            "monthly_coins_earned",
+            "monthly_login_days",
+            "monthly_levels_completed",
+            "monthly_skips_used",
+            "monthly_hints_used",
+            "monthly_restarts_used",
+            "monthly_ads_watched",
+            "monthly_surprise_boxes_opened",
+            "monthly_mystery_boxes_opened",
+            "monthly_valid_invites",
+            "monthly_max_win_streak",
+            "monthly_rate_breakdown",
+            "monthly_final_rate",
+            "mystery_box_pending",
+            "daily_surprise_boxes_opened",
+            "last_surprise_box_day_key",
+            "updated_at",
+            "activity_streak",
+            "last_active_day_key",
+        ]);
+        const userAssignments = [];
+        if (userColumns.has("coins"))
+            userAssignments.push(`coins = 0`);
+        if (userColumns.has("mc_balance"))
+            userAssignments.push(`mc_balance = 0`);
+        if (userColumns.has("rp_score"))
+            userAssignments.push(`rp_score = 0`);
+        if (userColumns.has("daily_rp"))
+            userAssignments.push(`daily_rp = 0`);
+        if (userColumns.has("free_restarts_used"))
+            userAssignments.push(`free_restarts_used = 0`);
+        if (userColumns.has("free_skips_used"))
+            userAssignments.push(`free_skips_used = 0`);
+        if (userColumns.has("free_hints_used"))
+            userAssignments.push(`free_hints_used = 0`);
+        if (userColumns.has("restarts_balance"))
+            userAssignments.push(`restarts_balance = 0`);
+        if (userColumns.has("skips_balance"))
+            userAssignments.push(`skips_balance = 0`);
+        if (userColumns.has("hints_balance"))
+            userAssignments.push(`hints_balance = 0`);
+        if (userColumns.has("daily_streak"))
+            userAssignments.push(`daily_streak = 0`);
+        if (userColumns.has("last_daily_claim_date"))
+            userAssignments.push(`last_daily_claim_date = NULL`);
+        if (userColumns.has("monthly_coins_earned"))
+            userAssignments.push(`monthly_coins_earned = 0`);
+        if (userColumns.has("monthly_login_days"))
+            userAssignments.push(`monthly_login_days = 0`);
+        if (userColumns.has("monthly_levels_completed"))
+            userAssignments.push(`monthly_levels_completed = 0`);
+        if (userColumns.has("monthly_skips_used"))
+            userAssignments.push(`monthly_skips_used = 0`);
+        if (userColumns.has("monthly_hints_used"))
+            userAssignments.push(`monthly_hints_used = 0`);
+        if (userColumns.has("monthly_restarts_used"))
+            userAssignments.push(`monthly_restarts_used = 0`);
+        if (userColumns.has("monthly_ads_watched"))
+            userAssignments.push(`monthly_ads_watched = 0`);
+        if (userColumns.has("monthly_surprise_boxes_opened"))
+            userAssignments.push(`monthly_surprise_boxes_opened = 0`);
+        if (userColumns.has("monthly_mystery_boxes_opened"))
+            userAssignments.push(`monthly_mystery_boxes_opened = 0`);
+        if (userColumns.has("monthly_valid_invites"))
+            userAssignments.push(`monthly_valid_invites = 0`);
+        if (userColumns.has("monthly_max_win_streak"))
+            userAssignments.push(`monthly_max_win_streak = 0`);
+        if (userColumns.has("monthly_rate_breakdown"))
+            userAssignments.push(`monthly_rate_breakdown = '{}'::jsonb`);
+        if (userColumns.has("monthly_final_rate"))
+            userAssignments.push(`monthly_final_rate = 50`);
+        if (userColumns.has("mystery_box_pending"))
+            userAssignments.push(`mystery_box_pending = FALSE`);
+        if (userColumns.has("daily_surprise_boxes_opened"))
+            userAssignments.push(`daily_surprise_boxes_opened = 0`);
+        if (userColumns.has("last_surprise_box_day_key"))
+            userAssignments.push(`last_surprise_box_day_key = '${resetDayKey}'`);
+        if (userColumns.has("daily_levels_played"))
+            userAssignments.push(`daily_levels_played = 0`);
+        if (userColumns.has("daily_levels_unlocked"))
+            userAssignments.push(`daily_levels_unlocked = ${economy_1.INITIAL_DAILY_UNLOCKED_LEVELS}`);
+        if (userColumns.has("last_level_reset_day_key"))
+            userAssignments.push(`last_level_reset_day_key = '${resetDayKey}'`);
+        if (userColumns.has("next_unlock_at"))
+            userAssignments.push(`next_unlock_at = NULL`);
+        if (userColumns.has("updated_at"))
+            userAssignments.push(`updated_at = NOW()`);
+        if (userColumns.has("activity_streak"))
+            userAssignments.push(`activity_streak = 0`);
+        if (userColumns.has("last_active_day_key"))
+            userAssignments.push(`last_active_day_key = NULL`);
+        if (userAssignments.length) {
+            await client.query(`UPDATE public.users
+            SET ${userAssignments.join(", ")}
+          WHERE uid = $1`, [uid]);
+        }
+        if (await tableExists(client, "public.user_level_monthly_rp")) {
+            await client.query(`DELETE FROM public.user_level_monthly_rp WHERE uid = $1`, [uid]);
+        }
+        if (await tableExists(client, "public.user_daily_quests")) {
+            await client.query(`DELETE FROM public.user_daily_quests WHERE uid = $1`, [uid]);
+        }
+        if (await tableExists(client, "public.monthly_pi_payouts")) {
+            await client.query(`DELETE FROM public.monthly_pi_payouts WHERE uid = $1`, [uid]);
+        }
+        if (await tableExists(client, "public.surprise_box_rewards")) {
+            await client.query(`DELETE FROM public.surprise_box_rewards WHERE uid = $1`, [uid]);
+        }
+        if (await tableExists(client, "public.admin_adjustments")) {
+            await client.query(`DELETE FROM public.admin_adjustments WHERE uid = $1`, [uid]);
+        }
+        if (await tableExists(client, "public.progress")) {
+            const progressAssignments = [];
+            if (await columnExists(client, "public.progress", "level"))
+                progressAssignments.push(`level = 1`);
+            if (await columnExists(client, "public.progress", "coins"))
+                progressAssignments.push(`coins = 0`);
+            if (await columnExists(client, "public.progress", "painted_keys"))
+                progressAssignments.push(`painted_keys = '[]'::jsonb`);
+            if (await columnExists(client, "public.progress", "resume"))
+                progressAssignments.push(`resume = NULL`);
+            if (await columnExists(client, "public.progress", "free_restarts_used"))
+                progressAssignments.push(`free_restarts_used = 0`);
+            if (await columnExists(client, "public.progress", "free_skips_used"))
+                progressAssignments.push(`free_skips_used = 0`);
+            if (await columnExists(client, "public.progress", "free_hints_used"))
+                progressAssignments.push(`free_hints_used = 0`);
+            if (await columnExists(client, "public.progress", "hints"))
+                progressAssignments.push(`hints = 0`);
+            if (await columnExists(client, "public.progress", "skips"))
+                progressAssignments.push(`skips = 0`);
+            if (await columnExists(client, "public.progress", "updated_at"))
+                progressAssignments.push(`updated_at = NOW()`);
+            if (progressAssignments.length) {
+                await client.query(`UPDATE public.progress
+              SET ${progressAssignments.join(", ")}
+            WHERE uid = $1`, [uid]);
+            }
+        }
+        if (await tableExists(client, "public.admin_adjustments")) {
+            await client.query(`INSERT INTO public.admin_adjustments
+           (uid, target, operation, amount, before_value, after_value, reason, admin_identity, created_at)
+         VALUES ($1, $2, $3, $4, NULL, NULL, $5, $6, NOW())`, [uid, "reset", "reset_user", 0, reason, opts.adminIdentity ?? null]);
+        }
+        await client.query("COMMIT");
+        return {
+            success: true,
+            uid,
+            message: "User reset to new player state",
+        };
+    }
+    catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+    }
+    finally {
+        client.release();
+    }
 }
 async function adminResetFreeCounters(uid) {
     const { rows } = await exports.pool.query(`
@@ -3114,26 +4541,109 @@ async function adminDeleteUser(uid) {
 }
 async function adminGetStats({ onlineMinutes }) {
     const users = await exports.pool.query(`SELECT COUNT(*) FROM public.users`);
-    const coins = await exports.pool.query(`SELECT SUM(coins) FROM public.users`);
+    const coins = await exports.pool.query(`SELECT COALESCE(SUM(mc_balance), 0)::bigint AS sum FROM public.users`);
+    const score = await exports.pool.query(`SELECT COALESCE(SUM(rp_score), 0)::bigint AS sum FROM public.users`);
+    const usersWithScore = await exports.pool.query(`SELECT COUNT(*)::int AS c FROM public.users WHERE COALESCE(rp_score, 0) > 0`);
+    const usersAtDailyCapRes = await exports.pool.query(`SELECT COUNT(*)::int AS c FROM public.users WHERE COALESCE(daily_rp, 0) >= $1`, [economy_1.DAILY_SCORE_CAP]);
     const online = await exports.pool.query(`
     SELECT COUNT(*) FROM sessions
     WHERE last_seen_at > NOW() - ($1 || ' minutes')::interval
   `, [onlineMinutes]);
-    const ad50 = await exports.pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='ad_50'`);
-    const daily = await exports.pool.query(`SELECT COUNT(*) FROM reward_claims WHERE type='daily_login'`);
     const levels = await exports.pool.query(`SELECT COUNT(*) FROM level_rewards`);
-    return {
+    const currentMonthKey = normalizeMonthKey();
+    const eligibleLeaderboard = await getEligibleLeaderboardUsers({ monthKey: currentMonthKey });
+    const scoredLeaderboard = await getMonthlyLeaderboardUsers({ eligibleOnly: false, monthKey: currentMonthKey });
+    const currentPayoutRows = await exports.pool.query(`SELECT COUNT(*)::int AS c,
+            COALESCE(SUM(payout_pi), 0)::numeric(20,8) AS total_payout_pi
+       FROM public.monthly_pi_payouts
+      WHERE month_key = $1`, [currentMonthKey]);
+    const currentSettlementRun = await exports.pool.query(`SELECT month_key, status, pool_pi, eligible_users, total_score, total_payout_pi, updated_at
+       FROM public.monthly_settlement_runs
+      WHERE month_key = $1
+      LIMIT 1`, [currentMonthKey]);
+    const lastSettlementRun = await exports.pool.query(`SELECT month_key, status, pool_pi, eligible_users, total_score, total_payout_pi, updated_at
+       FROM public.monthly_settlement_runs
+      WHERE status = 'completed'
+      ORDER BY month_key DESC, updated_at DESC
+      LIMIT 1`);
+    const adjustmentSummary = await exports.pool.query(`SELECT target, COUNT(*)::int AS c
+       FROM public.admin_adjustments
+      WHERE created_at >= date_trunc('month', NOW())
+      GROUP BY target`);
+    const levelAccessAnalytics = await getLevelAccessAnalyticsSummary({ dayKey: getDayKey() }).catch(() => null);
+    const eligibleUsers = eligibleLeaderboard.rows || [];
+    const scoredUsers = scoredLeaderboard.rows || [];
+    const tierAssignments = eligibleUsers.length ? await assignRewardTiers(eligibleUsers) : [];
+    const tierCounts = {
+        champion: tierAssignments.filter((row) => row.tier_name === "A").length,
+        elite: tierAssignments.filter((row) => row.tier_name === "B").length,
+        advanced: tierAssignments.filter((row) => row.tier_name === "C").length,
+        qualified: tierAssignments.filter((row) => row.tier_name === "D").length,
+    };
+    const currentRun = currentSettlementRun.rows[0] || null;
+    const lastRun = lastSettlementRun.rows[0] || null;
+    const currentPayoutRowCount = Number(currentPayoutRows.rows[0]?.c || 0);
+    const currentPayoutTotal = Number(currentPayoutRows.rows[0]?.total_payout_pi || 0);
+    const duplicateSettlementRisk = currentPayoutRowCount > 0 &&
+        String(currentRun?.status || "") !== "completed";
+    const orphanPayoutRowsWarning = currentPayoutRowCount > 0 &&
+        !currentRun;
+    const expectedPool = Number(currentRun?.pool_pi ?? economy_1.MONTHLY_PI_POOL);
+    const poolMismatchWarning = currentPayoutRowCount > 0 &&
+        Math.abs(currentPayoutTotal - expectedPool) > 0.000001;
+    const adjustmentCounts = adjustmentSummary.rows.reduce((acc, row) => {
+        acc[String(row.target || "")] = Number(row.c || 0);
+        return acc;
+    }, {});
+    return normalizeAdminStats({
         users_total: Number(users.rows[0].count),
         coins_total: Number(coins.rows[0].sum || 0),
+        score_total: Number(score.rows[0].sum || 0),
+        total_users_with_score: Number(usersWithScore.rows[0]?.c || 0),
         online_now: Number(online.rows[0].count),
-        ad50_count: Number(ad50.rows[0].count),
-        daily_login_count: Number(daily.rows[0].count),
+        payout_eligible_users: eligibleUsers.length,
+        total_current_score: scoredUsers.reduce((sum, row) => sum + Number(row.rp_score || 0), 0),
+        totalEligibleScore: eligibleUsers.reduce((sum, row) => sum + Number(row.rp_score || 0), 0),
+        current_season_pool: economy_1.MONTHLY_PI_POOL,
+        current_month_payout_rows: currentPayoutRowCount,
         level_complete_count: Number(levels.rows[0].count),
-    };
+        current_month_key: currentMonthKey,
+        already_settled_current_month: Boolean(String(currentRun?.status || "") === "completed") || currentPayoutRowCount > 0,
+        last_settlement_month_key: lastRun?.month_key ?? null,
+        last_settlement_total_payout_pi: lastRun?.total_payout_pi != null ? Number(lastRun.total_payout_pi) : null,
+        last_settlement_eligible_users: lastRun?.eligible_users != null ? Number(lastRun.eligible_users) : null,
+        settlement_status: currentRun?.status ?? null,
+        duplicate_settlement_risk: duplicateSettlementRisk,
+        pool_mismatch_warning: poolMismatchWarning,
+        orphan_payout_rows_warning: orphanPayoutRowsWarning,
+        users_at_daily_cap: Number(usersAtDailyCapRes.rows[0]?.c || 0),
+        users_with_score_but_not_eligible: Math.max(0, scoredUsers.length - eligibleUsers.length),
+        repeat_level_rp_blocks_today: null,
+        negative_balance_attempts_blocked: null,
+        manual_score_adjustments_this_month: Number(adjustmentCounts.score || 0),
+        manual_coins_adjustments_this_month: Number(adjustmentCounts.coins || 0),
+        level_access_day_key: levelAccessAnalytics?.dayKey ?? getDayKey(),
+        level_access_active_users: levelAccessAnalytics?.activeUsers ?? 0,
+        level_access_avg_levels_completed: levelAccessAnalytics?.avgLevelsCompleted ?? 0,
+        level_access_waiting_users: levelAccessAnalytics?.waitingUsers ?? 0,
+        level_access_waiting_events: levelAccessAnalytics?.waitingEvents ?? 0,
+        level_access_ad_unlock_users: levelAccessAnalytics?.adUnlockUsers ?? 0,
+        level_access_ad_unlock_events: levelAccessAnalytics?.adUnlockEvents ?? 0,
+        level_access_cap_reached_users: levelAccessAnalytics?.capReachedUsers ?? 0,
+        level_access_distribution: levelAccessAnalytics?.distribution ?? {
+            lt10: 0,
+            eq10: 0,
+            "11_14": 0,
+            "15_19": 0,
+            "20_29": 0,
+            eq30: 0,
+        },
+        tierCounts,
+    });
 }
 async function adminListOnlineUsers({ minutes, limit, offset, }) {
     const { rows } = await exports.pool.query(`
-    SELECT u.uid,u.username,u.coins,
+    SELECT u.uid,u.username,u.coins,u.mc_balance,u.rp_score,u.daily_rp,
            s.last_seen_at,s.started_at,s.user_agent
     FROM sessions s
     JOIN public.users u ON u.uid=s.uid
@@ -3141,10 +4651,10 @@ async function adminListOnlineUsers({ minutes, limit, offset, }) {
     ORDER BY s.last_seen_at DESC
     LIMIT $2 OFFSET $3
   `, [minutes, limit, offset]);
-    return { rows, count: rows.length };
+    return { rows: rows.map((row) => normalizeAdminUser(row)), count: rows.length };
 }
 /* ============================
-   Charts (Step 1 â€“ 7 days default)
+   Charts (Step 1 – 7 days default)
 ============================ */
 async function adminChartCoins({ days }) {
     const d = Math.max(1, Math.min(90, Number(days || 7)));
@@ -3227,13 +4737,13 @@ function coinRewardForAd(adsForCoinsThisMonth) {
     return Math.max(reward, 2);
 }
 async function claimCoinAd(uid) {
-    // 1ï¸âƒ£ Track ad view
+    // 1️⃣ Track ad view
     await trackAdView(uid, "coins");
-    // 2ï¸âƒ£ Read monthly ads
+    // 2️⃣ Read monthly ads
     const ads = await getMonthlyAds(uid);
     // ads_for_coins already incremented
     const coins = coinRewardForAd(ads.ads_for_coins - 1);
-    // 3ï¸âƒ£ Use EXISTING reward system
+    // 3️⃣ Use EXISTING reward system
     const nonce = `coin-ad-${currentMonthKey()}-${ads.ads_for_coins}`;
     return await claimReward({
         uid,

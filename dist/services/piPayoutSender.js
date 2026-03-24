@@ -2,20 +2,17 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getSendingWalletAvailableBalancePi = getSendingWalletAvailableBalancePi;
 exports.sendPiPayout = sendPiPayout;
-function parseOptionalNumber(raw) {
-    const n = Number(raw);
-    return Number.isFinite(n) ? n : null;
-}
+const runtime_1 = require("../config/runtime");
 async function getSendingWalletAvailableBalancePi() {
-    const configured = parseOptionalNumber(process.env.SENDING_WALLET_AVAILABLE_PI) ??
-        parseOptionalNumber(process.env.PAYOUT_TREASURY_AVAILABLE_PI);
+    const configured = runtime_1.runtimeConfig.payout.sendingWalletAvailablePi ??
+        runtime_1.runtimeConfig.payout.payoutTreasuryAvailablePi;
     if (configured !== null)
         return configured;
     // Real balance lookup adapter is intentionally isolated and can be added later.
     return null;
 }
 async function sendPiPayout(input) {
-    if (process.env.PAYOUT_SIMULATE_SUCCESS === "true") {
+    if (runtime_1.runtimeConfig.payout.simulateSuccess) {
         return {
             ok: true,
             txid: `sim-${input.idempotencyKey}`,
@@ -23,7 +20,7 @@ async function sendPiPayout(input) {
             raw: { mode: "simulation" },
         };
     }
-    if (process.env.PI_PAYOUT_ADAPTER_ENABLED !== "true") {
+    if (!runtime_1.runtimeConfig.payout.adapterEnabled) {
         return {
             ok: false,
             error: "adapter_not_configured",
