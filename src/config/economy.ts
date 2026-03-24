@@ -50,8 +50,8 @@ export const LEGACY_RESTART_COST_COINS = 50;
 export const LEGACY_SKIP_COST_COINS = 50;
 export const LEGACY_HINT_COST_COINS = 50;
 
-export const LEVEL_MC_REWARD = 2;
-export const LEVEL_RP_HINT_REWARD = 1;
+export const LEVEL_MC_REWARD = 1;
+export const LEVEL_RP_HINT_REWARD = 0;
 export const LEVEL_RP_CLEAN_REWARD = 2;
 export const LEVEL_RP_SKIP_REWARD = 0;
 

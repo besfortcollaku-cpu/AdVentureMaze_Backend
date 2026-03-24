@@ -1487,30 +1487,45 @@ function getEconomyVersion(user: any) {
     : runtimeConfig.economy.defaultEconomyVersion;
 }
 
-function calculateLevelRewardsV1(params: { usedHint: boolean; usedSkip: boolean }) {
-  const mc = LEVEL_MC_REWARD;
-  let rp = LEVEL_RP_SKIP_REWARD;
+type LevelRewardInput = {
+  isReplay: boolean;
+  usedHint: boolean;
+  usedSkip: boolean;
+  usedRestart?: boolean;
+};
 
-  if (params.usedSkip) {
-    rp = LEVEL_RP_SKIP_REWARD;
-  } else if (params.usedHint) {
-    rp = LEVEL_RP_HINT_REWARD;
-  } else {
-    rp = LEVEL_RP_CLEAN_REWARD;
+type LevelRewardResult = {
+  coins: number;
+  score: number;
+};
+
+function calculateLevelRewardsV1(input: LevelRewardInput): LevelRewardResult {
+  if (input.isReplay) {
+    return { coins: 0, score: 0 };
   }
 
-  return { mc, rp };
+  if (input.usedHint || input.usedSkip) {
+    return {
+      coins: LEVEL_MC_REWARD,
+      score: LEVEL_RP_HINT_REWARD,
+    };
+  }
+
+  return {
+    coins: LEVEL_MC_REWARD,
+    score: LEVEL_RP_CLEAN_REWARD,
+  };
 }
 
-function calculateLevelRewardsForUser(user: any, params: { usedHint: boolean; usedSkip: boolean }) {
+function calculateLevelRewardsForUser(user: any, input: LevelRewardInput): LevelRewardResult {
   const version = getEconomyVersion(user);
 
   if (version === 1) {
-    return calculateLevelRewardsV1(params);
+    return calculateLevelRewardsV1(input);
   }
 
   // Future economy versions can branch here without changing current v1 behavior.
-  return calculateLevelRewardsV1(params);
+  return calculateLevelRewardsV1(input);
 }
 
 function buildDailyLevelAccessState(user: any) {
@@ -4499,18 +4514,16 @@ export async function claimLevelComplete(
         throw new Error("user_not_found");
       }
 
-      const lifetimeCompletion = await client.query(
-        `SELECT 1
-           FROM public.level_rewards
-          WHERE uid = $1
-            AND level = $2
-          LIMIT 1
-          FOR UPDATE`,
+      const lifetimeInsert = await client.query(
+        `INSERT INTO public.level_rewards (uid, level, created_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (uid, level) DO NOTHING`,
         [uid, level]
       );
-      const isReplay = (lifetimeCompletion.rowCount ?? 0) > 0;
+      const isFirstLifetimeCompletion = (lifetimeInsert.rowCount ?? 0) > 0;
+      const isReplay = !isFirstLifetimeCompletion;
 
-      if (!isReplay) {
+      if (isFirstLifetimeCompletion) {
         await incrementDailyLevelsPlayedWithClient(client, uid, {
           used_hint: Boolean(opts?.usedHint),
           used_skip: Boolean(opts?.usedSkip),
@@ -4518,19 +4531,13 @@ export async function claimLevelComplete(
         });
       }
 
-      const lifetimeInsert = await client.query(
-        `INSERT INTO public.level_rewards (uid, level, created_at)
-         VALUES ($1, $2, NOW())
-         ON CONFLICT (uid, level) DO NOTHING`,
-      [uid, level]
-    );
-
       const rewards = calculateLevelRewardsForUser(rewardUser, {
+        isReplay,
         usedHint: Boolean(opts?.usedHint),
         usedSkip: Boolean(opts?.usedSkip),
+        usedRestart: false,
       });
-      const isFirstLifetimeCompletion = (lifetimeInsert.rowCount ?? 0) > 0;
-      const awardedMc = isFirstLifetimeCompletion ? Math.max(0, Number(rewards.mc || 0)) : 0;
+      const awardedMc = Math.max(0, Number(rewards.coins || 0));
 
       await client.query(
         `UPDATE public.users
@@ -4560,7 +4567,7 @@ export async function claimLevelComplete(
     const already = (monthlyCredit.rowCount ?? 0) > 0;
 
       if (!already && !isReplay) {
-        const rpResult = await addRPForUserVersion(client, rewardUser, uid, rewards.rp);
+        const rpResult = await addRPForUserVersion(client, rewardUser, uid, rewards.score);
         awardedRp = Number(rpResult.added || 0);
 
         await client.query(
