@@ -173,6 +173,7 @@ export async function initDB() {
       ADD COLUMN IF NOT EXISTS hints_balance INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS daily_streak INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS last_daily_claim_date DATE,
+      ADD COLUMN IF NOT EXISTS daily_reward_doubled BOOLEAN NOT NULL DEFAULT FALSE,
       ADD COLUMN IF NOT EXISTS lifetime_coins_earned INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS lifetime_coins_spent INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS lifetime_levels_completed INT DEFAULT 0,
@@ -1580,6 +1581,52 @@ function buildDailyLevelAccessState(user: any) {
     canUnlockWithAd: waitingForUnlock,
     canWatchAdToUnlock: waitingForUnlock,
     dailyLimitReached: dailyCapReached,
+  };
+}
+
+type AdminProgressionPreviewState =
+  | "completed_replayable"
+  | "available_new"
+  | "time_locked_next"
+  | "future_locked";
+
+function resolveAdminProgressionPreviewState(levelNumber: number, frontierLevel: number, canPlayNow: boolean): AdminProgressionPreviewState {
+  if (levelNumber < frontierLevel) {
+    return "completed_replayable";
+  }
+  if (levelNumber === frontierLevel) {
+    return canPlayNow ? "available_new" : "time_locked_next";
+  }
+  return "future_locked";
+}
+
+function buildAdminProgressionDebug(user: any, progress: any, levelAccess: any) {
+  const frontierLevel = Math.max(1, Number(progress?.level || 1));
+  const highestPermanentLevel = Math.max(0, frontierLevel - 1);
+  const previewStart = Math.max(1, frontierLevel - 4);
+  const previewEnd = Math.max(frontierLevel, frontierLevel + 5);
+  const progressionPreview = [] as Array<{ levelId: string; state: AdminProgressionPreviewState }>;
+
+  for (let levelNumber = previewStart; levelNumber <= previewEnd; levelNumber += 1) {
+    progressionPreview.push({
+      levelId: String(levelNumber),
+      state: resolveAdminProgressionPreviewState(levelNumber, frontierLevel, Boolean(levelAccess?.canPlayNow)),
+    });
+  }
+
+  return {
+    progressionDebug: {
+      highestPermanentLevel,
+      currentFrontierLevel: frontierLevel,
+      dailyLevelsPlayed: Number(levelAccess?.dailyLevelsPlayed ?? user?.daily_levels_played ?? 0),
+      dailyLevelsUnlocked: Number(levelAccess?.dailyLevelsUnlocked ?? user?.daily_levels_unlocked ?? INITIAL_DAILY_UNLOCKED_LEVELS),
+      dailyLevelsMax: Number(levelAccess?.dailyLevelsMax ?? DAILY_LEVELS_MAX),
+      lastLevelResetDayKey: user?.last_level_reset_day_key ?? null,
+      nextUnlockAt: levelAccess?.nextUnlockAt ?? (user?.next_unlock_at ? new Date(user.next_unlock_at).toISOString() : null),
+      isDailyCapReached: Boolean(levelAccess?.isDailyCapReached ?? false),
+      isWaitingForUnlock: Boolean(levelAccess?.isWaitingForUnlock ?? false),
+    },
+    progressionPreview,
   };
 }
 
@@ -4425,37 +4472,231 @@ export async function claimReward({
 }
 
 export async function claimDailyLogin(uid: string) {
-  const dayKey = new Date().toISOString().slice(0, 10);
-  const { rowCount } = await pool.query(
-    `
-    SELECT 1 FROM reward_claims
-    WHERE uid=$1 AND type='daily_login'
-      AND created_at::date = CURRENT_DATE
-  `,
-    [uid]
-  );
+  return claimDailyReturnReward(uid);
+}
 
-  if (rowCount) {
-    await auditRewardEvent({ uid, eventType: "daily_login", eventKey: dayKey, amountCoins: 5, accepted: false, rejectReason: "daily_already_claimed" });
-    return { already: true };
+const DAILY_RETURN_REWARD_TABLE = [
+  { itemType: "hint", itemCount: 1 },
+  { itemType: "restart", itemCount: 1 },
+  { itemType: "skip", itemCount: 1 },
+  { itemType: "hint", itemCount: 1 },
+  { itemType: "restart", itemCount: 1 },
+  { itemType: "skip", itemCount: 1 },
+  { itemType: "hint", itemCount: 2 },
+] as const;
+
+type DailyReturnRewardItemType = typeof DAILY_RETURN_REWARD_TABLE[number]["itemType"];
+
+function dayKeyToUtcDate(dayKey: string) {
+  return new Date(`${dayKey}T00:00:00.000Z`);
+}
+
+function getPreviousDayKey(dayKey: string) {
+  const d = dayKeyToUtcDate(dayKey);
+  d.setUTCDate(d.getUTCDate() - 1);
+  return getDayKey(d);
+}
+
+function getDailyReturnRewardForStreak(streakDay: number) {
+  const normalizedDay = Math.max(1, Math.trunc(Number(streakDay || 1)));
+  const rewardIndex = (normalizedDay - 1) % DAILY_RETURN_REWARD_TABLE.length;
+  const reward = DAILY_RETURN_REWARD_TABLE[rewardIndex];
+  return {
+    streakDay: normalizedDay,
+    itemType: reward.itemType as DailyReturnRewardItemType,
+    itemCount: Number(reward.itemCount || 0),
+  };
+}
+
+function formatDailyReturnRewardLabel(itemType: DailyReturnRewardItemType, itemCount: number) {
+  const label = itemType === "hint" ? "Hint" : itemType === "restart" ? "Restart" : "Skip";
+  return `${itemCount} ${label}${itemCount === 1 ? "" : "s"}`;
+}
+
+export async function claimDailyReturnReward(uid: string) {
+  const dayKey = getDayKey();
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const userRes = await client.query(
+      `SELECT uid,
+              daily_streak,
+              last_daily_claim_date,
+              daily_reward_doubled,
+              monthly_login_days,
+              restarts_balance,
+              skips_balance,
+              hints_balance
+         FROM public.users
+        WHERE uid = $1
+        FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    if (!user) {
+      throw new Error("user_not_found");
+    }
+
+    const lastClaimDayKey = user?.last_daily_claim_date ? getDayKey(new Date(user.last_daily_claim_date)) : null;
+    if (lastClaimDayKey === dayKey) {
+      await client.query("COMMIT");
+      return {
+        already: true,
+        streakDay: Math.max(0, Number(user?.daily_streak || 0)),
+      };
+    }
+
+    const nextStreakDay = lastClaimDayKey === getPreviousDayKey(dayKey)
+      ? Math.max(1, Number(user?.daily_streak || 0) + 1)
+      : 1;
+    const reward = getDailyReturnRewardForStreak(nextStreakDay);
+    const balanceColumn = reward.itemType === "hint"
+      ? "hints_balance"
+      : reward.itemType === "restart"
+        ? "restarts_balance"
+        : "skips_balance";
+
+    const updatedRes = await client.query(
+      `UPDATE public.users
+          SET ${balanceColumn} = COALESCE(${balanceColumn}, 0) + $1,
+              daily_streak = $2,
+              last_daily_claim_date = $3::date,
+              daily_reward_doubled = FALSE,
+              monthly_login_days = COALESCE(monthly_login_days, 0) + 1,
+              updated_at = NOW()
+        WHERE uid = $4
+        RETURNING hints_balance, restarts_balance, skips_balance, daily_streak, last_daily_claim_date, daily_reward_doubled, monthly_login_days`,
+      [reward.itemCount, reward.streakDay, dayKey, uid]
+    );
+
+    await client.query("COMMIT");
+
+    await auditRewardEvent({
+      uid,
+      eventType: "daily_login",
+      eventKey: dayKey,
+      amountCoins: 0,
+      accepted: true,
+    }).catch(() => {});
+
+    return {
+      already: false,
+      claimed: true,
+      streakDay: reward.streakDay,
+      reward: {
+        day: reward.streakDay,
+        itemType: reward.itemType,
+        itemCount: reward.itemCount,
+        label: formatDailyReturnRewardLabel(reward.itemType, reward.itemCount),
+        canDouble: true,
+        doubled: false,
+      },
+      user: {
+        hints_balance: Number(updatedRes.rows[0]?.hints_balance || 0),
+        restarts_balance: Number(updatedRes.rows[0]?.restarts_balance || 0),
+        skips_balance: Number(updatedRes.rows[0]?.skips_balance || 0),
+        daily_streak: Number(updatedRes.rows[0]?.daily_streak || reward.streakDay),
+        last_daily_claim_date: updatedRes.rows[0]?.last_daily_claim_date || dayKey,
+        daily_reward_doubled: Boolean(updatedRes.rows[0]?.daily_reward_doubled),
+        monthly_login_days: Number(updatedRes.rows[0]?.monthly_login_days || 0),
+      },
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
   }
+}
 
-  await pool.query(
-    `
-    INSERT INTO reward_claims (uid,type,amount,created_at)
-    VALUES ($1,'daily_login',5,NOW())
-  `,
-    [uid]
-  );
+export async function claimDailyReturnRewardDouble(uid: string) {
+  const dayKey = getDayKey();
+  const client = await pool.connect();
 
-  const user = await addCoins(uid, 5);
-  await pool.query(
-    `UPDATE public.users SET monthly_login_days = COALESCE(monthly_login_days,0) + 1 WHERE uid=$1`,
-    [uid]
-  );
-  await recalcAndStoreMonthlyRate(uid);
-  await auditRewardEvent({ uid, eventType: "daily_login", eventKey: dayKey, amountCoins: 5, accepted: true });
-  return { user };
+  try {
+    await client.query("BEGIN");
+
+    const userRes = await client.query(
+      `SELECT uid,
+              daily_streak,
+              last_daily_claim_date,
+              daily_reward_doubled,
+              restarts_balance,
+              skips_balance,
+              hints_balance
+         FROM public.users
+        WHERE uid = $1
+        FOR UPDATE`,
+      [uid]
+    );
+
+    const user = userRes.rows[0];
+    if (!user) {
+      throw new Error("user_not_found");
+    }
+
+    const lastClaimDayKey = user?.last_daily_claim_date ? getDayKey(new Date(user.last_daily_claim_date)) : null;
+    if (lastClaimDayKey !== dayKey) {
+      throw new Error("daily_reward_not_claimed");
+    }
+    if (Boolean(user?.daily_reward_doubled)) {
+      await client.query("COMMIT");
+      return { already: true };
+    }
+
+    const reward = getDailyReturnRewardForStreak(Math.max(1, Number(user?.daily_streak || 1)));
+    const balanceColumn = reward.itemType === "hint"
+      ? "hints_balance"
+      : reward.itemType === "restart"
+        ? "restarts_balance"
+        : "skips_balance";
+
+    const updatedRes = await client.query(
+      `UPDATE public.users
+          SET ${balanceColumn} = COALESCE(${balanceColumn}, 0) + $1,
+              daily_reward_doubled = TRUE,
+              updated_at = NOW()
+        WHERE uid = $2
+        RETURNING hints_balance, restarts_balance, skips_balance, daily_streak, last_daily_claim_date, daily_reward_doubled`,
+      [reward.itemCount, uid]
+    );
+
+    await client.query("COMMIT");
+
+    await auditRewardEvent({
+      uid,
+      eventType: "daily_login_double",
+      eventKey: dayKey,
+      amountCoins: 0,
+      accepted: true,
+    }).catch(() => {});
+
+    return {
+      already: false,
+      reward: {
+        day: reward.streakDay,
+        itemType: reward.itemType,
+        itemCount: reward.itemCount,
+        label: formatDailyReturnRewardLabel(reward.itemType, reward.itemCount),
+      },
+      user: {
+        hints_balance: Number(updatedRes.rows[0]?.hints_balance || 0),
+        restarts_balance: Number(updatedRes.rows[0]?.restarts_balance || 0),
+        skips_balance: Number(updatedRes.rows[0]?.skips_balance || 0),
+        daily_streak: Number(updatedRes.rows[0]?.daily_streak || reward.streakDay),
+        last_daily_claim_date: updatedRes.rows[0]?.last_daily_claim_date || dayKey,
+        daily_reward_doubled: Boolean(updatedRes.rows[0]?.daily_reward_doubled),
+      },
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 async function addRPWithClient(client: any, uid: string, amount: number) {
@@ -5292,8 +5533,10 @@ export async function adminListUsers({
 export async function adminGetUser(uid: string) {
   const user = await getUserByUid(uid);
   const progress = await getProgressByUid(uid);
+  const levelAccess = user ? await getDailyLevelAccessState(uid).catch(() => buildDailyLevelAccessState(user)) : null;
   const leaderboard = await getMonthlyLeaderboardMe(uid).catch(() => null);
   const recentAdjustments = await adminListUserAdjustments(uid, 20).catch(() => []);
+  const progressionDebugData = buildAdminProgressionDebug(user, progress, levelAccess);
 
   const { rows: stats } = await pool.query(
     `SELECT type,COUNT(*) FROM reward_claims WHERE uid=$1 GROUP BY type`,
@@ -5359,6 +5602,8 @@ export async function adminGetUser(uid: string) {
     hintCount: Number(user?.free_hints_used ?? 0),
     skipCount: Number(user?.free_skips_used ?? 0),
     progress,
+    progressionDebug: progressionDebugData.progressionDebug,
+    progressionPreview: progressionDebugData.progressionPreview,
     stats,
     last_session: session[0] || null,
     recentPayouts: payoutRows.map((row) => normalizeAdminPayoutRow(row)),

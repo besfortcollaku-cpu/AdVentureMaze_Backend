@@ -33,6 +33,8 @@ import {
   SpendMode,
   claimReward,
   claimDailyLogin,
+  claimDailyReturnReward,
+  claimDailyReturnRewardDouble,
   claimLevelComplete,
   useSkip,
   useHint, 
@@ -134,6 +136,7 @@ app.get("/api/me", async (req, res) => {
 
     try {
       const { uid } = await requirePiUser(req);
+      const dailyReturnRewardResult = await claimDailyReturnReward(uid).catch(() => ({ already: true }));
       const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
       const surpriseBoxState = await getDailySurpriseBoxState(uid).catch(() => null);
       const completedLevels = await getCompletedLevels(uid).catch(() => []);
@@ -293,6 +296,8 @@ if (firstRecoverableMissedDay) {
             restarts_balance: user.restarts_balance ?? 0,
             skips_balance: user.skips_balance ?? 0,
             hints_balance: user.hints_balance ?? 0,
+            daily_return_streak: user.daily_streak ?? 0,
+            daily_reward_doubled: Boolean(user.daily_reward_doubled),
             monthly_final_rate: user.monthly_final_rate ?? 50,
             monthly_rate_breakdown: user.monthly_rate_breakdown ?? {},
             monthly_coins_earned: user.monthly_coins_earned ?? 0,
@@ -346,6 +351,16 @@ if (firstRecoverableMissedDay) {
           }
         : null,
       dailyReward,
+      dailyReturnReward: dailyReturnRewardResult && !dailyReturnRewardResult.already && "reward" in dailyReturnRewardResult
+        ? {
+            streakDay: Number(dailyReturnRewardResult.streakDay || dailyReturnRewardResult.reward?.day || 1),
+            itemType: String(dailyReturnRewardResult.reward?.itemType || ""),
+            itemCount: Number(dailyReturnRewardResult.reward?.itemCount || 0),
+            label: String(dailyReturnRewardResult.reward?.label || ""),
+            canDouble: Boolean(dailyReturnRewardResult.reward?.canDouble ?? true),
+            doubled: Boolean(dailyReturnRewardResult.reward?.doubled ?? false),
+          }
+        : null,
       levelAccess,
         surpriseBoxState,
         completedLevels,
@@ -1610,68 +1625,45 @@ app.post("/api/restart", async (req, res) => {
 app.post("/api/rewards/daily-claim", async (req, res) => {
   try {
     const { uid } = await requirePiUser(req);
-
-    await pool.query("BEGIN");
-
-    const userRes = await pool.query(
-      `SELECT uid, coins, daily_streak, last_daily_claim_date, mystery_box_pending
-       FROM public.users
-       WHERE uid = $1
-       FOR UPDATE`,
-      [uid]
-    );
-
-    const user = userRes.rows[0];
-    if (!user) {
-      throw new Error("user_not_found");
-    }
-
-    const plan = buildDailyClaimPlan(user);
-
-    if (plan.already) {
-      await pool.query("ROLLBACK");
-      return res.json({ ok: true, already: true });
-    }
-
-    if (plan.resetCycle) {
-      await pool.query(
-        `DELETE FROM daily_reward_missed_days
-         WHERE uid = $1`,
-        [uid]
-      );
-    }
-
-    const reward = dailyRewardCoinsForDay(plan.nextDay);
-
-    await pool.query(
-      `UPDATE public.users
-       SET coins = coins + $1,
-           daily_streak = $2,
-           monthly_login_days = COALESCE(monthly_login_days,0) + 1,
-           last_daily_claim_date = CURRENT_DATE,
-           mystery_box_pending = CASE WHEN $2 = 7 THEN TRUE ELSE FALSE END
-       WHERE uid = $3`,
-      [reward, plan.nextDay, uid]
-    );
-
-    const updated = await pool.query(
-      `SELECT coins, daily_streak, mystery_box_pending
-       FROM public.users
-       WHERE uid=$1`,
-      [uid]
-    );
-
-    await pool.query("COMMIT");
-    try { await incrementDailyUserStats(uid, { coinsEarned: reward }); } catch {}
-    try { await recalcAndStoreMonthlyRate(uid); } catch {}
-
+    const out = await claimDailyReturnReward(uid);
     res.json({
-      day: plan.nextDay,
-      coins: reward,
-      user: updated.rows[0],
+      ok: true,
+      already: Boolean(out?.already),
+      streakDay: Number(out?.streakDay || out?.reward?.day || 0),
+      reward: out?.reward || null,
+      user: out?.user || null,
     });
   } catch (e: any) {
-    await pool.query("ROLLBACK");
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/rewards/daily-return/double", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    const progressRes = await pool.query(`SELECT level FROM public.progress WHERE uid = $1 LIMIT 1`, [uid]);
+    const levelBefore = Number(progressRes.rows[0]?.level || 1);
+    const out = await claimDailyReturnRewardDouble(uid);
+
+    if (!out?.already) {
+      try {
+        await trackRewardedAdActivity({
+          uid,
+          ...getAdRequestMeta(req),
+          ad_type: "daily_return_double",
+          level_before: levelBefore,
+          level_after: levelBefore,
+        });
+      } catch {}
+    }
+
+    res.json({
+      ok: true,
+      already: Boolean(out?.already),
+      reward: out?.reward || null,
+      user: out?.user || null,
+    });
+  } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
