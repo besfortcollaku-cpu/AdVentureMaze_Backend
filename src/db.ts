@@ -6,6 +6,7 @@ import {
   DAILY_LEVELS_MAX,
   INITIAL_DAILY_UNLOCKED_LEVELS,
   AD_UNLOCK_LEVELS,
+  LEVEL_UNLOCK_MC_COST,
   SURPRISE_BOX_DAILY_MAX,
   rollSurpriseBoxReward,
   UNLOCK_INTERVAL_SECONDS,
@@ -1827,6 +1828,70 @@ export async function claimDailyLevelAdUnlock(uid: string) {
       ok: true,
       user: updatedUser,
       levelAccess: buildDailyLevelAccessState(updatedUser),
+    };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function claimDailyLevelCoinUnlock(uid: string) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const user = await refreshDailyLevelAccessWithClient(client, uid);
+    const access = buildDailyLevelAccessState(user);
+
+    if (access.dailyLimitReached) {
+      throw new Error("daily_level_limit_reached");
+    }
+
+    if (!access.canWatchAdToUnlock) {
+      throw new Error("daily_level_coin_unlock_not_available");
+    }
+
+    const spendRes = await client.query(
+      `UPDATE public.users
+          SET mc_balance = COALESCE(mc_balance, 0) - $2,
+              updated_at = NOW()
+        WHERE uid = $1
+          AND COALESCE(mc_balance, 0) >= $2
+        RETURNING *`,
+      [uid, LEVEL_UNLOCK_MC_COST]
+    );
+
+    if (!(spendRes.rowCount ?? 0)) {
+      throw new Error("NOT_ENOUGH_COINS");
+    }
+
+    const nextUnlocked = Math.min(
+      DAILY_LEVELS_MAX,
+      access.dailyLevelsUnlocked + AD_UNLOCK_LEVELS
+    );
+
+    const out = await client.query(
+      `UPDATE public.users
+          SET daily_levels_unlocked = $2,
+              next_unlock_at = NULL,
+              updated_at = NOW()
+        WHERE uid = $1
+        RETURNING *`,
+      [uid, nextUnlocked]
+    );
+
+    const updatedUser = out.rows[0];
+    await client.query("COMMIT");
+
+    return {
+      ok: true,
+      user: {
+        ...updatedUser,
+        coins: Number(updatedUser?.mc_balance || 0),
+      },
+      levelAccess: buildDailyLevelAccessState(updatedUser),
+      unlockCostCoins: LEVEL_UNLOCK_MC_COST,
     };
   } catch (e) {
     await client.query("ROLLBACK");

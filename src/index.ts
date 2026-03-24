@@ -36,6 +36,7 @@ import {
   claimLevelComplete,
   useSkip,
   useHint, 
+  claimDailyLevelCoinUnlock,
   pool,
   getFreeSkipsLeft,
   getFreeHintsLeft,
@@ -1951,6 +1952,21 @@ app.get("/admin/settlement/preview", async (req,res)=>{
     res.json(out);
   }catch(e:any){
     res.status(400).json({ok:false,error:e.message});
+  }
+});
+app.post("/api/levels/coins-unlock", async (req,res)=>{
+  try{
+    const { uid } = await requirePiUser(req);
+    const out = await claimDailyLevelCoinUnlock(uid);
+    res.json({ ok: true, user: out.user, levelAccess: out.levelAccess, unlockCostCoins: out.unlockCostCoins });
+  }catch(e:any){
+    try {
+      const { uid } = await requirePiUser(req);
+      const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
+      res.status(400).json({ ok:false, error:e.message, levelAccess });
+    } catch {
+      res.status(400).json({ ok:false, error:e.message });
+    }
   }
 });
 
