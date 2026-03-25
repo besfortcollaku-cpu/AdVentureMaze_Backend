@@ -232,6 +232,16 @@ app.get("/api/me", async (req, res) => {
         res.status(401).json({ ok: false, error: e.message });
     }
 });
+app.delete("/api/account", async (req, res) => {
+    try {
+        const { uid } = await requirePiUser(req);
+        await (0, db_1.adminDeleteUser)(uid);
+        res.json({ ok: true });
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
 function validatePiWalletInput(raw) {
     const compact = String(raw || "").replace(/[\r\n]+/g, " ").trim();
     if (!compact)

@@ -5965,25 +5965,77 @@ export async function adminResetFreeCounters(uid: string) {
   return rows[0];
 }
 export async function adminDeleteUser(uid: string) {
-  // delete user
-  await pool.query(
-    `DELETE FROM public.users WHERE uid = $1`,
-    [uid]
-  );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  // delete progress
-  await pool.query(
-    `DELETE FROM progress WHERE uid = $1`,
-    [uid]
-  );
+    if (await tableExists(client, "public.user_invites")) {
+      await client.query(
+        `DELETE FROM public.user_invites
+          WHERE invitee_uid = $1
+             OR inviter_uid = $1`,
+        [uid]
+      );
+    }
 
-  // delete sessions
-  await pool.query(
-    `DELETE FROM sessions WHERE uid = $1`,
-    [uid]
-  );
+    if (await tableExists(client, "public.users")) {
+      if (await columnExists(client, "public.users", "invited_by_uid")) {
+        await client.query(
+          `UPDATE public.users
+              SET invited_by_uid = NULL,
+                  invited_at = NULL
+            WHERE invited_by_uid = $1`,
+          [uid]
+        );
+      }
+    }
 
-  return { ok: true };
+    const deleteByUidTables = [
+      "public.progress",
+      "public.sessions",
+      "public.user_ad_activity",
+      "public.level_access_events",
+      "public.surprise_box_rewards",
+      "public.ad_watch_logs",
+      "public.daily_user_stats",
+      "public.daily_leaderboard_snapshots",
+      "public.reward_claims",
+      "public.reward_nonces",
+      "public.reward_event_audit",
+      "public.daily_reward_missed_days",
+      "public.daily_reward_recoveries",
+      "public.level_rewards",
+      "public.level_skips",
+      "public.user_level_monthly_rp",
+      "public.level_reward_events",
+      "public.monthly_payouts",
+      "public.monthly_pi_payouts",
+      "public.monthly_payout_snapshots",
+      "public.pi_payout_jobs",
+      "public.payout_transfer_logs",
+      "public.admin_adjustments",
+      "public.user_ads",
+      "public.user_daily_quests",
+    ];
+
+    for (const tableName of deleteByUidTables) {
+      if (await tableExists(client, tableName)) {
+        await client.query(`DELETE FROM ${tableName} WHERE uid = $1`, [uid]);
+      }
+    }
+
+    if (await tableExists(client, "public.users")) {
+      await client.query(`DELETE FROM public.users WHERE uid = $1`, [uid]);
+    }
+
+    await client.query("COMMIT");
+    return { ok: true };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 export async function adminGetStats({ onlineMinutes }: { onlineMinutes: number }) {
   const users = await pool.query(`SELECT COUNT(*) FROM public.users`);

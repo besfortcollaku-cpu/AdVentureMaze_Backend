@@ -376,6 +376,17 @@ if (firstRecoverableMissedDay) {
     res.status(401).json({ ok: false, error: e.message });
   }
 });
+
+app.delete("/api/account", async (req, res) => {
+  try {
+    const { uid } = await requirePiUser(req);
+    await adminDeleteUser(uid);
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
 function validatePiWalletInput(raw: unknown): { ok: true; wallet: string } | { ok: false; error: string } {
   const compact = String(raw || "").replace(/[\r\n]+/g, " ").trim();
 
