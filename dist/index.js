@@ -337,7 +337,10 @@ app.post("/api/progress", async (req, res) => {
         }
         const progressRes = await db_1.pool.query(`SELECT level FROM public.progress WHERE uid = $1 LIMIT 1`, [uid]);
         const currentSavedLevel = Number(progressRes.rows[0]?.level ?? 1);
-        if (requestedLevel > currentSavedLevel + 1) {
+        const levelAccess = await (0, db_1.getDailyLevelAccessState)(uid).catch(() => null);
+        const availableNewLevels = Math.max(0, Number(levelAccess?.dailyLevelsUnlocked ?? 0) - Number(levelAccess?.dailyLevelsPlayed ?? 0));
+        const maxReachableLevel = Math.max(currentSavedLevel, currentSavedLevel + availableNewLevels);
+        if (requestedLevel > maxReachableLevel) {
             return res.status(403).json({ ok: false, error: "level_jump_blocked" });
         }
         const safeLevel = Math.max(currentSavedLevel, requestedLevel);
@@ -1085,14 +1088,16 @@ app.post("/api/rewards/level-complete", async (req, res) => {
         // anti-exploit: user may only claim reward for current reached level
         const progressRes = await db_1.pool.query(`SELECT level FROM public.progress WHERE uid = $1 LIMIT 1`, [uid]);
         const savedLevel = Number(progressRes.rows[0]?.level ?? 1);
+        const levelAccess = await (0, db_1.getDailyLevelAccessState)(uid).catch(() => null);
+        const availableNewLevels = Math.max(0, Number(levelAccess?.dailyLevelsUnlocked ?? 0) - Number(levelAccess?.dailyLevelsPlayed ?? 0));
+        const maxReachableLevel = Math.max(savedLevel, savedLevel + availableNewLevels);
         // allowed:
         // - exact current level
         // - previous levels already reached
-        // - the immediate next frontier level if the client entered it before
-        //   progress persistence caught up
+        // - any currently unlocked frontier level window
         // blocked:
         // - future levels beyond current reached progress window
-        if (level > savedLevel + 1) {
+        if (level > maxReachableLevel) {
             return res.status(403).json({ ok: false, error: "level_not_reached" });
         }
         if (level > savedLevel) {

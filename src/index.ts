@@ -515,8 +515,17 @@ app.post("/api/progress", async (req, res) => {
     );
 
     const currentSavedLevel = Number(progressRes.rows[0]?.level ?? 1);
+    const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
+    const availableNewLevels = Math.max(
+      0,
+      Number(levelAccess?.dailyLevelsUnlocked ?? 0) - Number(levelAccess?.dailyLevelsPlayed ?? 0)
+    );
+    const maxReachableLevel = Math.max(
+      currentSavedLevel,
+      currentSavedLevel + availableNewLevels
+    );
 
-    if (requestedLevel > currentSavedLevel + 1) {
+    if (requestedLevel > maxReachableLevel) {
       return res.status(403).json({ ok: false, error: "level_jump_blocked" });
     }
 
@@ -1449,15 +1458,23 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
     );
 
     const savedLevel = Number(progressRes.rows[0]?.level ?? 1);
+    const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
+    const availableNewLevels = Math.max(
+      0,
+      Number(levelAccess?.dailyLevelsUnlocked ?? 0) - Number(levelAccess?.dailyLevelsPlayed ?? 0)
+    );
+    const maxReachableLevel = Math.max(
+      savedLevel,
+      savedLevel + availableNewLevels
+    );
 
     // allowed:
     // - exact current level
     // - previous levels already reached
-    // - the immediate next frontier level if the client entered it before
-    //   progress persistence caught up
+    // - any currently unlocked frontier level window
     // blocked:
     // - future levels beyond current reached progress window
-    if (level > savedLevel + 1) {
+    if (level > maxReachableLevel) {
       return res.status(403).json({ ok:false, error:"level_not_reached" });
     }
 
