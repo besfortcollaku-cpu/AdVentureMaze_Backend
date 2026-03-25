@@ -1589,6 +1589,8 @@ async function claimDailyLevelAdUnlock(uid) {
         if (!access.canWatchAdToUnlock) {
             throw new Error("daily_level_ad_unlock_not_available");
         }
+        const progressRes = await client.query(`SELECT level FROM public.progress WHERE uid = $1 FOR UPDATE`, [uid]);
+        const currentProgressLevel = Math.max(1, Number(progressRes.rows[0]?.level ?? 1));
         const nextUnlocked = Math.min(economy_1.DAILY_LEVELS_MAX, access.dailyLevelsUnlocked + economy_1.AD_UNLOCK_LEVELS);
         const out = await client.query(`UPDATE public.users
           SET daily_levels_unlocked = $2,
@@ -1596,6 +1598,10 @@ async function claimDailyLevelAdUnlock(uid) {
               updated_at = NOW()
         WHERE uid = $1
         RETURNING *`, [uid, nextUnlocked]);
+        await client.query(`UPDATE public.progress
+          SET level = GREATEST(level, $2),
+              updated_at = NOW()
+        WHERE uid = $1`, [uid, currentProgressLevel + economy_1.AD_UNLOCK_LEVELS]);
         const updatedUser = out.rows[0];
         await logLevelAccessEvent({
             uid,
@@ -1635,6 +1641,8 @@ async function claimDailyLevelCoinUnlock(uid) {
         if (!access.canWatchAdToUnlock) {
             throw new Error("daily_level_coin_unlock_not_available");
         }
+        const progressRes = await client.query(`SELECT level FROM public.progress WHERE uid = $1 FOR UPDATE`, [uid]);
+        const currentProgressLevel = Math.max(1, Number(progressRes.rows[0]?.level ?? 1));
         const spendRes = await client.query(`UPDATE public.users
           SET coins = COALESCE(coins, 0) - $2,
               mc_balance = COALESCE(mc_balance, 0) - $2,
@@ -1652,6 +1660,10 @@ async function claimDailyLevelCoinUnlock(uid) {
               updated_at = NOW()
         WHERE uid = $1
         RETURNING *`, [uid, nextUnlocked]);
+        await client.query(`UPDATE public.progress
+          SET level = GREATEST(level, $2),
+              updated_at = NOW()
+        WHERE uid = $1`, [uid, currentProgressLevel + economy_1.AD_UNLOCK_LEVELS]);
         const updatedUser = out.rows[0];
         await client.query("COMMIT");
         return {

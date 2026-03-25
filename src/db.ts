@@ -1892,6 +1892,12 @@ export async function claimDailyLevelAdUnlock(uid: string) {
       throw new Error("daily_level_ad_unlock_not_available");
     }
 
+    const progressRes = await client.query(
+      `SELECT level FROM public.progress WHERE uid = $1 FOR UPDATE`,
+      [uid]
+    );
+    const currentProgressLevel = Math.max(1, Number(progressRes.rows[0]?.level ?? 1));
+
     const nextUnlocked = Math.min(
       DAILY_LEVELS_MAX,
       access.dailyLevelsUnlocked + AD_UNLOCK_LEVELS
@@ -1905,6 +1911,14 @@ export async function claimDailyLevelAdUnlock(uid: string) {
         WHERE uid = $1
         RETURNING *`,
       [uid, nextUnlocked]
+    );
+
+    await client.query(
+      `UPDATE public.progress
+          SET level = GREATEST(level, $2),
+              updated_at = NOW()
+        WHERE uid = $1`,
+      [uid, currentProgressLevel + AD_UNLOCK_LEVELS]
     );
 
     const updatedUser = out.rows[0];
@@ -1953,6 +1967,12 @@ export async function claimDailyLevelCoinUnlock(uid: string) {
       throw new Error("daily_level_coin_unlock_not_available");
     }
 
+    const progressRes = await client.query(
+      `SELECT level FROM public.progress WHERE uid = $1 FOR UPDATE`,
+      [uid]
+    );
+    const currentProgressLevel = Math.max(1, Number(progressRes.rows[0]?.level ?? 1));
+
     const spendRes = await client.query(
       `UPDATE public.users
           SET coins = COALESCE(coins, 0) - $2,
@@ -1981,6 +2001,14 @@ export async function claimDailyLevelCoinUnlock(uid: string) {
         WHERE uid = $1
         RETURNING *`,
       [uid, nextUnlocked]
+    );
+
+    await client.query(
+      `UPDATE public.progress
+          SET level = GREATEST(level, $2),
+              updated_at = NOW()
+        WHERE uid = $1`,
+      [uid, currentProgressLevel + AD_UNLOCK_LEVELS]
     );
 
     const updatedUser = out.rows[0];
