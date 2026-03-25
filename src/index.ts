@@ -1453,10 +1453,29 @@ app.post("/api/rewards/level-complete", async (req,res)=>{
     // allowed:
     // - exact current level
     // - previous levels already reached
+    // - the immediate next frontier level if the client entered it before
+    //   progress persistence caught up
     // blocked:
-    // - future levels beyond current reached progress
-    if (level > savedLevel) {
+    // - future levels beyond current reached progress window
+    if (level > savedLevel + 1) {
       return res.status(403).json({ ok:false, error:"level_not_reached" });
+    }
+
+    if (level > savedLevel) {
+      const userLevelRes = await pool.query(
+        `SELECT COALESCE(mc_balance, coins, 0) AS mc_balance
+           FROM public.users
+          WHERE uid = $1
+          LIMIT 1`,
+        [uid]
+      );
+      const safeCoins = Number(userLevelRes.rows[0]?.mc_balance ?? 0);
+
+      await setProgressByUid({
+        uid,
+        level,
+        coins: safeCoins,
+      });
     }
 
     const usedHint = req.body?.usedHint === true;
