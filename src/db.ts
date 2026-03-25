@@ -1955,7 +1955,8 @@ export async function claimDailyLevelCoinUnlock(uid: string) {
 
     const spendRes = await client.query(
       `UPDATE public.users
-          SET mc_balance = COALESCE(mc_balance, 0) - $2,
+          SET coins = COALESCE(coins, 0) - $2,
+              mc_balance = COALESCE(mc_balance, 0) - $2,
               updated_at = NOW()
         WHERE uid = $1
           AND COALESCE(mc_balance, 0) >= $2
@@ -3807,7 +3808,13 @@ export async function getUserByUid(uid: string) {
     `SELECT * FROM public.users WHERE uid=$1`,
     [uid]
   );
-  return rows[0] || null;
+  const user = rows[0] || null;
+  if (!user) return null;
+  return {
+    ...user,
+    coins: Number(user?.mc_balance ?? user?.coins ?? 0),
+    mc_balance: Number(user?.mc_balance ?? user?.coins ?? 0),
+  };
 }
 
 export async function syncMcBalanceFromLegacyCoins(uid: string) {

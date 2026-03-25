@@ -1636,7 +1636,8 @@ async function claimDailyLevelCoinUnlock(uid) {
             throw new Error("daily_level_coin_unlock_not_available");
         }
         const spendRes = await client.query(`UPDATE public.users
-          SET mc_balance = COALESCE(mc_balance, 0) - $2,
+          SET coins = COALESCE(coins, 0) - $2,
+              mc_balance = COALESCE(mc_balance, 0) - $2,
               updated_at = NOW()
         WHERE uid = $1
           AND COALESCE(mc_balance, 0) >= $2
@@ -3099,7 +3100,14 @@ async function upsertUser({ uid, username, }) {
 }
 async function getUserByUid(uid) {
     const { rows } = await exports.pool.query(`SELECT * FROM public.users WHERE uid=$1`, [uid]);
-    return rows[0] || null;
+    const user = rows[0] || null;
+    if (!user)
+        return null;
+    return {
+        ...user,
+        coins: Number(user?.mc_balance ?? user?.coins ?? 0),
+        mc_balance: Number(user?.mc_balance ?? user?.coins ?? 0),
+    };
 }
 async function syncMcBalanceFromLegacyCoins(uid) {
     const out = await exports.pool.query(`UPDATE public.users
