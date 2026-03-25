@@ -100,6 +100,7 @@ exports.trackAdView = trackAdView;
 exports.getMonthlyAds = getMonthlyAds;
 exports.claimCoinAd = claimCoinAd;
 exports.getCompletedLevels = getCompletedLevels;
+exports.getSkippedLevels = getSkippedLevels;
 exports.calcMonthlyRate = calcMonthlyRate;
 exports.recalcAndStoreMonthlyRate = recalcAndStoreMonthlyRate;
 exports.claimMonthlyRewards = claimMonthlyRewards;
@@ -499,6 +500,18 @@ async function initDB() {
     await exports.pool.query(`
   CREATE UNIQUE INDEX IF NOT EXISTS level_rewards_uid_level_unique
   ON public.level_rewards (uid, level)
+`);
+    await exports.pool.query(`
+  CREATE TABLE IF NOT EXISTS public.level_skips (
+    uid TEXT NOT NULL,
+    level INT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (uid, level)
+  );
+`);
+    await exports.pool.query(`
+  CREATE INDEX IF NOT EXISTS level_skips_uid_created_idx
+  ON public.level_skips (uid, created_at DESC)
 `);
     await exports.pool.query(`
   CREATE TABLE IF NOT EXISTS public.user_level_monthly_rp (
@@ -3887,6 +3900,9 @@ async function claimLevelComplete(uid, level, opts) {
             await client.query(`INSERT INTO public.user_level_monthly_rp (uid, level_id, month_key, rp_awarded, first_completed_at)
          VALUES ($1, $2, $3, $4, NOW())`, [uid, levelId, monthKey, awardedRp]);
         }
+        await client.query(`DELETE FROM public.level_skips
+        WHERE uid = $1
+          AND level = $2`, [uid, level]);
         await client.query(`INSERT INTO public.level_reward_events (
          uid,
          level_id,
@@ -3918,11 +3934,13 @@ async function claimLevelComplete(uid, level, opts) {
             rejectReason: isReplay ? "replay_no_rewards" : already ? "monthly_rp_already_awarded" : undefined,
         });
         const user = await getUserByUid(uid);
+        const skippedLevels = await getSkippedLevels(uid).catch(() => []);
         const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
         return {
             already,
             isReplay,
             user,
+            skippedLevels,
             levelAccess,
             rewards: {
                 mc: awardedMc,
@@ -4970,6 +4988,10 @@ async function claimCoinAd(uid) {
 async function getCompletedLevels(uid) {
     const { rows } = await exports.pool.query(`SELECT level FROM level_rewards WHERE uid=$1`, [uid]);
     return rows.map(r => r.level);
+}
+async function getSkippedLevels(uid) {
+    const { rows } = await exports.pool.query(`SELECT level FROM public.level_skips WHERE uid=$1 ORDER BY level ASC`, [uid]);
+    return rows.map((r) => r.level);
 }
 function prevMonthKey() {
     const d = new Date();

@@ -461,6 +461,20 @@ await pool.query(`
 `);
 
 await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.level_skips (
+    uid TEXT NOT NULL,
+    level INT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (uid, level)
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS level_skips_uid_created_idx
+  ON public.level_skips (uid, created_at DESC)
+`);
+
+await pool.query(`
   CREATE TABLE IF NOT EXISTS public.user_level_monthly_rp (
     id BIGSERIAL PRIMARY KEY,
     uid TEXT NOT NULL,
@@ -4844,6 +4858,13 @@ export async function claimLevelComplete(
     }
 
     await client.query(
+      `DELETE FROM public.level_skips
+        WHERE uid = $1
+          AND level = $2`,
+      [uid, level]
+    );
+
+    await client.query(
       `INSERT INTO public.level_reward_events (
          uid,
          level_id,
@@ -4880,11 +4901,13 @@ export async function claimLevelComplete(
       });
 
       const user = await getUserByUid(uid);
+      const skippedLevels = await getSkippedLevels(uid).catch(() => []);
       const levelAccess = await getDailyLevelAccessState(uid).catch(() => null);
       return {
         already,
         isReplay,
         user,
+        skippedLevels,
         levelAccess,
         rewards: {
           mc: awardedMc,
@@ -6209,6 +6232,15 @@ export async function getCompletedLevels(uid: string) {
   );
   return rows.map(r => r.level);
 }
+
+export async function getSkippedLevels(uid: string) {
+  const { rows } = await pool.query(
+    `SELECT level FROM public.level_skips WHERE uid=$1 ORDER BY level ASC`,
+    [uid]
+  );
+  return rows.map((r) => r.level);
+}
+
 function prevMonthKey() {
   const d = new Date();
   const y = d.getUTCFullYear();

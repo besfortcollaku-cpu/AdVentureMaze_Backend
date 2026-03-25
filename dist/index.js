@@ -41,6 +41,7 @@ app.get("/api/me", async (req, res) => {
         const levelAccess = await (0, db_1.getDailyLevelAccessState)(uid).catch(() => null);
         const surpriseBoxState = await (0, db_1.getDailySurpriseBoxState)(uid).catch(() => null);
         const completedLevels = await (0, db_1.getCompletedLevels)(uid).catch(() => []);
+        const skippedLevels = await (0, db_1.getSkippedLevels)(uid).catch(() => []);
         const userRes = await db_1.pool.query(`SELECT * FROM public.users WHERE uid = $1 LIMIT 1`, [uid]);
         const user = userRes.rows[0] ?? null;
         const progress = await (0, db_1.getProgressByUid)(uid);
@@ -192,6 +193,8 @@ app.get("/api/me", async (req, res) => {
                     can_open_surprise_box: surpriseBoxState?.canOpenNow ?? true,
                     completed_levels: completedLevels,
                     completedLevels,
+                    skipped_levels: skippedLevels,
+                    skippedLevels,
                 }
                 : null,
             progress: progress
@@ -220,6 +223,7 @@ app.get("/api/me", async (req, res) => {
             levelAccess,
             surpriseBoxState,
             completedLevels,
+            skippedLevels,
             missedDay,
             mysteryChest,
         });
@@ -1092,7 +1096,15 @@ app.post("/api/rewards/level-complete", async (req, res) => {
         const usedHint = req.body?.usedHint === true;
         const usedSkip = req.body?.usedSkip === true;
         const out = await (0, db_1.claimLevelComplete)(uid, level, { usedHint, usedSkip });
-        res.json({ ok: true, already: !!out?.already, isReplay: !!out?.isReplay, user: out?.user, rewards: out?.rewards || null, levelAccess: out?.levelAccess || null });
+        res.json({
+            ok: true,
+            already: !!out?.already,
+            isReplay: !!out?.isReplay,
+            user: out?.user,
+            rewards: out?.rewards || null,
+            levelAccess: out?.levelAccess || null,
+            skippedLevels: out?.skippedLevels || [],
+        });
     }
     catch (e) {
         try {
@@ -1268,6 +1280,7 @@ app.post("/api/skip", async (req, res) => {
         const { uid } = await requirePiUser(req);
         const nonce = String(req.body?.nonce || "");
         const mode = String(req.body?.mode || "");
+        const requestedLevel = Number(req.body?.level ?? 0);
         await db_1.pool.query("BEGIN");
         const userRes = await db_1.pool.query(`SELECT skips_balance, mc_balance, rp_score, daily_rp, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`, [uid]);
         const progressRes = await db_1.pool.query(`SELECT free_skips_used, level FROM progress WHERE uid=$1 FOR UPDATE`, [uid]);
@@ -1278,6 +1291,13 @@ app.post("/api/skip", async (req, res) => {
         }
         const FREE_SKIP_LIMIT = economy_1.FREE_SKIPS_PER_ACCOUNT;
         const SKIP_PRICE = economy_1.SKIP_MC_COST;
+        const currentProgressLevel = Number(progress?.level ?? 1);
+        const levelToSkip = Number.isInteger(requestedLevel) && requestedLevel > 0
+            ? requestedLevel
+            : currentProgressLevel;
+        if (levelToSkip > currentProgressLevel) {
+            throw new Error("invalid_level");
+        }
         let usedFree = false;
         let usedAd = false;
         const adLevelBefore = Number(progress?.level ?? 1);
@@ -1324,6 +1344,18 @@ app.post("/api/skip", async (req, res) => {
         await db_1.pool.query(`UPDATE public.users
        SET monthly_skips_used = COALESCE(monthly_skips_used,0) + 1
        WHERE uid=$1`, [uid]);
+        const completedRes = await db_1.pool.query(`SELECT 1 FROM public.level_rewards WHERE uid = $1 AND level = $2 LIMIT 1`, [uid, levelToSkip]);
+        const isAlreadyCompleted = (completedRes.rowCount ?? 0) > 0;
+        if (!isAlreadyCompleted) {
+            await db_1.pool.query(`INSERT INTO public.level_skips (uid, level, created_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (uid, level) DO NOTHING`, [uid, levelToSkip]);
+        }
+        const nextAccessibleLevel = Math.max(currentProgressLevel, levelToSkip + 1);
+        await db_1.pool.query(`UPDATE public.progress
+          SET level = GREATEST(level, $2),
+              updated_at = NOW()
+        WHERE uid = $1`, [uid, nextAccessibleLevel]);
         await db_1.pool.query("COMMIT");
         try {
             await (0, db_1.recalcAndStoreMonthlyRate)(uid);
@@ -1342,16 +1374,22 @@ app.post("/api/skip", async (req, res) => {
             catch { }
         }
         const updatedUser = await db_1.pool.query(`SELECT skips_balance, mc_balance, rp_score, daily_rp FROM public.users WHERE uid=$1`, [uid]);
-        const updatedProgress = await db_1.pool.query(`SELECT free_skips_used FROM progress WHERE uid=$1`, [uid]);
+        const updatedProgress = await db_1.pool.query(`SELECT free_skips_used, level FROM progress WHERE uid=$1`, [uid]);
+        const skippedLevels = await (0, db_1.getSkippedLevels)(uid).catch(() => []);
+        const levelAccess = await (0, db_1.getDailyLevelAccessState)(uid).catch(() => null);
         res.json({
             ok: true,
             free_skips_used: updatedProgress.rows[0].free_skips_used,
+            level: updatedProgress.rows[0].level,
             skips_balance: updatedUser.rows[0].skips_balance,
             coins: updatedUser.rows[0].mc_balance,
             mcBalance: updatedUser.rows[0].mc_balance,
             rpScore: updatedUser.rows[0].rp_score,
             dailyRp: updatedUser.rows[0].daily_rp,
             usedFree,
+            skippedLevels,
+            skipped_levels: skippedLevels,
+            levelAccess,
         });
     }
     catch (e) {
