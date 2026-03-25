@@ -1311,7 +1311,17 @@ app.post("/api/skip", async (req, res) => {
         const mode = String(req.body?.mode || "");
         const requestedLevel = Number(req.body?.level ?? 0);
         await db_1.pool.query("BEGIN");
-        const userRes = await db_1.pool.query(`SELECT skips_balance, mc_balance, rp_score, daily_rp, ads_watched_today FROM public.users WHERE uid=$1 FOR UPDATE`, [uid]);
+        const userRes = await db_1.pool.query(`SELECT skips_balance,
+              mc_balance,
+              rp_score,
+              daily_rp,
+              ads_watched_today,
+              daily_levels_played,
+              daily_levels_unlocked,
+              next_unlock_at
+         FROM public.users
+        WHERE uid=$1
+        FOR UPDATE`, [uid]);
         const progressRes = await db_1.pool.query(`SELECT free_skips_used, level FROM progress WHERE uid=$1 FOR UPDATE`, [uid]);
         const user = userRes.rows[0];
         const progress = progressRes.rows[0];
@@ -1375,10 +1385,33 @@ app.post("/api/skip", async (req, res) => {
        WHERE uid=$1`, [uid]);
         const completedRes = await db_1.pool.query(`SELECT 1 FROM public.level_rewards WHERE uid = $1 AND level = $2 LIMIT 1`, [uid, levelToSkip]);
         const isAlreadyCompleted = (completedRes.rowCount ?? 0) > 0;
+        const skipRes = await db_1.pool.query(`SELECT 1 FROM public.level_skips WHERE uid = $1 AND level = $2 LIMIT 1`, [uid, levelToSkip]);
+        const isAlreadySkipped = (skipRes.rowCount ?? 0) > 0;
         if (!isAlreadyCompleted) {
             await db_1.pool.query(`INSERT INTO public.level_skips (uid, level, created_at)
          VALUES ($1, $2, NOW())
          ON CONFLICT (uid, level) DO NOTHING`, [uid, levelToSkip]);
+        }
+        if (!isAlreadyCompleted && !isAlreadySkipped && levelToSkip === currentProgressLevel) {
+            const currentPlayed = Math.max(0, Number(user?.daily_levels_played ?? 0));
+            const currentUnlocked = Math.max(0, Number(user?.daily_levels_unlocked ?? currentPlayed));
+            if (currentPlayed >= economy_1.DAILY_LEVELS_MAX) {
+                throw new Error("daily_level_limit_reached");
+            }
+            if (currentPlayed >= currentUnlocked) {
+                throw new Error("daily_levels_locked");
+            }
+            const nextPlayed = Math.min(economy_1.DAILY_LEVELS_MAX, currentPlayed + 1);
+            const shouldQueueNextUnlock = nextPlayed >= currentUnlocked &&
+                currentUnlocked < economy_1.DAILY_LEVELS_MAX;
+            const nextUnlockAt = shouldQueueNextUnlock
+                ? new Date(Date.now() + (60 * 60 * 1000))
+                : null;
+            await db_1.pool.query(`UPDATE public.users
+            SET daily_levels_played = $2,
+                next_unlock_at = $3,
+                updated_at = NOW()
+          WHERE uid = $1`, [uid, nextPlayed, nextUnlockAt]);
         }
         const nextAccessibleLevel = Math.max(currentProgressLevel, levelToSkip + 1);
         await db_1.pool.query(`UPDATE public.progress
