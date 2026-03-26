@@ -206,6 +206,7 @@ app.get("/api/me", async (req, res) => {
                     free_hints_used: progress.free_hints_used ?? 0,
                     free_restarts_used: progress.free_restarts_used ?? 0,
                     paintedKeys: progress.painted_keys ?? [],
+                    resumeLevel: progress.resume_level ?? null,
                     resume: progress.resume ?? null,
                 }
                 : null,
@@ -341,6 +342,7 @@ app.post("/api/progress", async (req, res) => {
         const { uid } = await requirePiUser(req);
         const requestedLevel = Number(req.body?.level ?? 1);
         const paintedKeys = req.body?.paintedKeys ?? null;
+        const resumeLevel = req.body?.resumeLevel ?? null;
         const resume = req.body?.resume ?? null;
         if (!Number.isInteger(requestedLevel) || requestedLevel < 1) {
             return res.status(400).json({ ok: false, error: "invalid_level" });
@@ -362,6 +364,7 @@ app.post("/api/progress", async (req, res) => {
             level: safeLevel,
             coins: safeCoins,
             paintedKeys,
+            resumeLevel,
             resume,
         });
         res.json({ ok: true, level: safeLevel, coins: safeCoins });

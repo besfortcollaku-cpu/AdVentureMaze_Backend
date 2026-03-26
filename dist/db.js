@@ -268,9 +268,14 @@ async function initDB() {
       level INT DEFAULT 1,
       coins INT DEFAULT 0,
       painted_keys JSONB DEFAULT '[]'::jsonb,
+      resume_level INT DEFAULT NULL,
       resume JSONB DEFAULT NULL,
       updated_at TIMESTAMP DEFAULT NOW()
     );
+  `);
+    await exports.pool.query(`
+    ALTER TABLE public.progress
+      ADD COLUMN IF NOT EXISTS resume_level INT DEFAULT NULL
   `);
     await exports.pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS mystery_box_pending BOOLEAN NOT NULL DEFAULT FALSE`);
     await exports.pool.query(`
@@ -3569,22 +3574,24 @@ async function getProgressByUid(uid) {
     const { rows } = await exports.pool.query(`SELECT * FROM progress WHERE uid=$1`, [uid]);
     return rows[0] || null;
 }
-async function setProgressByUid({ uid, level, coins, paintedKeys, resume, }) {
+async function setProgressByUid({ uid, level, coins, paintedKeys, resumeLevel, resume, }) {
     await exports.pool.query(`
-    INSERT INTO progress (uid, level, coins, painted_keys, resume)
-    VALUES ($1, $2, $3, $4, $5)
+    INSERT INTO progress (uid, level, coins, painted_keys, resume_level, resume)
+    VALUES ($1, $2, $3, $4, $5, $6)
     ON CONFLICT (uid)
     DO UPDATE SET
       level = GREATEST(progress.level, EXCLUDED.level),
       coins = EXCLUDED.coins,
-      painted_keys = COALESCE($4::jsonb, progress.painted_keys),
-      resume = $5,
+      painted_keys = COALESCE($4::jsonb, '[]'::jsonb),
+      resume_level = $5,
+      resume = $6,
       updated_at = NOW()
     `, [
         uid,
         level ?? 1,
         coins ?? 0,
         paintedKeys ? JSON.stringify(paintedKeys) : null,
+        Number.isInteger(Number(resumeLevel)) ? Number(resumeLevel) : null,
         resume ? JSON.stringify(resume) : null,
     ]);
 }
