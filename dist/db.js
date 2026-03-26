@@ -3926,6 +3926,12 @@ async function claimLevelComplete(uid, level, opts) {
             await client.query(`INSERT INTO public.user_level_monthly_rp (uid, level_id, month_key, rp_awarded, first_completed_at)
          VALUES ($1, $2, $3, $4, NOW())`, [uid, levelId, monthKey, awardedRp]);
         }
+        if (isFirstLifetimeCompletion) {
+            await client.query(`UPDATE public.progress
+            SET level = GREATEST(level, $2),
+                updated_at = NOW()
+          WHERE uid = $1`, [uid, level + 1]);
+        }
         await client.query(`DELETE FROM public.level_skips
         WHERE uid = $1
           AND level = $2`, [uid, level]);

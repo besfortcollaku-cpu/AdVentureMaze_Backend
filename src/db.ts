@@ -4901,6 +4901,16 @@ export async function claimLevelComplete(
       );
     }
 
+    if (isFirstLifetimeCompletion) {
+      await client.query(
+        `UPDATE public.progress
+            SET level = GREATEST(level, $2),
+                updated_at = NOW()
+          WHERE uid = $1`,
+        [uid, level + 1]
+      );
+    }
+
     await client.query(
       `DELETE FROM public.level_skips
         WHERE uid = $1
