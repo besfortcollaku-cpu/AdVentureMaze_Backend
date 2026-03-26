@@ -1859,7 +1859,7 @@ app.post("/api/skip", async (req, res) => {
       );
     }
 
-    if (!isAlreadyCompleted && !isAlreadySkipped && levelToSkip === currentProgressLevel) {
+    if (!isAlreadyCompleted && !isAlreadySkipped) {
       const currentPlayed = Math.max(0, Number(user?.daily_levels_played ?? 0));
       const currentUnlocked = Math.max(
         0,

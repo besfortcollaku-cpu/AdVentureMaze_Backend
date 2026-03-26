@@ -1392,7 +1392,7 @@ app.post("/api/skip", async (req, res) => {
          VALUES ($1, $2, NOW())
          ON CONFLICT (uid, level) DO NOTHING`, [uid, levelToSkip]);
         }
-        if (!isAlreadyCompleted && !isAlreadySkipped && levelToSkip === currentProgressLevel) {
+        if (!isAlreadyCompleted && !isAlreadySkipped) {
             const currentPlayed = Math.max(0, Number(user?.daily_levels_played ?? 0));
             const currentUnlocked = Math.max(0, Number(user?.daily_levels_unlocked ?? currentPlayed));
             if (currentPlayed >= economy_1.DAILY_LEVELS_MAX) {

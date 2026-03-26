@@ -4837,8 +4837,17 @@ export async function claimLevelComplete(
       );
       const isFirstLifetimeCompletion = (lifetimeInsert.rowCount ?? 0) > 0;
       const isReplay = !isFirstLifetimeCompletion;
+      const skippedBeforeCompletionRes = await client.query(
+        `SELECT 1
+           FROM public.level_skips
+          WHERE uid = $1
+            AND level = $2
+          LIMIT 1`,
+        [uid, level]
+      );
+      const wasPreviouslySkipped = (skippedBeforeCompletionRes.rowCount ?? 0) > 0;
 
-      if (isFirstLifetimeCompletion) {
+      if (isFirstLifetimeCompletion && !wasPreviouslySkipped) {
         await incrementDailyLevelsPlayedWithClient(client, uid, {
           used_hint: Boolean(opts?.usedHint),
           used_skip: Boolean(opts?.usedSkip),
